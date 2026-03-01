@@ -137,7 +137,7 @@ def extract_key(request, key: str, check_existence: bool = True) -> Any:
                 raise InvalidKeyValue(key, value)
 
         elif key in ('monitor', 'delete_folder', 'rename_files', 'only_english',
-                    'limit_parent_folder', 'force_match'):
+                    'limit_parent_folder', 'force_match', 'local_only'):
             if value == 'true':
                 value = True
             elif value == 'false':
@@ -179,6 +179,9 @@ def extract_key(request, key: str, check_existence: bool = True) -> Any:
             value = False
 
         elif key == 'force_match':
+            value = False
+
+        elif key == 'local_only':
             value = False
 
     return value
@@ -687,11 +690,17 @@ def api_library_import():
             'limit_parent_folder',
             check_existence=False
         )
+        local_only = extract_key(
+            request,
+            'local_only',
+            check_existence=False
+        )
         result = propose_library_import(
             folder_filter,
             limit,
             limit_parent_folder,
-            only_english
+            only_english,
+            local_only
         )
         return return_api(result)
 

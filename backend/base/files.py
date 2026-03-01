@@ -13,7 +13,7 @@ from os.path import (abspath, basename, commonpath, dirname, isdir,
                      isfile, join, relpath, samefile, sep, splitext)
 from re import compile
 from shutil import chown, copy2, copytree, move, rmtree
-from typing import Dict, Iterable, List, Sequence, Union
+from typing import Dict, Generator, Iterable, List, Sequence, Union
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from backend.base.definitions import (CharConstants, Constants,
@@ -106,6 +106,58 @@ def list_files(folder: str, ext: Iterable[str] = []) -> List[str]:
                 files.append(f.path)
 
     return files
+
+
+def iter_files(
+    folder: str,
+    ext: Iterable[str] = []
+) -> Generator[str, None, None]:
+    """Yield files in a folder recursively with absolute paths.
+
+    Like ``list_files()`` but yields lazily, allowing callers to stop
+    early (e.g. after finding enough folders) without walking the
+    entire directory tree. This is critical for large libraries on
+    network storage where each ``scandir()`` call is a round-trip.
+
+    Hidden files (files starting with ``'.'``) are skipped.
+    Inaccessible directories are silently skipped.
+
+    Args:
+        folder (str): The base folder to search through.
+
+        ext (Iterable[str], optional): File extensions to only include.
+            Dot-prefix optional. Keep empty to allow all extensions.
+            Defaults to [].
+
+    Yields:
+        str: Absolute paths of files found during the walk.
+    """
+    to_dos = deque((folder,))
+    ext_set = {force_prefix(e.lower(), '.') for e in ext}
+
+    while to_dos:
+        to_do = to_dos.popleft()
+        try:
+            entries = scandir(to_do)
+        except (PermissionError, NotADirectoryError, OSError):
+            continue
+
+        for f in entries:
+            try:
+                if f.is_dir():
+                    to_dos.append(f.path)
+
+                elif (
+                    f.is_file()
+                    and not f.name.startswith('.')
+                    and check_filter(
+                        splitext(f.name)[1].lower(),
+                        ext_set
+                    )
+                ):
+                    yield f.path
+            except OSError:
+                continue
 
 
 def get_archive_mimetype(filepath: str) -> Union[str, None]:

@@ -25,7 +25,25 @@ from backend.base.helpers import (AsyncSession, Session, batched,
                                   normalise_string, normalise_year,
                                   to_full_string_cv_id, to_string_cv_id)
 from backend.base.logging import LOGGER
+from backend.implementations.local_comicvine import (
+    cache_issues_from_api, cache_volumes_from_api)
 from backend.implementations.matching import select_best_volume_result_for_file
+
+
+def _safe_cache_volumes(raw_volumes):
+    """Cache volume data to local DB, logging failures."""
+    try:
+        cache_volumes_from_api(raw_volumes)
+    except Exception as e:
+        LOGGER.debug('Failed to cache volumes to local DB: %s', e)
+
+
+def _safe_cache_issues(raw_issues):
+    """Cache issue data to local DB, logging failures."""
+    try:
+        cache_issues_from_api(raw_issues)
+    except Exception as e:
+        LOGGER.debug('Failed to cache issues to local DB: %s', e)
 from backend.internals.db import get_db
 from backend.internals.settings import Settings
 
@@ -462,6 +480,8 @@ class ComicVine:
                 {'field_list': self.volume_field_list}
             )
 
+            _safe_cache_volumes([result['results']])
+
             volume_info = self.__format_volume_output(result['results'])
             volume_info['issues'] = await self.fetch_issues((cv_id,))
 
@@ -520,6 +540,11 @@ class ComicVine:
                     for id_batch in batched(request_batch, 100)
                 )
                 responses = await gather(*tasks)
+
+                raw_vols = [r for batch in responses
+                            for r in batch['results']]
+                if raw_vols:
+                    _safe_cache_volumes(raw_vols)
 
                 # Format volume responses and prep cover requests
                 batch_volumes: List[VolumeMetadata] = [
@@ -591,6 +616,8 @@ class ComicVine:
                 except CVRateLimitReached:
                     break
 
+                _safe_cache_issues(results['results'])
+
                 issue_infos.extend((
                     self.__format_issue_output(r)
                     for r in results['results']
@@ -618,6 +645,8 @@ class ComicVine:
                         responses = await gather(*tasks)
 
                         for batch in responses:
+                            _safe_cache_issues(batch['results'])
+
                             issue_infos.extend((
                                 self.__format_issue_output(r)
                                 for r in batch['results']
@@ -698,6 +727,8 @@ class ComicVine:
         if not results:
             return []
 
+        _safe_cache_volumes(results)
+
         return self.__format_search_output(results)
 
     async def filenames_to_cvs(
@@ -761,5 +792,98 @@ class ComicVine:
                         'issue_count': result['issue_count'],
                         'link': result['site_url']
                     }
+
+        return matches
+
+    async def resolve_groups_by_issue_ids(
+        self,
+        groups_to_issue_ids: Dict[int, int],
+        only_english: bool
+    ) -> Dict[int, Dict[str, Any]]:
+        """Resolve file groups directly via ComicVine issue IDs (from
+        ComicInfo.xml), bypassing the title-based search entirely.
+
+        Each issue ID is fetched from the CV API to get its parent volume,
+        then the volume metadata is returned in the same format as
+        filenames_to_cvs().
+
+        Args:
+            groups_to_issue_ids: Mapping from group number to CV issue ID
+                (numeric, e.g. 12345).
+            only_english: Only match to english volumes.
+
+        Returns:
+            A mapping from group number to its CV match (same format as
+            filenames_to_cvs output).
+        """
+        matches: Dict[int, Dict[str, Any]] = {}
+        no_match = {
+            'id': None,
+            'title': None,
+            'issue_count': None,
+            'link': None
+        }
+
+        # Deduplicate: multiple groups might reference the same issue ID
+        unique_issue_ids = set(groups_to_issue_ids.values())
+
+        # Fetch issue details to get parent volume IDs
+        issue_to_volume: Dict[int, int] = {}
+        async with AsyncSession() as session:
+            for issue_id in unique_issue_ids:
+                try:
+                    result = await self.__call_api(
+                        session,
+                        f'/issue/4000-{issue_id}',
+                        {'field_list': 'id,volume'}
+                    )
+                    volume_id = int(result['results']['volume']['id'])
+                    issue_to_volume[issue_id] = volume_id
+
+                except (CVRateLimitReached, VolumeNotMatched, KeyError,
+                        TypeError, ValueError) as e:
+                    LOGGER.warning(
+                        f'Failed to resolve CV issue {issue_id}: {e}'
+                    )
+                    continue
+
+        # Fetch volume metadata for the discovered volume IDs
+        unique_volume_ids = set(issue_to_volume.values())
+        volume_metadata: Dict[int, VolumeMetadata] = {}
+
+        if unique_volume_ids:
+            try:
+                volumes = await self.fetch_volumes(list(unique_volume_ids))
+                for vol in volumes:
+                    volume_metadata[vol['comicvine_id']] = vol
+            except Exception as e:
+                LOGGER.warning(
+                    f'Failed to fetch volume metadata for '
+                    f'CV-resolved volumes: {e}'
+                )
+
+        # Build results for each group
+        for group_number, issue_id in groups_to_issue_ids.items():
+            volume_id = issue_to_volume.get(issue_id)
+            if volume_id is None:
+                matches[group_number] = no_match.copy()
+                continue
+
+            vol = volume_metadata.get(volume_id)
+            if vol is None:
+                matches[group_number] = no_match.copy()
+                continue
+
+            # Filter non-english if requested
+            if only_english and vol.get('translated', False):
+                matches[group_number] = no_match.copy()
+                continue
+
+            matches[group_number] = {
+                'id': vol['comicvine_id'],
+                'title': f"{vol['title']} ({vol['year']})",
+                'issue_count': vol['issue_count'],
+                'link': vol['site_url']
+            }
 
         return matches

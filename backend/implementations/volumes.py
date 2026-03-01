@@ -26,7 +26,7 @@ from backend.base.definitions import (BaseEnum, Constants, FileData,
                                       GeneralFileData, IssueData,
                                       LibraryFilter, LibrarySorting,
                                       MonitorScheme, SpecialVersion,
-                                      VolumeData)
+                                      VolumeData, VolumeMetadata)
 from backend.base.files import (change_basefolder, create_folder,
                                 delete_empty_child_folders,
                                 delete_empty_parent_folders,
@@ -1266,6 +1266,179 @@ class Library:
 
         LOGGER.info(
             f'Added volume with CV ID {comicvine_id} and ID {volume_id}'
+        )
+        return volume_id
+
+    @classmethod
+    def add_from_local(
+        cls,
+        volume_data: 'VolumeMetadata',
+        root_folder_id: int,
+        monitored: bool = True,
+        monitor_scheme: MonitorScheme = MonitorScheme.ALL,
+        monitor_new_issues: bool = True,
+        volume_folder: Union[str, None] = None,
+        special_version: Union[SpecialVersion, None] = None
+    ) -> int:
+        """Add a volume using pre-fetched local CV data (no API calls).
+
+        Same as ``add()`` but accepts a ``VolumeMetadata`` dict (with
+        populated ``issues``) instead of calling the ComicVine API.
+
+        Args:
+            volume_data: Pre-fetched VolumeMetadata from local CV cache.
+            root_folder_id: The root folder to add the volume to.
+            monitored: Whether to monitor the volume.
+            monitor_scheme: How to monitor.
+            monitor_new_issues: Also monitor new issues.
+            volume_folder: Override the auto-generated folder.
+            special_version: Override special version detection.
+
+        Raises:
+            RootFolderNotFound: Root folder not found.
+            VolumeAlreadyAdded: Volume already in library.
+
+        Returns:
+            int: The ID of the new volume.
+        """
+        from backend.implementations.naming import generate_volume_folder_path
+
+        comicvine_id = volume_data['comicvine_id']
+
+        LOGGER.info(
+            'Adding volume from local CV: '
+            'CV ID %d, RF ID %d, M %s, MS %s, MNI %s, VF %s, SV %s',
+            comicvine_id,
+            root_folder_id,
+            monitored,
+            monitor_scheme.value,
+            monitor_new_issues,
+            volume_folder,
+            special_version
+        )
+
+        potential_volume_id = cls._cv_to_id(comicvine_id)
+        if potential_volume_id:
+            raise VolumeAlreadyAdded(comicvine_id, potential_volume_id)
+
+        root_folder = RootFolders().get_one(root_folder_id)
+
+        vd = volume_data
+
+        cursor = get_db()
+        with cursor:
+            volume_id = cursor.execute(
+                """
+                INSERT INTO volumes(
+                    comicvine_id,
+                    title,
+                    alt_title,
+                    year,
+                    publisher,
+                    volume_number,
+                    description,
+                    site_url,
+                    monitored,
+                    monitor_new_issues,
+                    root_folder,
+                    custom_folder,
+                    last_cv_fetch,
+                    special_version,
+                    special_version_locked
+                ) VALUES (
+                    :comicvine_id, :title, :alt_title,
+                    :year, :publisher, :volume_number, :description,
+                    :site_url, :monitored, :monitor_new_issues,
+                    :root_folder, :custom_folder,
+                    :last_cv_fetch, :special_version, :special_version_locked
+                );
+                """,
+                {
+                    "comicvine_id": vd["comicvine_id"],
+                    "title": vd["title"],
+                    "alt_title": (vd["aliases"] or [None])[0],
+                    "year": vd["year"],
+                    "publisher": vd["publisher"],
+                    "volume_number": vd["volume_number"],
+                    "description": vd["description"],
+                    "site_url": vd["site_url"],
+                    "monitored": monitored,
+                    "monitor_new_issues": monitor_new_issues,
+                    "root_folder": root_folder.id,
+                    "custom_folder": volume_folder is not None,
+                    "last_cv_fetch": round(time()),
+                    "special_version": None,
+                    "special_version_locked": special_version is not None
+                }
+            ).lastrowid
+
+            # No cover available from local DB (no image download)
+            cursor.execute(
+                """
+                INSERT INTO volumes_covers(volume_id, cover)
+                VALUES (:volume_id, :cover);
+                """,
+                {
+                    "volume_id": volume_id,
+                    "cover": None
+                }
+            )
+
+            cursor.executemany("""
+                INSERT INTO issues(
+                    volume_id,
+                    comicvine_id,
+                    issue_number,
+                    calculated_issue_number,
+                    title,
+                    date,
+                    description,
+                    monitored
+                ) VALUES (
+                    :volume_id, :comicvine_id,
+                    :issue_number, :calculated_issue_number,
+                    :title, :date, :description,
+                    :monitored
+                );
+                """,
+                (
+                    {
+                        "volume_id": volume_id,
+                        "comicvine_id": i["comicvine_id"],
+                        "issue_number": i["issue_number"],
+                        "calculated_issue_number": i["calculated_issue_number"],
+                        "title": i["title"],
+                        "date": i["date"],
+                        "description": i["description"],
+                        "monitored": True
+                    }
+                    for i in vd["issues"] or []
+                )
+            )
+
+            volume = Volume(volume_id)
+
+            if special_version is None:
+                special_version = determine_special_version(volume.id)
+            volume.update({'special_version': special_version})
+
+            folder = generate_volume_folder_path(
+                root_folder.folder,
+                volume.get_data(),
+                volume_folder
+            )
+            volume.update({'folder': folder})
+
+            if Settings().sv.create_empty_volume_folders:
+                create_folder(folder)
+                scan_files(volume_id)
+
+            volume.apply_monitor_scheme(monitor_scheme)
+
+            mass_process_files(volume_id)
+
+        LOGGER.info(
+            f'Added volume from local CV: CV ID {comicvine_id}, ID {volume_id}'
         )
         return volume_id
 

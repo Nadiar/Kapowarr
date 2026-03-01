@@ -18,8 +18,11 @@ from backend.base.custom_exceptions import (InvalidComicVineApiKey,
 from backend.base.helpers import Singleton, get_subclasses
 from backend.base.logging import LOGGER
 from backend.features.download_queue import DownloadHandler
+from backend.features.library_import import (import_library_local,
+                                             propose_library_import)
 from backend.features.search import auto_search
 from backend.implementations.conversion import mass_convert
+from backend.implementations.local_comicvine import is_local_cv_available
 from backend.implementations.naming import mass_rename
 from backend.implementations.volumes import Volume, refresh_and_scan
 from backend.internals.db import close_db, get_db
@@ -446,6 +449,64 @@ class UpdateAll(Task):
         return
 
 
+class AutoImportAll(Task):
+    "Automatically import all unimported comics that match in the local CV cache"
+
+    stop = False
+    message = ''
+    action = 'auto_import_all'
+    display_title = 'Auto Import'
+    category = ''
+
+    @property
+    def volume_id(self) -> None:
+        return None
+
+    @property
+    def issue_id(self) -> None:
+        return None
+
+    def __init__(self) -> None:
+        return
+
+    def run(self) -> None:
+        if not is_local_cv_available():
+            LOGGER.info('Auto Import skipped — local CV cache not available')
+            return
+
+        self.message = 'Scanning library for unimported comics'
+        WebSocket().emit(TaskStatusEvent(self.message))
+
+        proposals = propose_library_import(
+            limit=0,
+            local_only=True
+        )
+
+        # Filter to only files with a valid CV match
+        matches = [
+            {'id': p['cv']['id'], 'filepath': p['filepath']}
+            for p in proposals
+            if p['cv']['id'] is not None
+        ]
+
+        if not matches:
+            LOGGER.info('Auto Import: no matched comics to import')
+            self.message = 'No matched comics to import'
+            WebSocket().emit(TaskStatusEvent(self.message))
+            return
+
+        self.message = f'Importing matched comics ({len(matches)} files)'
+        WebSocket().emit(TaskStatusEvent(self.message))
+        LOGGER.info('Auto Import: %d matched files', len(matches))
+
+        added = import_library_local(matches)
+
+        self.message = f'Auto Import complete: {added} new volumes added'
+        WebSocket().emit(TaskStatusEvent(self.message))
+        LOGGER.info('Auto Import complete: %d new volumes added', added)
+        return
+
+
 class SearchAll(Task):
     "Trigger an automatic search for each volume in the library"
 
@@ -610,7 +671,7 @@ class TaskHandler(metaclass=Singleton):
         return any(
             t
             for t in TaskHandler.queue
-            if (isinstance(t['task'], (UpdateAll, SearchAll))
+            if (isinstance(t['task'], (UpdateAll, AutoImportAll, SearchAll))
                 or t['task'].volume_id == volume_id)
         )
 

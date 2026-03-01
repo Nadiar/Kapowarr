@@ -33,7 +33,8 @@ function loadProposal(api_key) {
 	const params = {
 		limit: parseInt(document.querySelector('#limit-input').value),
 		limit_parent_folder: document.querySelector('#folder-input').value,
-		only_english: document.querySelector('#lang-input').value
+		only_english: document.querySelector('#lang-input').value,
+		local_only: document.querySelector('#local-only-input').value
 	};
 	const ffi = document.querySelector('#folder-filter-input');
 	if (ffi.offsetParent !== null && (ffi.value || null) !== null)

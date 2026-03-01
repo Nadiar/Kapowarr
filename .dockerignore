@@ -130,6 +130,7 @@ dmypy.json
 
 # Database
 db/
+localcv.db
 
 # VS code
 *.code-workspace
