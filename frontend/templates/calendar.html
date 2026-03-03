@@ -1,0 +1,188 @@
+{% extends "base.html" %}
+{% from "base.html" import icon_button, window, loading_window %}
+{% block title %}Calendar{% endblock %}
+{% block css %}
+	<link rel="stylesheet" href="{{ url_for('static', filename='css/calendar.css') }}">
+	<link rel="stylesheet" href="{{ url_for('static', filename='css/window.css') }}">
+{% endblock %}
+{% block js %}
+	<script src="{{ url_for('static', filename='js/window.js') }}" defer></script>
+	<script src="{{ url_for('static', filename='js/calendar.js') }}" defer></script>
+{% endblock %}
+
+{% block pre_build_els %}
+	<a href="" class="calendar-issue" target="_blank" aria-label="">
+		<div class="calendar-issue-badges"></div>
+		<img class="calendar-issue-img" src="" alt="" loading="lazy">
+		<div class="calendar-issue-info">
+			<h3 class="calendar-issue-volume"></h3>
+			<p class="calendar-issue-number"></p>
+			<p class="calendar-issue-title"></p>
+			<p class="calendar-issue-publisher"></p>
+		</div>
+		<div class="calendar-issue-actions">
+			<button class="calendar-add-btn" type="button" title="Add volume to library">+</button>
+		</div>
+	</a>
+{% endblock %}
+
+{% block right_side_header %}
+	<div id="calendar-header-controls">
+		<button id="prev-period" title="Previous" type="button">
+			<img src="{{ url_for('static', filename='img/arrow_left.svg') }}" alt="Previous">
+		</button>
+		<h2 id="period-label"></h2>
+		<button id="next-period" title="Next" type="button">
+			<img src="{{ url_for('static', filename='img/arrow_right.svg') }}" alt="Next">
+		</button>
+		<button id="today-button" title="Go to current period" type="button">
+			Today
+		</button>
+		<div id="view-toggle">
+			<button id="view-week" class="view-btn active" title="Week view" type="button">Week</button>
+			<button id="view-month" class="view-btn" title="Month view" type="button">Month</button>
+		</div>
+	</div>
+{% endblock %}
+
+{% block main %}
+<main>
+	<section class="tool-bar-container" aria-label="Tool bar">
+		<div class="tool-bar">
+			{{ icon_button(
+				"refresh-calendar",
+				"Refresh the calendar data",
+				"refresh.svg",
+				"Refresh"
+			) }}
+			<button id="filter-toggle" title="Toggle publisher filter" type="button">
+				<img src="{{ url_for('static', filename='img/filter.svg') }}" alt="">
+				<div aria-hidden="true">
+					<p>Publishers</p>
+				</div>
+			</button>
+			<button id="add-all-unmonitored" title="Add all unmonitored volumes from this view" type="button">
+				<div aria-hidden="true">
+					<p>+ Add All</p>
+				</div>
+			</button>
+		</div>
+	</section>
+
+	<div id="calendar-layout">
+		<aside id="publisher-filter" class="hidden">
+			<div class="filter-header">
+				<h3>Publishers</h3>
+				<div class="filter-actions">
+					<button id="select-all-publishers" type="button">All</button>
+					<button id="select-none-publishers" type="button">None</button>
+				</div>
+			</div>
+			<label class="publisher-option any-publisher">
+				<input type="checkbox" value="any" checked>
+				<span>Any Publisher</span>
+			</label>
+			<div id="publisher-list"></div>
+
+			<div class="filter-section-divider"></div>
+
+			<div class="filter-header">
+				<h3>Format</h3>
+			</div>
+			<label class="format-option">
+				<input type="checkbox" id="filter-tpb" checked>
+				<span>Trade Paperbacks</span>
+			</label>
+			<label class="format-option">
+				<input type="checkbox" id="filter-hardcover" checked>
+				<span>Hard Covers</span>
+			</label>
+			<label class="format-option">
+				<input type="checkbox" id="filter-webcomic" checked>
+				<span>Webcomics</span>
+			</label>
+		</aside>
+
+		<div id="calendar-content">
+			<div id="calendar-grid"></div>
+			<section id="loading-calendar" class="loading-screen">
+				<img src="{{ url_for('static', filename='img/loading.svg') }}" class="spinning" alt="">
+				<p>Loading calendar...</p>
+			</section>
+			<section id="empty-calendar" class="loading-screen hidden">
+				<p>No comics found for this period</p>
+			</section>
+		</div>
+	</div>
+</main>
+{% endblock main %}
+
+{% block windows %}
+	{{ loading_window("calendar-loading-window", "Adding volume...") }}
+
+	{% set add_content %}
+		<form id="calendar-add-form">
+			<input type="hidden" id="calendar-cv-id" value="">
+			<p id="calendar-add-title" class="calendar-add-volume-title"></p>
+			<table class="fold-table">
+				<tr>
+					<th><label for="calendar-rootfolder-input">Root Folder</label></th>
+					<td>
+						<select id="calendar-rootfolder-input">
+						</select>
+					</td>
+				</tr>
+				<tr>
+					<th><label for="calendar-monitor-input">Monitor Volume</label></th>
+					<td>
+						<select id="calendar-monitor-input">
+							<option value="true" selected>Yes</option>
+							<option value="false">No</option>
+						</select>
+					</td>
+				</tr>
+				<tr>
+					<th><label for="calendar-monitor-issues-input">Monitor New Issues</label></th>
+					<td>
+						<select id="calendar-monitor-issues-input">
+							<option value="true" selected>Yes</option>
+							<option value="false">No</option>
+						</select>
+					</td>
+				</tr>
+				<tr>
+					<th><label for="calendar-monitoring-scheme-input">Monitoring Scheme</label></th>
+					<td>
+						<select id="calendar-monitoring-scheme-input">
+							<option value="all" selected>All</option>
+							<option value="missing">Missing</option>
+							<option value="none">None</option>
+						</select>
+					</td>
+				</tr>
+				<tr>
+					<th><label for="calendar-special-input">Special Version</label></th>
+					<td>
+						<select id="calendar-special-input">
+							<option value="auto" selected>Automatic</option>
+							<option value="">Normal Volume</option>
+							<option value="tpb">Trade Paper Back</option>
+							<option value="one-shot">One Shot</option>
+							<option value="hard-cover">Hard Cover</option>
+							<option value="omnibus">Omnibus</option>
+							<option value="volume-as-issue">Volume As Issue</option>
+						</select>
+					</td>
+				</tr>
+			</table>
+		</form>
+	{% endset %}
+
+	{% set add_submit %}
+		<label for="calendar-auto-search-input">Start search for missing volume</label>
+		<input type="checkbox" id="calendar-auto-search-input">
+		<button id="calendar-add-submit" type="submit" form="calendar-add-form">Add Volume</button>
+	{% endset %}
+
+	{{ window(False, "calendar-add-window", "Add volume", add_content, add_submit, "calendar-loading-window", True) }}
+{% endblock windows %}

@@ -159,9 +159,10 @@ class SettingsValues(PublicSettingsValues):
 task_intervals = {
     # If there are tasks that should be run at the same time,
     # but per se after each other, put them in that order in the dict.
-    'update_all': 3600,         # every hour
-    'auto_import_all': 86400,   # every day, runs before search_all
-    'search_all': 86400         # every day
+    'update_all': 3600,                 # every hour
+    'auto_import_all': 86400,           # every day, runs before search_all
+    'search_all': 86400,                # every day
+    'refresh_calendar_cache': 604800    # every week
 }
 
 

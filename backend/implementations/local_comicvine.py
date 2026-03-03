@@ -12,6 +12,7 @@ The local DB is expected at /app/db/localcv.db.
 """
 
 import sqlite3
+from datetime import date
 from os.path import isfile
 from re import IGNORECASE, compile
 from typing import Any, Dict, List, Optional, Sequence, Union
@@ -666,6 +667,55 @@ def fetch_volumes_local(
         conn.close()
 
 
+def fetch_issues_local(
+    volume_cv_ids: Sequence[int]
+) -> Optional[List[IssueMetadata]]:
+    """Fetch issue metadata for multiple volumes from the local CV database.
+
+    This is the local equivalent of ``ComicVine.fetch_issues()``.
+
+    Args:
+        volume_cv_ids: Sequence of numeric CV volume IDs.
+
+    Returns:
+        List of IssueMetadata dicts, or None if local DB unavailable.
+    """
+    conn = _get_local_cv_conn()
+    if conn is None:
+        return None
+
+    try:
+        cursor = conn.cursor()
+        date_type = Settings().sv.date_type.value
+        result: List[IssueMetadata] = []
+
+        batch_size = 500
+        ids = list(volume_cv_ids)
+        for i in range(0, len(ids), batch_size):
+            batch = ids[i:i + batch_size]
+            placeholders = ','.join('?' for _ in batch)
+            cursor.execute(
+                f'SELECT id, volume_id, name, issue_number, '
+                f'cover_date, store_date, description '
+                f'FROM cv_issue WHERE volume_id IN ({placeholders}) '
+                f'ORDER BY id',
+                batch
+            )
+            result.extend(
+                _format_local_issue(row, date_type)
+                for row in cursor.fetchall()
+            )
+
+        return result
+
+    except sqlite3.Error as e:
+        LOGGER.warning('fetch_issues_local failed: %s', e)
+        return None
+
+    finally:
+        conn.close()
+
+
 def local_filenames_to_cvs(
     file_groups: Dict[int, Dict[str, FilenameData]],
     only_english: bool
@@ -880,6 +930,188 @@ def local_resolve_groups_by_issue_ids(
         }
 
     return matches
+
+
+def fetch_issues_by_date_range_local(
+    start_date: str,
+    end_date: str
+) -> Optional[List[Dict[str, Any]]]:
+    """Fetch raw issue data from local cache for a store_date range.
+
+    Queries only by store_date (the actual shelf date).
+
+    Args:
+        start_date: Start of range in YYYY-MM-DD format (inclusive).
+        end_date: End of range in YYYY-MM-DD format (inclusive).
+
+    Returns:
+        List of raw-style dicts suitable for ``_enrich_with_publishers``,
+        or None if the local DB is unavailable.
+    """
+    conn = _get_local_cv_conn()
+    if conn is None:
+        return None
+
+    try:
+        cursor = conn.cursor()
+
+        # Query issues by store_date only
+        cursor.execute('''
+            SELECT i.id, i.volume_id, i.name, i.issue_number,
+                   i.cover_date, i.store_date, i.description,
+                   i.image_url, i.site_detail_url
+            FROM cv_issue i
+            WHERE i.store_date BETWEEN ? AND ?
+            ORDER BY i.store_date ASC
+        ''', (start_date, end_date))
+
+        rows = cursor.fetchall()
+        if not rows:
+            return []
+
+        # Fetch volume info for all matched issues
+        vol_ids = list({r['volume_id'] for r in rows})
+        vol_map: Dict[int, Dict[str, Any]] = {}
+        for i in range(0, len(vol_ids), 500):
+            batch = vol_ids[i:i + 500]
+            placeholders = ','.join('?' for _ in batch)
+            cursor.execute(
+                f'SELECT id, name FROM cv_volume WHERE id IN ({placeholders})',
+                batch
+            )
+            for vr in cursor.fetchall():
+                vol_map[vr['id']] = {'id': vr['id'], 'name': vr['name']}
+
+        # Build raw-style dicts matching the API format expected by
+        # calendar_cv._enrich_with_publishers()
+        result: List[Dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        for row in rows:
+            iid = int(row['id'])
+            if iid in seen_ids:
+                continue
+            seen_ids.add(iid)
+
+            vol_info = vol_map.get(row['volume_id'], {})
+            result.append({
+                'id': iid,
+                'volume': {
+                    'id': row['volume_id'],
+                    'name': vol_info.get('name', '')
+                },
+                'issue_number': row['issue_number'] or '',
+                'name': row['name'] or None,
+                'cover_date': row['cover_date'] or None,
+                'store_date': row['store_date'] or None,
+                'description': row['description'] or None,
+                'person_credits': [],  # Not stored locally
+                'image': {
+                    'small_url': row['image_url'] or ''
+                },
+                'site_detail_url': row['site_detail_url'] or ''
+            })
+
+        return result
+
+    except sqlite3.Error as e:
+        LOGGER.warning('fetch_issues_by_date_range_local failed: %s', e)
+        return None
+
+    finally:
+        conn.close()
+
+
+def is_date_range_cache_complete(
+    start_date: str,
+    end_date: str,
+    n_sigma: float = 2.0
+) -> bool:
+    """Return True if all months in the date range appear fully cached locally.
+
+    Computes the mean and standard deviation of per-month issue counts from
+    well-established historical months (at least 2 months old, sane dates),
+    then checks that every month overlapping the requested range has a count
+    at or above ``mean - n_sigma * stdev``.  Months below that threshold are
+    still filling in and should be fetched from the API instead.
+
+    Args:
+        start_date: Range start in YYYY-MM-DD format.
+        end_date:   Range end in YYYY-MM-DD format.
+        n_sigma:    How many standard deviations below the mean is still
+                    considered complete.  Default 2.0.
+
+    Returns:
+        True if every month in the range is confidently complete.
+    """
+    conn = _get_local_cv_conn()
+    if conn is None:
+        return False
+
+    try:
+        cursor = conn.cursor()
+        # Fetch per-month counts from stable historical months only:
+        # - at least 2 months old (recent months are still filling in)
+        # - sane date range (exclude CV data-entry errors like year 2121)
+        rows = cursor.execute("""
+            SELECT substr(store_date, 1, 7) AS month, COUNT(*) AS cnt
+            FROM cv_issue
+            WHERE store_date IS NOT NULL
+              AND store_date != ''
+              AND store_date < date('now', '-2 months')
+              AND store_date > '2000-01-01'
+              AND store_date < '2030-01-01'
+            GROUP BY month
+        """).fetchall()
+
+        if len(rows) < 6:
+            # Not enough historical data to make a reliable estimate
+            return False
+
+        counts = [r['cnt'] for r in rows]
+        mean = sum(counts) / len(counts)
+        variance = sum((c - mean) ** 2 for c in counts) / len(counts)
+        stdev = variance ** 0.5
+        threshold = mean - n_sigma * stdev
+
+        month_counts = {r['month']: r['cnt'] for r in rows}
+
+        # Walk every calendar month that overlaps the requested range
+        try:
+            start = date.fromisoformat(start_date)
+            end = date.fromisoformat(end_date)
+        except ValueError:
+            return False
+
+        current = date(start.year, start.month, 1)
+        while current <= end:
+            month_str = current.strftime('%Y-%m')
+            count = month_counts.get(month_str, 0)
+            if count < threshold:
+                LOGGER.debug(
+                    'Cache completeness: %s has %d issues (threshold %.0f) '
+                    '— treating as incomplete',
+                    month_str, count, threshold
+                )
+                return False
+            # Advance to next month
+            if current.month == 12:
+                current = date(current.year + 1, 1, 1)
+            else:
+                current = date(current.year, current.month + 1, 1)
+
+        LOGGER.debug(
+            'Cache completeness: all months in %s–%s are complete '
+            '(mean=%.0f, stdev=%.0f, threshold=%.0f)',
+            start_date, end_date, mean, stdev, threshold
+        )
+        return True
+
+    except sqlite3.Error as e:
+        LOGGER.warning('is_date_range_cache_complete failed: %s', e)
+        return False
+
+    finally:
+        conn.close()
 
 
 def is_local_cv_available() -> bool:

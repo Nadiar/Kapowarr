@@ -13,10 +13,13 @@ from typing import Dict, List, Tuple, Type, Union
 
 from flask import Flask
 
+from datetime import date, timedelta
+
 from backend.base.custom_exceptions import (InvalidComicVineApiKey,
                                             TaskNotDeletable, TaskNotFound)
 from backend.base.helpers import Singleton, get_subclasses
 from backend.base.logging import LOGGER
+from backend.features.calendar import clear_calendar_cache
 from backend.features.download_queue import DownloadHandler
 from backend.features.library_import import (import_library_local,
                                              propose_library_import)
@@ -529,9 +532,14 @@ class SearchAll(Task):
 
     def run(self) -> List[Tuple[str, int, Union[int, None]]]:
         cursor = get_db(force_new=True)
-        cursor.execute(
-            "SELECT id, title FROM volumes WHERE monitored = 1;"
-        )
+        cursor.execute("""
+            SELECT v.id, v.title
+            FROM volumes v
+            LEFT JOIN issues i ON i.volume_id = v.id
+            WHERE v.monitored = 1
+            GROUP BY v.id
+            ORDER BY COALESCE(MAX(i.date), '0000-00-00') DESC;
+        """)
         downloads: List[Tuple[str, int, Union[int, None]]] = []
         ws = WebSocket()
         for volume_id, volume_title in cursor:
@@ -547,6 +555,61 @@ class SearchAll(Task):
                     for result in results
                 ]
         return downloads
+
+
+class RefreshCalendarCache(Task):
+    "Fetch the past 14 days and next 7 days of issues from CV API into local cache"
+
+    stop = False
+    message = ''
+    action = 'refresh_calendar_cache'
+    display_title = 'Refresh Calendar Cache'
+    category = ''
+
+    @property
+    def volume_id(self) -> None:
+        return None
+
+    @property
+    def issue_id(self) -> None:
+        return None
+
+    def __init__(self) -> None:
+        return
+
+    def run(self) -> None:
+        from asyncio import run as async_run
+
+        from backend.implementations.comicvine import ComicVine
+
+        try:
+            cv = ComicVine()
+        except InvalidComicVineApiKey:
+            LOGGER.warning(
+                'No CV API key set; skipping calendar cache refresh'
+            )
+            return
+
+        today = date.today()
+        start_date = (today - timedelta(days=14)).isoformat()
+        end_date = (today + timedelta(days=7)).isoformat()
+
+        self.message = f'Fetching calendar issues {start_date} to {end_date}'
+        WebSocket().emit(TaskStatusEvent(self.message))
+
+        try:
+            count = async_run(cv.prefetch_calendar_from_api(start_date, end_date))
+            LOGGER.info(
+                'Calendar cache refresh: cached %d issues (%s to %s)',
+                count, start_date, end_date
+            )
+        except Exception:
+            LOGGER.exception('Calendar cache refresh failed')
+            return
+
+        # Evict in-memory cache so the next view reads fresh localcv.db data
+        clear_calendar_cache()
+        return
 
 
 # =====================

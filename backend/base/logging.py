@@ -19,6 +19,23 @@ class UpToInfoFilter(logging.Filter):
         return record.levelno <= logging.INFO
 
 
+class SuppressSocketDisconnectFilter(logging.Filter):
+    """Suppress the noisy 'Session is disconnected' KeyError that waitress
+    logs when a WebSocket client disconnects before the server finishes
+    processing the request. This is a normal part of WebSocket teardown."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if 'Session is disconnected' in record.getMessage():
+            return False
+        # Also check exception info — the KeyError appears in the traceback,
+        # not in the log message itself (which is "Exception while serving...")
+        if record.exc_info:
+            exc = record.exc_info[1]
+            if isinstance(exc, KeyError) and exc.args == ('Session is disconnected',):
+                return False
+        return True
+
+
 class ErrorColorFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> Any:
         result = super().format(record)
@@ -68,6 +85,9 @@ LOGGING_CONFIG = {
     "filters": {
         "up_to_info": {
             "()": UpToInfoFilter
+        },
+        "suppress_socket_disconnect": {
+            "()": SuppressSocketDisconnectFilter
         }
     },
     "handlers": {
@@ -75,13 +95,14 @@ LOGGING_CONFIG = {
             "class": "logging.StreamHandler",
             "level": "WARNING",
             "formatter": "simple_red",
+            "filters": ["suppress_socket_disconnect"],
             "stream": "ext://sys.stderr"
         },
         "console": {
             "class": "logging.StreamHandler",
             "level": "DEBUG",
             "formatter": "simple",
-            "filters": ["up_to_info"],
+            "filters": ["up_to_info", "suppress_socket_disconnect"],
             "stream": "ext://sys.stdout"
         },
         "file": {

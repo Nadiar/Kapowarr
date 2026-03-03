@@ -26,7 +26,12 @@ from backend.base.helpers import (AsyncSession, Session, batched,
                                   to_full_string_cv_id, to_string_cv_id)
 from backend.base.logging import LOGGER
 from backend.implementations.local_comicvine import (
-    cache_issues_from_api, cache_volumes_from_api)
+    cache_issues_from_api, cache_volumes_from_api,
+    fetch_issues_by_date_range_local, fetch_issues_local,
+    fetch_volume_local, fetch_volumes_local,
+    is_date_range_cache_complete,
+    local_filenames_to_cvs, local_resolve_groups_by_issue_ids,
+    resolve_issue_ids_local, search_volumes_local)
 from backend.implementations.matching import select_best_volume_result_for_file
 
 
@@ -455,6 +460,9 @@ class ComicVine:
     async def fetch_volume(self, cv_id: Union[str, int]) -> VolumeMetadata:
         """Get the metadata of a volume, including its issues.
 
+        Checks the local CV cache first and only hits the API if the
+        volume is not cached.
+
         Args:
             cv_id (Union[str, int]): The CV ID of the volume.
 
@@ -471,14 +479,43 @@ class ComicVine:
         except ValueError:
             raise VolumeNotMatched
 
+        # Try local cache first
+        numeric_id = int(cv_id.split('-')[-1])
+        cached = fetch_volume_local(numeric_id)
+        if cached is not None and cached.get('issues') is not None:
+            LOGGER.debug('fetch_volume(%s): served from local cache', cv_id)
+            # Download cover from URL (not stored in local DB)
+            if cached['cover_link']:
+                async with AsyncSession() as session:
+                    cached['cover'] = await session.get_content(
+                        cached['cover_link'],
+                        quiet_fail=True
+                    ) or None
+            return cached
+
         LOGGER.debug(f'Fetching volume data for {cv_id}')
 
         async with AsyncSession() as session:
-            result = await self.__call_api(
-                session,
-                f'/volume/{cv_id}',
-                {'field_list': self.volume_field_list}
-            )
+            try:
+                result = await self.__call_api(
+                    session,
+                    f'/volume/{cv_id}',
+                    {'field_list': self.volume_field_list}
+                )
+            except CVRateLimitReached:
+                # Fall back to local cache even without issues
+                if cached is not None:
+                    LOGGER.info(
+                        'fetch_volume(%s): rate-limited, using stale cache',
+                        cv_id
+                    )
+                    if cached['cover_link']:
+                        cached['cover'] = await session.get_content(
+                            cached['cover_link'],
+                            quiet_fail=True
+                        ) or None
+                    return cached
+                raise
 
             _safe_cache_volumes([result['results']])
 
@@ -500,6 +537,9 @@ class ComicVine:
     ) -> List[VolumeMetadata]:
         """Get the metadata of the volumes, without their issues.
 
+        Checks the local CV cache first and only API-fetches volumes
+        not found in the cache. Falls back to cache on rate limit.
+
         Args:
             cv_ids (Sequence[Union[str, int]]): The CV IDs of the volumes.
 
@@ -519,13 +559,56 @@ class ComicVine:
 
         LOGGER.debug(f'Fetching volume data for {formatted_cv_ids}')
 
-        # Each request to CV can return 100 volumes. Make 10 requests at the
-        # same time (one batch). Wait/cooldown in between batches. Spending time
-        # fetching covers immediately after each batch increases cooldown.
-        volume_infos = []
+        # Check local cache for all requested IDs
+        numeric_ids = [int(cid) for cid in formatted_cv_ids]
+        cached_map = fetch_volumes_local(numeric_ids)
+        cached_volumes: List[VolumeMetadata] = []
+        missing_cv_ids: List[str] = []
+
+        if cached_map:
+            for cid_str, cid_int in zip(formatted_cv_ids, numeric_ids):
+                if cid_int in cached_map:
+                    cached_volumes.append(cached_map[cid_int])
+                else:
+                    missing_cv_ids.append(cid_str)
+        else:
+            missing_cv_ids = list(formatted_cv_ids)
+
+        if cached_volumes:
+            LOGGER.info(
+                'fetch_volumes: %d/%d served from local cache, '
+                '%d need API fetch',
+                len(cached_volumes), len(formatted_cv_ids),
+                len(missing_cv_ids)
+            )
+
+        # If everything was cached, download covers and return
+        if not missing_cv_ids:
+            async with AsyncSession() as session:
+                cover_map = {
+                    v['comicvine_id']: session.get_content(
+                        v['cover_link'], quiet_fail=True
+                    )
+                    for v in cached_volumes
+                    if v['cover_link']
+                }
+                if cover_map:
+                    cover_responses = dict(zip(
+                        cover_map.keys(),
+                        await gather(*cover_map.values())
+                    ))
+                    for v in cached_volumes:
+                        v['cover'] = cover_responses.get(
+                            v['comicvine_id']
+                        ) or None
+
+            return cached_volumes
+
+        # Fetch missing volumes from API
+        api_volumes: List[VolumeMetadata] = []
         async with AsyncSession() as session:
             async for request_batch in self.__sleep_iter(
-                batched(formatted_cv_ids, 1000), 10
+                batched(missing_cv_ids, 1000), 10
             ):
                 tasks = (
                     self.__call_api(
@@ -546,13 +629,12 @@ class ComicVine:
                 if raw_vols:
                     _safe_cache_volumes(raw_vols)
 
-                # Format volume responses and prep cover requests
                 batch_volumes: List[VolumeMetadata] = [
                     self.__format_volume_output(result)
                     for batch in responses
                     for result in batch['results']
                 ]
-                cover_map: Dict[int, Any] = {
+                cover_map_api: Dict[int, Any] = {
                     volume['comicvine_id']: session.get_content(
                         volume['cover_link'],
                         quiet_fail=True
@@ -560,25 +642,47 @@ class ComicVine:
                     for volume in batch_volumes
                 }
 
-                # Fetch covers and add them to the volume info
                 cover_responses = dict(zip(
-                    cover_map.keys(),
-                    await gather(*cover_map.values())
+                    cover_map_api.keys(),
+                    await gather(*cover_map_api.values())
                 ))
                 for volume in batch_volumes:
                     volume['cover'] = cover_responses.get(
                         volume['comicvine_id']
                     ) or None
 
-                volume_infos.extend(batch_volumes)
+                api_volumes.extend(batch_volumes)
 
-            return volume_infos
+            # Download covers for cached volumes too
+            if cached_volumes:
+                cover_map_cached: Dict[int, Any] = {
+                    v['comicvine_id']: session.get_content(
+                        v['cover_link'], quiet_fail=True
+                    )
+                    for v in cached_volumes
+                    if v['cover_link']
+                }
+                if cover_map_cached:
+                    cover_responses = dict(zip(
+                        cover_map_cached.keys(),
+                        await gather(*cover_map_cached.values())
+                    ))
+                    for v in cached_volumes:
+                        v['cover'] = cover_responses.get(
+                            v['comicvine_id']
+                        ) or None
+
+            return cached_volumes + api_volumes
 
     async def fetch_issues(
         self,
         cv_ids: Sequence[Union[str, int]]
     ) -> List[IssueMetadata]:
         """Get the metadata of the issues of volumes.
+
+        Checks the local CV cache first and only API-fetches issues
+        for volumes not found in the cache. Falls back to cache on
+        rate limit.
 
         Args:
             cv_ids (Sequence[Union[str, int]]): The CV IDs of the volumes.
@@ -599,9 +703,39 @@ class ComicVine:
 
         LOGGER.debug(f'Fetching issue data for volumes {formatted_cv_ids}')
 
-        issue_infos = []
+        # Check local cache first
+        numeric_ids = [int(cid) for cid in formatted_cv_ids]
+        cached_issues = fetch_issues_local(numeric_ids)
+
+        if cached_issues:
+            # Determine which volumes have cached issues
+            cached_volume_ids = {i['volume_id'] for i in cached_issues}
+            missing_cv_ids = [
+                cid for cid, nid in zip(formatted_cv_ids, numeric_ids)
+                if nid not in cached_volume_ids
+            ]
+
+            if not missing_cv_ids:
+                LOGGER.info(
+                    'fetch_issues: all %d volumes served from local cache',
+                    len(formatted_cv_ids)
+                )
+                return cached_issues
+
+            LOGGER.info(
+                'fetch_issues: %d/%d volumes cached, %d need API fetch',
+                len(formatted_cv_ids) - len(missing_cv_ids),
+                len(formatted_cv_ids),
+                len(missing_cv_ids)
+            )
+        else:
+            missing_cv_ids = list(formatted_cv_ids)
+            cached_issues = []
+
+        # Fetch missing from API
+        api_issues: List[IssueMetadata] = []
         async with AsyncSession() as session:
-            for id_batch in batched(formatted_cv_ids, 50):
+            for id_batch in batched(missing_cv_ids, 50):
                 batch_filter = "|".join(id_batch)
                 try:
                     results = await self.__call_api(
@@ -614,11 +748,16 @@ class ComicVine:
                     )
 
                 except CVRateLimitReached:
+                    LOGGER.info(
+                        'fetch_issues: rate-limited, returning %d cached '
+                        '+ %d API issues',
+                        len(cached_issues), len(api_issues)
+                    )
                     break
 
                 _safe_cache_issues(results['results'])
 
-                issue_infos.extend((
+                api_issues.extend((
                     self.__format_issue_output(r)
                     for r in results['results']
                 ))
@@ -647,12 +786,12 @@ class ComicVine:
                         for batch in responses:
                             _safe_cache_issues(batch['results'])
 
-                            issue_infos.extend((
+                            api_issues.extend((
                                 self.__format_issue_output(r)
                                 for r in batch['results']
                             ))
 
-            return issue_infos
+            return cached_issues + api_issues
 
     async def __search_volume(
         self, query: str
@@ -695,6 +834,10 @@ class ComicVine:
     ) -> List[VolumeMetadata]:
         """Search for volumes.
 
+        Checks the local FTS index first. If local results are found,
+        returns them without hitting the API. Falls back to API for
+        queries with no local matches.
+
         Args:
             query (str): The query to use when searching.
             allow_rate_limit_reached (bool, optional): Instead of a
@@ -710,6 +853,40 @@ class ComicVine:
         """
         LOGGER.debug(f'Searching for volumes with the query {query}')
 
+        # For CV ID lookups, try local cache first
+        if query.startswith(('4050-', 'cv:')):
+            try:
+                cv_id_str = to_full_string_cv_id((query,))[0]
+                numeric_id = int(cv_id_str.split('-')[-1])
+                cached = fetch_volume_local(numeric_id)
+                if cached is not None:
+                    LOGGER.debug(
+                        'search_volumes(%s): served from local cache', query
+                    )
+                    # Mark already_added
+                    cursor = get_db()
+                    row = cursor.execute(
+                        'SELECT id FROM volumes WHERE comicvine_id = ? '
+                        'LIMIT 1',
+                        (numeric_id,)
+                    ).fetchone()
+                    cached['already_added'] = row['id'] if row else None
+                    cached['issues'] = None  # Search results don't include issues
+                    return [cached]
+            except (ValueError, Exception):
+                pass
+
+        # For text queries, try local FTS
+        if not query.startswith(('4050-', 'cv:')):
+            local_results = search_volumes_local(query)
+            if local_results:
+                LOGGER.debug(
+                    'search_volumes(%s): %d results from local cache',
+                    query, len(local_results)
+                )
+                return local_results
+
+        # Fall back to API
         try:
             if query.startswith(('4050-', 'cv:')):
                 results = await self.__search_volume(query)
@@ -738,6 +915,9 @@ class ComicVine:
     ) -> Dict[int, Dict[str, Any]]:
         """Match groups of filenames to CV volumes.
 
+        Checks the local CV cache first and only hits the API for
+        groups that couldn't be resolved locally.
+
         Args:
             file_groups (Dict[int, Dict[str, FilenameData]]): The file groups.
                 Is a mapping from group number to a mapping of filename to
@@ -748,14 +928,36 @@ class ComicVine:
             Dict[int, Dict[str, Any]]: A mapping from the group number to its CV
                 match.
         """
-        # All files in a group share a series title. Searching is done by series
-        # title, so search for every title/group instead of for every file.
-        titles_to_groups: Dict[str, List[int]] = {}
-        for group_numbers, file_group in file_groups.items():
-            series_name = next(iter(file_group.values()))['series'].lower()
-            titles_to_groups.setdefault(series_name, []).append(group_numbers)
+        # Try local resolution first
+        local_matches = local_filenames_to_cvs(file_groups, only_english)
 
-        # Search for each title in batches
+        # Find groups that weren't resolved locally
+        unresolved_groups = {
+            gn: fg
+            for gn, fg in file_groups.items()
+            if local_matches.get(gn, {}).get('id') is None
+        }
+
+        if not unresolved_groups:
+            LOGGER.info(
+                'filenames_to_cvs: all %d groups served from local cache',
+                len(file_groups)
+            )
+            return local_matches
+
+        LOGGER.info(
+            'filenames_to_cvs: %d/%d resolved locally, %d need API',
+            len(file_groups) - len(unresolved_groups),
+            len(file_groups),
+            len(unresolved_groups)
+        )
+
+        # Fall back to API for unresolved groups
+        titles_to_groups: Dict[str, List[int]] = {}
+        for group_number, file_group in unresolved_groups.items():
+            series_name = next(iter(file_group.values()))['series'].lower()
+            titles_to_groups.setdefault(series_name, []).append(group_number)
+
         titles_to_results: Dict[str, List[VolumeMetadata]] = {}
         async for title_batch in self.__sleep_iter(
             batched(list(titles_to_groups), 10), 10
@@ -768,32 +970,30 @@ class ComicVine:
                 ))
             )))
 
-        matches: Dict[int, Dict[str, Any]] = {}
         for title, group_numbers in titles_to_groups.items():
             for group_number in group_numbers:
                 result = select_best_volume_result_for_file(
-                    file_groups[group_number],
+                    unresolved_groups[group_number],
                     titles_to_results[title],
                     only_english=only_english
                 )
 
                 if result is None:
-                    matches[group_number] = {
+                    local_matches[group_number] = {
                         'id': None,
                         'title': None,
                         'issue_count': None,
                         'link': None
                     }
-
                 else:
-                    matches[group_number] = {
+                    local_matches[group_number] = {
                         'id': result['comicvine_id'],
                         'title': f"{result['title']} ({result['year']})",
                         'issue_count': result['issue_count'],
                         'link': result['site_url']
                     }
 
-        return matches
+        return local_matches
 
     async def resolve_groups_by_issue_ids(
         self,
@@ -803,9 +1003,8 @@ class ComicVine:
         """Resolve file groups directly via ComicVine issue IDs (from
         ComicInfo.xml), bypassing the title-based search entirely.
 
-        Each issue ID is fetched from the CV API to get its parent volume,
-        then the volume metadata is returned in the same format as
-        filenames_to_cvs().
+        Checks the local CV cache first and only hits the API for
+        issue IDs not found locally.
 
         Args:
             groups_to_issue_ids: Mapping from group number to CV issue ID
@@ -816,7 +1015,35 @@ class ComicVine:
             A mapping from group number to its CV match (same format as
             filenames_to_cvs output).
         """
-        matches: Dict[int, Dict[str, Any]] = {}
+        # Try local resolution first
+        local_matches = local_resolve_groups_by_issue_ids(
+            groups_to_issue_ids, only_english
+        )
+
+        # Find groups that weren't resolved locally (id is None)
+        unresolved = {
+            gn: iid
+            for gn, iid in groups_to_issue_ids.items()
+            if local_matches.get(gn, {}).get('id') is None
+        }
+
+        if not unresolved:
+            LOGGER.info(
+                'resolve_groups_by_issue_ids: all %d groups served '
+                'from local cache',
+                len(groups_to_issue_ids)
+            )
+            return local_matches
+
+        LOGGER.info(
+            'resolve_groups_by_issue_ids: %d/%d resolved locally, '
+            '%d need API',
+            len(groups_to_issue_ids) - len(unresolved),
+            len(groups_to_issue_ids),
+            len(unresolved)
+        )
+
+        # Fall back to API for unresolved groups
         no_match = {
             'id': None,
             'title': None,
@@ -824,10 +1051,8 @@ class ComicVine:
             'link': None
         }
 
-        # Deduplicate: multiple groups might reference the same issue ID
-        unique_issue_ids = set(groups_to_issue_ids.values())
+        unique_issue_ids = set(unresolved.values())
 
-        # Fetch issue details to get parent volume IDs
         issue_to_volume: Dict[int, int] = {}
         async with AsyncSession() as session:
             for issue_id in unique_issue_ids:
@@ -847,7 +1072,6 @@ class ComicVine:
                     )
                     continue
 
-        # Fetch volume metadata for the discovered volume IDs
         unique_volume_ids = set(issue_to_volume.values())
         volume_metadata: Dict[int, VolumeMetadata] = {}
 
@@ -862,28 +1086,227 @@ class ComicVine:
                     f'CV-resolved volumes: {e}'
                 )
 
-        # Build results for each group
-        for group_number, issue_id in groups_to_issue_ids.items():
+        # Merge: start with local matches, override unresolved with API results
+        for group_number, issue_id in unresolved.items():
             volume_id = issue_to_volume.get(issue_id)
             if volume_id is None:
-                matches[group_number] = no_match.copy()
+                local_matches[group_number] = no_match.copy()
                 continue
 
             vol = volume_metadata.get(volume_id)
             if vol is None:
-                matches[group_number] = no_match.copy()
+                local_matches[group_number] = no_match.copy()
                 continue
 
-            # Filter non-english if requested
             if only_english and vol.get('translated', False):
-                matches[group_number] = no_match.copy()
+                local_matches[group_number] = no_match.copy()
                 continue
 
-            matches[group_number] = {
+            local_matches[group_number] = {
                 'id': vol['comicvine_id'],
                 'title': f"{vol['title']} ({vol['year']})",
                 'issue_count': vol['issue_count'],
                 'link': vol['site_url']
             }
 
-        return matches
+        return local_matches
+
+    async def fetch_issues_by_date_range(
+        self,
+        start_date: str,
+        end_date: str
+    ) -> List[Dict[str, Any]]:
+        """Fetch raw issue data for issues in a date range from the local cache.
+
+        Returns only locally cached data — never calls the CV API.
+        Use ``prefetch_calendar_from_api`` (via the ``RefreshCalendarCache``
+        background task) to populate the local cache ahead of time.
+
+        Args:
+            start_date: Start of range in YYYY-MM-DD format (inclusive).
+            end_date: End of range in YYYY-MM-DD format (inclusive).
+
+        Returns:
+            List of raw issue dicts for matching issues, or empty list.
+        """
+        local_issues = fetch_issues_by_date_range_local(start_date, end_date)
+        if local_issues:
+            LOGGER.info(
+                'Calendar: %d issues from local cache for %s to %s',
+                len(local_issues), start_date, end_date
+            )
+            return local_issues
+
+        if local_issues is not None and is_date_range_cache_complete(
+            start_date, end_date
+        ):
+            LOGGER.info(
+                'Calendar: cache confirmed complete, 0 issues for %s to %s',
+                start_date, end_date
+            )
+
+        return local_issues or []
+
+    async def prefetch_calendar_from_api(
+        self,
+        start_date: str,
+        end_date: str
+    ) -> int:
+        """Fetch issues for a date range from the CV API and write to local cache.
+
+        Intended to be called by the ``RefreshCalendarCache`` background task.
+        Results are stored in localcv.db via ``_safe_cache_issues`` so that
+        subsequent ``fetch_issues_by_date_range`` calls are served locally.
+
+        Args:
+            start_date: Start of range in YYYY-MM-DD format (inclusive).
+            end_date: End of range in YYYY-MM-DD format (inclusive).
+
+        Returns:
+            Total number of issues fetched and cached.
+        """
+        calendar_field_list = ','.join((
+            'id', 'issue_number', 'name', 'cover_date', 'store_date',
+            'volume', 'image', 'site_detail_url',
+            'description', 'person_credits'
+        ))
+
+        all_raw: List[Dict[str, Any]] = []
+
+        params = {
+            'field_list': calendar_field_list,
+            'filter': f'store_date:{start_date}|{end_date}',
+            'sort': 'store_date:asc',
+            'offset': 0
+        }
+
+        async with AsyncSession() as session:
+            try:
+                result = await self.__call_api(
+                    session, '/issues', params
+                )
+            except CVRateLimitReached:
+                LOGGER.warning('CV rate limit on calendar prefetch request')
+                return 0
+            except Exception as e:
+                LOGGER.warning('Calendar prefetch query failed: %s', e)
+                return 0
+
+            total = result.get('number_of_total_results', 0)
+            raw = result.get('results', [])
+            all_raw.extend(raw)
+            _safe_cache_issues(raw)
+
+            LOGGER.info(
+                'Calendar prefetch: fetched %d/%d issues for %s to %s',
+                len(raw), total, start_date, end_date
+            )
+
+            if total > 100:
+                offsets = list(range(100, total, 100))
+                async for offset_batch in self.__sleep_iter(
+                    batched(offsets, 10), 10
+                ):
+                    tasks = []
+                    for offset in offset_batch:
+                        p = dict(params)
+                        p['offset'] = offset
+                        tasks.append(
+                            self.__call_api(
+                                session, '/issues', p,
+                                {'results': []}
+                            )
+                        )
+
+                    responses = await gather(*tasks)
+                    for resp in responses:
+                        batch_raw = resp.get('results', [])
+                        all_raw.extend(batch_raw)
+                        _safe_cache_issues(batch_raw)
+
+        return len(all_raw)
+
+    async def fetch_volumes_for_enrichment(
+        self,
+        volume_ids: List[int]
+    ) -> List[Dict[str, Any]]:
+        """Fetch raw volume data for publisher enrichment.
+
+        Checks local cache first, only API-fetches volumes not found
+        locally. Returns raw API-style dicts so callers can extract
+        publisher info.
+
+        Args:
+            volume_ids: CV volume IDs to fetch.
+
+        Returns:
+            List of raw API result dicts for matching volumes.
+        """
+        enrichment_field_list = ','.join((
+            'id', 'name', 'publisher', 'image', 'site_detail_url',
+            'aliases', 'count_of_issues', 'deck', 'description', 'start_year'
+        ))
+
+        # Check local cache first for all requested IDs
+        cached_map = fetch_volumes_local(volume_ids)
+        all_vols: List[Dict[str, Any]] = []
+        missing_ids: List[int] = []
+
+        if cached_map:
+            for vid in volume_ids:
+                if vid in cached_map:
+                    vol = cached_map[vid]
+                    # Convert VolumeMetadata back to raw API-style dict
+                    all_vols.append({
+                        'id': vol['comicvine_id'],
+                        'name': vol['title'],
+                        'publisher': {
+                            'id': None,
+                            'name': vol.get('publisher')
+                        } if vol.get('publisher') else None,
+                        'image': {'small_url': vol.get('cover_link', '')},
+                        'site_detail_url': vol.get('site_url', ''),
+                        'aliases': '\r\n'.join(vol.get('aliases') or []),
+                        'count_of_issues': vol.get('issue_count', 0),
+                        'deck': '',
+                        'description': vol.get('description', ''),
+                        'start_year': vol.get('year')
+                    })
+                else:
+                    missing_ids.append(vid)
+        else:
+            missing_ids = list(volume_ids)
+
+        if not missing_ids:
+            LOGGER.info(
+                'fetch_volumes_for_enrichment: all %d served from cache',
+                len(volume_ids)
+            )
+            return all_vols
+
+        # Fetch missing from API
+        async with AsyncSession() as session:
+            for id_batch in batched(missing_ids, 100):
+                str_ids = [str(vid) for vid in id_batch]
+                try:
+                    result = await self.__call_api(
+                        session,
+                        '/volumes',
+                        {
+                            'field_list': enrichment_field_list,
+                            'filter': f'id:{"|".join(str_ids)}'
+                        },
+                        {'results': []}
+                    )
+                except CVRateLimitReached:
+                    LOGGER.warning(
+                        'CV rate limit while enriching calendar volumes'
+                    )
+                    break
+
+                raw_vols = result.get('results', [])
+                if raw_vols:
+                    _safe_cache_volumes(raw_vols)
+                    all_vols.extend(raw_vols)
+
+        return all_vols
