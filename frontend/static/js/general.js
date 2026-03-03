@@ -294,7 +294,13 @@ const default_values = {
 	'last_login': 0,
 	'monitor_new_volume': true,
 	'monitor_new_issues': true,
-	'monitoring_scheme': "all"
+	'monitoring_scheme': "all",
+	'calendar_any_publisher': true,
+	'calendar_publisher_ids': [],
+	'calendar_view_mode': 'week',
+	'calendar_show_tpb': true,
+	'calendar_show_hardcover': true,
+	'calendar_show_webcomic': true
 };
 
 function setupLocalStorage() {

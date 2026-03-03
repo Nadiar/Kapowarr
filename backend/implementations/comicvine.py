@@ -763,3 +763,138 @@ class ComicVine:
                     }
 
         return matches
+
+    async def fetch_issues_by_date_range(
+        self,
+        start_date: str,
+        end_date: str
+    ) -> List[Dict[str, Any]]:
+        """Fetch raw issue data for issues in a date range from the CV API.
+
+        Queries by both ``store_date`` and ``cover_date`` to catch issues
+        that only have one of the two populated (older issues often lack
+        ``store_date``). Results are deduplicated by issue ID.
+
+        Args:
+            start_date: Start of range in YYYY-MM-DD format (inclusive).
+            end_date: End of range in YYYY-MM-DD format (inclusive).
+
+        Returns:
+            List of unique raw API result dicts for matching issues.
+        """
+        calendar_field_list = ','.join((
+            'id', 'issue_number', 'name', 'cover_date', 'store_date',
+            'volume', 'image', 'site_detail_url',
+            'description', 'person_credits'
+        ))
+
+        all_raw: List[Dict[str, Any]] = []
+
+        async with AsyncSession() as session:
+            for date_field in ('store_date', 'cover_date'):
+                if all_raw:
+                    await sleep(Constants.CV_BRAKE_TIME)
+
+                params = {
+                    'field_list': calendar_field_list,
+                    'filter': f'{date_field}:{start_date}|{end_date}',
+                    'sort': f'{date_field}:asc',
+                    'offset': 0
+                }
+
+                try:
+                    result = await self.__call_api(
+                        session, '/issues', params
+                    )
+                except CVRateLimitReached:
+                    LOGGER.warning(
+                        'CV rate limit on calendar %s request', date_field
+                    )
+                    continue
+                except Exception as e:
+                    LOGGER.warning(
+                        'Calendar %s query failed: %s', date_field, e
+                    )
+                    continue
+
+                total = result.get('number_of_total_results', 0)
+                raw = result.get('results', [])
+                all_raw.extend(raw)
+
+                LOGGER.info(
+                    'Calendar (%s): fetched %d/%d issues for %s to %s',
+                    date_field, len(raw), total, start_date, end_date
+                )
+
+                if total > 100:
+                    offsets = list(range(100, total, 100))
+                    async for offset_batch in self.__sleep_iter(
+                        batched(offsets, 10), 10
+                    ):
+                        tasks = []
+                        for offset in offset_batch:
+                            p = dict(params)
+                            p['offset'] = offset
+                            tasks.append(
+                                self.__call_api(
+                                    session, '/issues', p,
+                                    {'results': []}
+                                )
+                            )
+
+                        responses = await gather(*tasks)
+                        for resp in responses:
+                            all_raw.extend(resp.get('results', []))
+
+        # Deduplicate by issue ID
+        seen_ids: set[int] = set()
+        unique: List[Dict[str, Any]] = []
+        for issue in all_raw:
+            iid = int(issue['id'])
+            if iid not in seen_ids:
+                seen_ids.add(iid)
+                unique.append(issue)
+
+        return unique
+
+    async def fetch_volumes_for_enrichment(
+        self,
+        volume_ids: List[int]
+    ) -> List[Dict[str, Any]]:
+        """Fetch raw volume data for publisher enrichment.
+
+        Args:
+            volume_ids: CV volume IDs to fetch.
+
+        Returns:
+            List of raw API result dicts for matching volumes.
+        """
+        enrichment_field_list = ','.join((
+            'id', 'name', 'publisher', 'image', 'site_detail_url',
+            'aliases', 'count_of_issues', 'deck', 'description', 'start_year'
+        ))
+
+        all_vols: List[Dict[str, Any]] = []
+
+        async with AsyncSession() as session:
+            for id_batch in batched(volume_ids, 100):
+                str_ids = [str(vid) for vid in id_batch]
+                try:
+                    result = await self.__call_api(
+                        session,
+                        '/volumes',
+                        {
+                            'field_list': enrichment_field_list,
+                            'filter': 'id:{}'.format('|'.join(str_ids))
+                        },
+                        {'results': []}
+                    )
+                except CVRateLimitReached:
+                    LOGGER.warning(
+                        'CV rate limit while enriching calendar volumes'
+                    )
+                    break
+
+                all_vols.extend(result.get('results', []))
+
+        return all_vols

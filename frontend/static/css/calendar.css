@@ -1,0 +1,482 @@
+/*  */
+/* Calendar Header Controls */
+/*  */
+#calendar-header-controls {
+	display: flex;
+	align-items: center;
+	gap: .5rem;
+	margin-right: .5rem;
+}
+
+#calendar-header-controls button {
+	width: 2rem;
+	height: 2rem;
+	padding: .4rem;
+	border-radius: 4px;
+	background-color: transparent;
+	color: var(--header-color);
+	font-size: .8rem;
+	font-weight: 500;
+}
+
+#calendar-header-controls button:hover {
+	background-color: rgba(0, 0, 0, 0.1);
+}
+
+#today-button {
+	width: auto !important;
+	padding: .4rem .75rem !important;
+	border: 2px solid var(--header-color);
+	border-radius: 4px;
+	font-weight: 500;
+}
+
+#view-toggle {
+	display: flex;
+	gap: 0;
+	margin-left: .25rem;
+}
+
+.view-btn {
+	width: auto !important;
+	padding: .3rem .5rem !important;
+	border: 1px solid var(--header-color) !important;
+	font-size: .7rem !important;
+	opacity: .6;
+	transition: opacity 150ms ease;
+}
+
+.view-btn:first-child {
+	border-radius: 4px 0 0 4px !important;
+	border-right: none !important;
+}
+
+.view-btn:last-child {
+	border-radius: 0 4px 4px 0 !important;
+}
+
+.view-btn.active {
+	opacity: 1;
+	background-color: rgba(255, 255, 255, 0.15) !important;
+	font-weight: 600 !important;
+}
+
+#period-label {
+	font-size: .9rem;
+	font-weight: 500;
+	color: var(--header-color);
+	white-space: nowrap;
+	min-width: 10rem;
+	text-align: center;
+}
+
+/*  */
+/* Calendar Layout */
+/*  */
+#calendar-layout {
+	display: flex;
+	flex: 1;
+	overflow: hidden;
+}
+
+#calendar-content {
+	flex: 1;
+	overflow-y: auto;
+	padding: 1rem;
+	position: relative;
+}
+
+#loading-calendar,
+#empty-calendar {
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+	bottom: 0;
+}
+
+#loading-calendar img {
+	width: 3rem;
+	height: 3rem;
+}
+
+/*  */
+/* Publisher Filter Sidebar */
+/*  */
+#publisher-filter {
+	width: 220px;
+	flex: 0 0 auto;
+	overflow-y: auto;
+	padding: .75rem;
+	background-color: var(--foreground-color);
+	border-right: 1px solid var(--border-color);
+}
+
+.filter-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	margin-bottom: .75rem;
+	padding-bottom: .5rem;
+	border-bottom: 1px solid var(--border-color);
+}
+
+.filter-header h3 {
+	font-size: .85rem;
+	font-weight: 500;
+	color: var(--text-color);
+}
+
+.filter-actions {
+	display: flex;
+	gap: .25rem;
+}
+
+.filter-actions button {
+	padding: .15rem .4rem;
+	border: 1px solid var(--border-color);
+	border-radius: 3px;
+	background-color: var(--background-color);
+	color: var(--dimmed-text-color);
+	font-size: .7rem;
+	cursor: pointer;
+}
+
+.filter-actions button:hover {
+	background-color: var(--hover-color);
+	color: var(--text-color);
+}
+
+.publisher-option {
+	display: flex;
+	align-items: center;
+	gap: .5rem;
+	padding: .35rem .25rem;
+	border-radius: 3px;
+	cursor: pointer;
+	font-size: .8rem;
+	color: var(--text-color);
+}
+
+.publisher-option:hover {
+	background-color: var(--hover-color);
+}
+
+.publisher-option input[type="checkbox"] {
+	accent-color: var(--accent-color);
+	cursor: pointer;
+}
+
+.publisher-option.any-publisher {
+	margin-bottom: .5rem;
+	padding-bottom: .5rem;
+	border-bottom: 1px solid var(--border-color);
+	font-weight: 500;
+}
+
+.filter-section-divider {
+	margin: .75rem 0;
+	border-top: 1px solid var(--border-color);
+}
+
+.format-option {
+	display: flex;
+	align-items: center;
+	gap: .5rem;
+	padding: .35rem .25rem;
+	border-radius: 3px;
+	cursor: pointer;
+	font-size: .8rem;
+	color: var(--text-color);
+}
+
+.format-option:hover {
+	background-color: var(--hover-color);
+}
+
+.format-option input[type="checkbox"] {
+	accent-color: var(--accent-color);
+	cursor: pointer;
+}
+
+/*  */
+/* Calendar Grid */
+/*  */
+#calendar-grid {
+	display: flex;
+	flex-direction: column;
+	gap: 1.5rem;
+}
+
+.calendar-day {
+	background-color: var(--foreground-color);
+	border-radius: 6px;
+	overflow: hidden;
+}
+
+.calendar-day-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	padding: .6rem 1rem;
+	background-color: var(--accent-color);
+	color: var(--header-color);
+}
+
+.calendar-day-header h3 {
+	font-size: .85rem;
+	font-weight: 500;
+}
+
+.calendar-day-header .issue-count {
+	font-size: .75rem;
+	font-weight: 400;
+	opacity: .8;
+}
+
+.calendar-day-issues {
+	display: flex;
+	flex-wrap: wrap;
+	gap: .5rem;
+	padding: .75rem;
+}
+
+/*  */
+/* Calendar Issue Card */
+/*  */
+.calendar-issue {
+	width: clamp(9rem, 14vw, 12rem);
+	display: flex;
+	flex-direction: column;
+	border-radius: 4px;
+	overflow: hidden;
+	background-color: var(--background-color);
+	text-decoration: none;
+	color: var(--text-color);
+	transition: transform 150ms ease, box-shadow 150ms ease;
+	position: relative;
+}
+
+.calendar-issue:hover {
+	text-decoration: none;
+	transform: translateY(-2px);
+	box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+}
+
+/* Status border indicators */
+.calendar-issue.in-library {
+	border: 2px solid var(--accent-color);
+}
+
+.calendar-issue.is-downloaded {
+	border-color: #2ecc71;
+}
+
+.calendar-issue.is-monitored {
+	border-color: #3498db;
+}
+
+/* Badges */
+.calendar-issue-badges {
+	position: absolute;
+	top: .25rem;
+	left: .25rem;
+	display: flex;
+	gap: .2rem;
+	z-index: 1;
+	flex-wrap: wrap;
+	max-width: calc(100% - 2.5rem);
+}
+
+.badge {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 1.4rem;
+	height: 1.4rem;
+	border-radius: 50%;
+	background-color: rgba(0, 0, 0, 0.65);
+	font-size: .7rem;
+	line-height: 1;
+	cursor: default;
+}
+
+/* Actions overlay */
+.calendar-issue-actions {
+	position: absolute;
+	top: .25rem;
+	right: .25rem;
+	z-index: 1;
+}
+
+.calendar-add-btn {
+	width: 1.6rem;
+	height: 1.6rem;
+	border-radius: 50%;
+	border: none;
+	background-color: var(--accent-color);
+	color: var(--header-color);
+	font-size: 1rem;
+	font-weight: 700;
+	line-height: 1;
+	cursor: pointer;
+	opacity: 0;
+	transition: opacity 150ms ease;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.calendar-issue:hover .calendar-add-btn:not(.hidden) {
+	opacity: 1;
+}
+
+.calendar-add-btn:hover {
+	transform: scale(1.15);
+}
+
+.calendar-issue-img {
+	width: 100%;
+	aspect-ratio: 2/3;
+	object-fit: cover;
+	background-color: var(--border-color);
+}
+
+.calendar-issue-info {
+	padding: .5rem;
+	display: flex;
+	flex-direction: column;
+	gap: .15rem;
+}
+
+.calendar-issue-volume {
+	font-size: .75rem;
+	font-weight: 500;
+	color: var(--text-color);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.calendar-issue-number {
+	font-size: .7rem;
+	color: var(--dimmed-text-color);
+}
+
+.calendar-issue-title {
+	font-size: .65rem;
+	color: var(--dimmed-text-color);
+	font-style: italic;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.calendar-issue-publisher {
+	font-size: .65rem;
+	color: var(--accent-color);
+	font-weight: 500;
+	margin-top: .15rem;
+}
+
+/*  */
+/* Toolbar filter toggle */
+/*  */
+#filter-toggle {
+	display: inline-flex;
+	flex-direction: column;
+	gap: .125rem;
+	align-items: center;
+	justify-content: center;
+}
+
+#filter-toggle img {
+	height: 1.15rem;
+}
+
+#filter-toggle div {
+	display: flex;
+	justify-content: center;
+	align-items: center;
+	flex: 1;
+}
+
+#filter-toggle div > p {
+	word-wrap: normal;
+	font-size: .65rem;
+}
+
+#filter-toggle.active {
+	background-color: var(--accent-color);
+	color: var(--header-color);
+}
+
+#add-all-unmonitored {
+	display: inline-flex;
+	flex-direction: column;
+	gap: .125rem;
+	align-items: center;
+	justify-content: center;
+}
+
+#add-all-unmonitored div {
+	display: flex;
+	justify-content: center;
+	align-items: center;
+	flex: 1;
+}
+
+#add-all-unmonitored div > p {
+	word-wrap: normal;
+	font-size: .65rem;
+	white-space: nowrap;
+}
+
+#add-all-unmonitored:disabled {
+	opacity: .5;
+	cursor: wait;
+}
+
+/*  */
+/* Responsive */
+/*  */
+@media (max-width: 720px) {
+	#publisher-filter {
+		position: absolute;
+		left: 0;
+		top: 0;
+		bottom: 0;
+		z-index: 5;
+		width: 200px;
+		box-shadow: 4px 0 12px rgba(0, 0, 0, 0.2);
+	}
+
+	#calendar-header-controls {
+		gap: .25rem;
+	}
+
+	#week-label {
+		font-size: .75rem;
+		min-width: 7rem;
+	}
+
+	.calendar-issue {
+		width: clamp(7rem, 40vw, 10rem);
+	}
+
+	.calendar-day-issues {
+		justify-content: center;
+	}
+}
+
+/*  */
+/* Add Volume Window Overrides */
+/*  */
+.calendar-add-volume-title {
+	font-size: .95rem;
+	font-weight: 500;
+	color: var(--text-color);
+	margin-bottom: .5rem;
+	padding-bottom: .5rem;
+	border-bottom: 1px solid var(--border-color);
+}

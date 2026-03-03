@@ -17,6 +17,7 @@ from backend.base.definitions import (BlocklistReason, BlocklistReasonID,
                                       SpecialVersion, StartType, VolumeData)
 from backend.base.helpers import hash_credential
 from backend.base.logging import LOGGER, get_log_file_contents
+from backend.features.calendar import get_calendar, get_publisher_presets
 from backend.features.download_queue import (DownloadHandler,
                                              delete_download_history,
                                              get_download_history)
@@ -1439,3 +1440,33 @@ def api_files(f_id: int):
     elif request.method == 'DELETE':
         delete_issue_file(f_id)
         return return_api({})
+
+
+# =====================
+# Calendar
+# =====================
+@api.route('/calendar', methods=['GET'])
+@error_handler
+@auth
+def api_calendar():
+    start = request.values.get('start')
+    end = request.values.get('end')
+    if not start or not end:
+        raise KeyNotFound('start' if not start else 'end')
+    publishers_raw = request.values.get('publishers', '')
+    publisher_ids = None
+    if publishers_raw:
+        try:
+            publisher_ids = [int(p) for p in publishers_raw.split(',') if p]
+        except ValueError:
+            raise InvalidKeyValue('publishers', publishers_raw)
+    result = get_calendar(start, end, publisher_ids,
+                          force_refresh=bool(request.values.get('force')))
+    return return_api(result)
+
+
+@api.route('/calendar/publishers', methods=['GET'])
+@error_handler
+@auth
+def api_calendar_publishers():
+    return return_api(get_publisher_presets())

@@ -66,6 +66,11 @@ def ui_library_import():
     return render('library_import.html')
 
 
+@ui.route('/calendar', methods=methods)
+def ui_calendar():
+    return render('calendar.html')
+
+
 @ui.route('/volumes/<id>', methods=methods)
 def ui_view_volume(id):
     return render('view_volume.html')
