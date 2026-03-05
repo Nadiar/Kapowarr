@@ -22,16 +22,6 @@ _calendar_cache: Dict[Tuple[str, str], Tuple[float, list]] = {}
 _CACHE_MAX_ENTRIES = 20
 
 
-def clear_calendar_cache() -> None:
-    """Evict all entries from the in-memory calendar cache.
-
-    Called by ``RefreshCalendarCache`` after populating localcv.db so the
-    next calendar page-view picks up the freshly cached data.
-    """
-    _calendar_cache.clear()
-    LOGGER.debug('In-memory calendar cache cleared')
-
-
 class CalendarIssue(TypedDict):
     """A comic issue returned by the calendar endpoint."""
     comicvine_id: int
@@ -193,13 +183,30 @@ def get_calendar(
     cache_key = (start_date, end_date)
     now = time()
 
-    # Check cache
-    cached = _calendar_cache.get(cache_key)
-    if not force_refresh and cached and (now - cached[0]) < _CACHE_TTL:
-        LOGGER.debug('Calendar cache hit for %s to %s', start_date, end_date)
-        # Deep copy so library status refresh doesn't persist across requests
-        issues = [dict(i) for i in cached[1]]
-    else:
+    # Check cache — exact match first, then look for a superset range
+    issues: Optional[List[CalendarIssue]] = None
+
+    if not force_refresh:
+        # Exact match
+        cached = _calendar_cache.get(cache_key)
+        if cached and (now - cached[0]) < _CACHE_TTL:
+            LOGGER.debug('Calendar cache hit for %s to %s', start_date, end_date)
+            issues = [dict(i) for i in cached[1]]
+        else:
+            # Check if any cached range fully contains the requested range
+            for (cs, ce), (ts, cached_issues) in _calendar_cache.items():
+                if cs <= start_date and ce >= end_date and (now - ts) < _CACHE_TTL:
+                    LOGGER.debug(
+                        'Calendar cache subset hit: %s–%s within %s–%s',
+                        start_date, end_date, cs, ce
+                    )
+                    issues = [
+                        dict(i) for i in cached_issues
+                        if start_date <= (i.get('effective_date') or '') <= end_date
+                    ]
+                    break
+
+    if issues is None:
         LOGGER.info('Calendar cache miss for %s to %s', start_date, end_date)
         issues = fetch_calendar_issues(start_date, end_date)
 

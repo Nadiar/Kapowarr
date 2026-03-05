@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls found:*)",
+      "Bash(gh repo:*)",
+      "Bash(gh search:*)",
+      "Bash(python:*)",
+      "Bash(gh auth:*)",
+      "WebSearch",
+      "Bash(setx GITHUB_PERSONAL_ACCESS_TOKEN:*)"
+    ]
+  }
+}

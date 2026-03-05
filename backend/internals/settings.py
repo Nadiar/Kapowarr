@@ -66,6 +66,7 @@ class PublicSettingsValues:
     auth_password: str = ''
 
     comicvine_api_key: str = ''
+    comicvine_api_url: str = 'https://comicvine.gamespot.com/api'
     api_key: str = ''
     flaresolverr_base_url: str = ''
 
@@ -455,6 +456,11 @@ class Settings(metaclass=Singleton):
             from backend.implementations.comicvine import ComicVine
             converted_value = value.strip()
             if converted_value and not ComicVine(converted_value).test_key():
+                raise InvalidKeyValue(key, value)
+
+        elif key == 'comicvine_api_url':
+            converted_value = value.strip().rstrip('/')
+            if converted_value and not converted_value.startswith(('http://', 'https://')):
                 raise InvalidKeyValue(key, value)
 
         elif key == 'download_folder':

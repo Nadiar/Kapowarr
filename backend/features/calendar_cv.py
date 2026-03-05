@@ -42,11 +42,8 @@ def _enrich_with_publishers(
     Returns:
         List of CalendarIssue TypedDicts with publisher info filled in.
     """
-    # Filter out stub entries (no description AND no creators)
-    issues = [
-        i for i in issues
-        if i.get('description') or i.get('person_credits')
-    ]
+    # NOTE: Stub filter removed — CVProxy may return issues without
+    # description/person_credits from local cache; filtering here
     # Collect unique volume IDs
     volume_ids = {
         int(issue['volume']['id'])

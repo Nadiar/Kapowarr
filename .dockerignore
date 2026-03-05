@@ -160,3 +160,4 @@ temp_downloads/*
 docs/
 project_management/
 requirements-dev.txt
+localcv.db

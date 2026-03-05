@@ -47,10 +47,10 @@ class Constants:
     DB_NAME = "Kapowarr.db"
     "Name of database file itself"
 
-    DB_TIMEOUT = 10.0 # seconds
+    DB_TIMEOUT = 30.0 # seconds
     "Seconds to wait on database command before timing out"
 
-    DB_MAX_CONCURRENT_CONNECTIONS = 32
+    DB_MAX_CONCURRENT_CONNECTIONS = 4
     "Maximum allowed database connections to be open at the same time"
 
     LOGGER_NAME = "Kapowarr"
@@ -97,7 +97,7 @@ class Constants:
     CV_SITE_URL = "https://comicvine.gamespot.com"
     "The base URL of ComicVine"
 
-    CV_API_URL = "https://comicvine.gamespot.com/api"
+    CV_API_URL = "http://cvproxy:8585/api"
     "The base URL of the ComicVine API"
 
     CV_BRAKE_TIME = 1.0 # seconds

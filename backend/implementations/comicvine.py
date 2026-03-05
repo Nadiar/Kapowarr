@@ -186,6 +186,8 @@ class ComicVine:
         if not api_key:
             raise InvalidComicVineApiKey
 
+        self.api_url = settings.comicvine_api_url or Constants.CV_API_URL
+
         self.ssn = Session()
         self._params = {'format': 'json', 'api_key': api_key}
         self.ssn.params.update(self._params) # type: ignore
@@ -229,7 +231,7 @@ class ComicVine:
 
         try:
             response = await session.get(
-                Constants.CV_API_URL + url_path,
+                self.api_url + url_path,
                 params={**self._params, **params}
             )
             result: Dict[str, Any] = await response.json()
@@ -771,16 +773,16 @@ class ComicVine:
     ) -> List[Dict[str, Any]]:
         """Fetch raw issue data for issues in a date range from the CV API.
 
-        Queries by both ``store_date`` and ``cover_date`` to catch issues
-        that only have one of the two populated (older issues often lack
-        ``store_date``). Results are deduplicated by issue ID.
+        Queries by ``store_date`` only — the actual shelf date for new
+        releases.  Older issues that lack ``store_date`` are intentionally
+        excluded so the calendar shows only genuine new releases.
 
         Args:
             start_date: Start of range in YYYY-MM-DD format (inclusive).
             end_date: End of range in YYYY-MM-DD format (inclusive).
 
         Returns:
-            List of unique raw API result dicts for matching issues.
+            List of raw API result dicts for matching issues.
         """
         calendar_field_list = ','.join((
             'id', 'issue_number', 'name', 'cover_date', 'store_date',
@@ -791,71 +793,58 @@ class ComicVine:
         all_raw: List[Dict[str, Any]] = []
 
         async with AsyncSession() as session:
-            for date_field in ('store_date', 'cover_date'):
-                if all_raw:
-                    await sleep(Constants.CV_BRAKE_TIME)
+            params = {
+                'field_list': calendar_field_list,
+                'filter': f'store_date:{start_date}|{end_date}',
+                'sort': 'store_date:asc',
+                'offset': 0
+            }
 
-                params = {
-                    'field_list': calendar_field_list,
-                    'filter': f'{date_field}:{start_date}|{end_date}',
-                    'sort': f'{date_field}:asc',
-                    'offset': 0
-                }
-
-                try:
-                    result = await self.__call_api(
-                        session, '/issues', params
-                    )
-                except CVRateLimitReached:
-                    LOGGER.warning(
-                        'CV rate limit on calendar %s request', date_field
-                    )
-                    continue
-                except Exception as e:
-                    LOGGER.warning(
-                        'Calendar %s query failed: %s', date_field, e
-                    )
-                    continue
-
-                total = result.get('number_of_total_results', 0)
-                raw = result.get('results', [])
-                all_raw.extend(raw)
-
-                LOGGER.info(
-                    'Calendar (%s): fetched %d/%d issues for %s to %s',
-                    date_field, len(raw), total, start_date, end_date
+            try:
+                result = await self.__call_api(
+                    session, '/issues', params
                 )
+            except CVRateLimitReached:
+                LOGGER.warning(
+                    'CV rate limit on calendar store_date request'
+                )
+                return []
+            except Exception as e:
+                LOGGER.warning(
+                    'Calendar store_date query failed: %s', e
+                )
+                return []
 
-                if total > 100:
-                    offsets = list(range(100, total, 100))
-                    async for offset_batch in self.__sleep_iter(
-                        batched(offsets, 10), 10
-                    ):
-                        tasks = []
-                        for offset in offset_batch:
-                            p = dict(params)
-                            p['offset'] = offset
-                            tasks.append(
-                                self.__call_api(
-                                    session, '/issues', p,
-                                    {'results': []}
-                                )
+            total = result.get('number_of_total_results', 0)
+            raw = result.get('results', [])
+            all_raw.extend(raw)
+
+            LOGGER.info(
+                'Calendar: fetched %d/%d issues for %s to %s',
+                len(raw), total, start_date, end_date
+            )
+
+            if total > 100:
+                offsets = list(range(100, total, 100))
+                async for offset_batch in self.__sleep_iter(
+                    batched(offsets, 10), 10
+                ):
+                    tasks = []
+                    for offset in offset_batch:
+                        p = dict(params)
+                        p['offset'] = offset
+                        tasks.append(
+                            self.__call_api(
+                                session, '/issues', p,
+                                {'results': []}
                             )
+                        )
 
-                        responses = await gather(*tasks)
-                        for resp in responses:
-                            all_raw.extend(resp.get('results', []))
+                    responses = await gather(*tasks)
+                    for resp in responses:
+                        all_raw.extend(resp.get('results', []))
 
-        # Deduplicate by issue ID
-        seen_ids: set[int] = set()
-        unique: List[Dict[str, Any]] = []
-        for issue in all_raw:
-            iid = int(issue['id'])
-            if iid not in seen_ids:
-                seen_ids.add(iid)
-                unique.append(issue)
-
-        return unique
+        return all_raw
 
     async def fetch_volumes_for_enrichment(
         self,

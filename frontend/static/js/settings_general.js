@@ -14,6 +14,7 @@ function fillSettings(api_key) {
 		document.querySelector('#proxy-password-input').value = json.result.proxy_password;
 		document.querySelector('#proxy-ignored-addresses-input').value = json.result.proxy_ignored_addresses.join(',');
 		document.querySelector('#cv-input').value = json.result.comicvine_api_key;
+		document.querySelector('#cv-url-input').value = json.result.comicvine_api_url;
 		document.querySelector('#flaresolverr-input').value = json.result.flaresolverr_base_url;
 		document.querySelector('#log-level-input').value = json.result.log_level;
 		
@@ -32,6 +33,7 @@ function saveSettings(api_key) {
 	document.querySelector('#proxy-username-input').classList.remove('error-input');
 	document.querySelector('#proxy-password-input').classList.remove('error-input');
 	document.querySelector('#cv-input').classList.remove('error-input');
+	document.querySelector('#cv-url-input').classList.remove('error-input');
 	document.querySelector("#flaresolverr-input").classList.remove('error-input');
 
 	let proxyIgnoredAddresses = document.querySelector('#proxy-ignored-addresses-input').value.split(',');
@@ -51,6 +53,7 @@ function saveSettings(api_key) {
 		'proxy_password': document.querySelector('#proxy-password-input').value,
 		'proxy_ignored_addresses': proxyIgnoredAddresses,
 		'comicvine_api_key': document.querySelector('#cv-input').value,
+		'comicvine_api_url': document.querySelector('#cv-url-input').value,
 		'flaresolverr_base_url': document.querySelector('#flaresolverr-input').value,
 		'log_level': parseInt(document.querySelector('#log-level-input').value)
 	};

@@ -1184,3 +1184,12 @@ def _migrate_add_forced_file_match_column():
     """)
 
     return
+
+
+@DatabaseMigrationHandler.register_handler(45)
+def _migrate_add_comicvine_api_url():
+    get_db().executescript("""
+        INSERT OR IGNORE INTO config(key, value)
+        VALUES ('comicvine_api_url', 'https://comicvine.gamespot.com/api');
+    """)
+    return
