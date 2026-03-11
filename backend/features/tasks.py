@@ -7,6 +7,7 @@ Background tasks and their handling
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import date, timedelta
 from threading import Thread, Timer
 from time import sleep, time
 from typing import Dict, List, Tuple, Type, Union
@@ -488,6 +489,62 @@ class SearchAll(Task):
         return downloads
 
 
+class SearchRecent(Task):
+    """Search for missing issues released in the past 2 weeks or releasing
+    in the next week."""
+
+    stop = False
+    message = ''
+    action = 'search_recent'
+    display_title = 'Search Recent'
+    category = 'download'
+
+    @property
+    def volume_id(self) -> None:
+        return None
+
+    @property
+    def issue_id(self) -> None:
+        return None
+
+    def __init__(self) -> None:
+        return
+
+    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+        today = date.today()
+        window_start = (today - timedelta(days=14)).isoformat()
+        window_end = (today + timedelta(days=7)).isoformat()
+        cursor = get_db(force_new=True)
+        cursor.execute(
+            """
+            SELECT DISTINCT i.volume_id, v.title
+            FROM issues i
+            JOIN volumes v ON v.id = i.volume_id
+            LEFT JOIN issues_files if ON i.id = if.issue_id
+            WHERE
+                v.monitored = 1
+                AND i.monitored = 1
+                AND if.file_id IS NULL
+                AND i.date BETWEEN ? AND ?;
+            """,
+            (window_start, window_end)
+        )
+        downloads: List[Tuple[str, int, Union[int, None]]] = []
+        ws = WebSocket()
+        for volume_id, volume_title in cursor:
+            if self.stop:
+                break
+            self.message = f'Searching for {volume_title}'
+            ws.emit(TaskStatusEvent(self.message))
+            results = auto_search(volume_id)
+            if results:
+                downloads += [
+                    (result['link'], volume_id, None)
+                    for result in results
+                ]
+        return downloads
+
+
 # =====================
 # Task handling
 # =====================
@@ -610,7 +667,7 @@ class TaskHandler(metaclass=Singleton):
         return any(
             t
             for t in TaskHandler.queue
-            if (isinstance(t['task'], (UpdateAll, SearchAll))
+            if (isinstance(t['task'], (UpdateAll, SearchAll, SearchRecent))
                 or t['task'].volume_id == volume_id)
         )
 
