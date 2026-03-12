@@ -8,7 +8,8 @@ from asyncio import gather
 from functools import reduce
 from hashlib import sha1
 from re import IGNORECASE, compile
-from typing import Callable, List, Tuple, Type, Union
+from time import time as _time
+from typing import Callable, Dict, List, Tuple, Type, Union
 
 from aiohttp import ClientError
 from bencoding import bencode
@@ -731,6 +732,13 @@ async def _test_paths(
 
 
 # region Searching
+# In-memory cache for GetComics search results.
+# Avoids re-scraping the same query during bulk tasks like SearchAll.
+_search_cache: Dict[str, Tuple[float, List[SearchResultData]]] = {}
+_SEARCH_CACHE_TTL = 3600  # 1 hour
+_SEARCH_CACHE_MAX = 200
+
+
 async def search_getcomics(
     session: AsyncSession,
     query: str
@@ -744,6 +752,12 @@ async def search_getcomics(
     Returns:
         List[SearchResultData]: The search results.
     """
+    # Check cache first
+    now = _time()
+    cached = _search_cache.get(query)
+    if cached and (now - cached[0]) < _SEARCH_CACHE_TTL:
+        return [dict(r) for r in cached[1]]
+
     # Fetch first page and determine max pages
     first_page = await session.get_text(
         Constants.GC_SITE_URL,
@@ -800,6 +814,12 @@ async def search_getcomics(
         for soup in (first_soup, *other_soups)
         for article in _get_articles(soup)
     ]
+
+    # Store in cache (evict oldest if over limit)
+    if len(_search_cache) >= _SEARCH_CACHE_MAX:
+        oldest_key = min(_search_cache, key=lambda k: _search_cache[k][0])
+        del _search_cache[oldest_key]
+    _search_cache[query] = (_time(), formatted_results)
 
     return formatted_results
 

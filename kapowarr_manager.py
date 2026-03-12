@@ -2,17 +2,19 @@
 """
 Kapowarr Manager
 ----------------
-CLI tool to manage Kapowarr running jobs and task intervals via docker exec.
+CLI tool to manage Kapowarr running jobs and task intervals.
 
-Uses the HTTP API for read operations and docker exec for operations the API
-doesn't expose (stopping the running task, changing intervals).
+- Queued tasks are stopped via the HTTP API.
+- The currently RUNNING task cannot be stopped through the API; use
+  'docker restart <container>' if you need to abort it immediately.
+- Task intervals are updated via docker exec (direct DB write + timer reschedule).
 
 Usage:
     python kapowarr_manager.py [--container NAME] [--url URL] [--key API_KEY] <command> [args]
 
 Commands:
     list                          Show all running and queued jobs
-    stop <name>                   Stop a job by name (partial match, including running)
+    stop <name>                   Stop queued jobs by name (partial match)
     intervals                     Show scheduled task intervals
     set-interval <task> <hours>   Set a task's interval in hours
 
@@ -34,13 +36,14 @@ Examples:
     python kapowarr_manager.py intervals
     python kapowarr_manager.py set-interval search_all 12
     python kapowarr_manager.py set-interval update_all 2
+    python kapowarr_manager.py logs search           # all log lines for past/current Search All runs
+    python kapowarr_manager.py logs search --follow  # live-stream logs for the running job
 """
 
 from __future__ import annotations
 
 import argparse
 import configparser
-import json
 import os
 import subprocess
 import sys
@@ -155,6 +158,15 @@ class KapowarrClient:
     def delete_task(self, task_id: int) -> None:
         self._delete(f"/system/tasks/{task_id}")
 
+    def get_logs(self) -> str:
+        resp = self._session.get(
+            f"{self.base_url}/api/system/logs",
+            params={"api_key": self.api_key},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.text
+
 
 # ---------------------------------------------------------------------------
 # docker exec helpers
@@ -253,95 +265,165 @@ def cmd_list(client: KapowarrClient) -> None:
     print()
 
 
-# Python snippet run inside the container to stop the currently running task.
-# Sets task.stop = True and waits for the thread to finish (mirrors stop_handle).
-_STOP_RUNNING_SNIPPET = """\
-import sys, os
-os.chdir('/app')
-sys.path.insert(0, '/app')
-
-from backend.features.tasks import TaskHandler
-
-handler = TaskHandler()
-q = handler.queue
-if not q:
-    print('NO_TASKS')
-else:
-    entry = q[0]
-    title = entry['task'].display_title
-    if entry['status'] != 'running':
-        print(f'NOT_RUNNING:{title}')
-    else:
-        entry['task'].stop = True
-        entry['thread'].join()
-        print(f'STOPPED:{title}')
-"""
-
-# Python snippet to stop a queued (not yet running) task by action/display_title.
-# task_name_lower is interpolated by the host script.
-_STOP_QUEUED_SNIPPET = """\
-import sys, os, json
-os.chdir('/app')
-sys.path.insert(0, '/app')
-
-from backend.base.custom_exceptions import TaskNotDeletable
-from backend.features.tasks import TaskHandler
-from backend.internals.server import WebSocket, TaskEndedEvent
-
-handler = TaskHandler()
-name_lower = {name_lower!r}
-matches = [
-    e for i, e in enumerate(handler.queue)
-    if i > 0
-    and (
-        name_lower in e['task'].display_title.lower()
-        or name_lower in e['task'].action.lower()
-    )
-]
-if not matches:
-    print('NO_MATCH')
-else:
-    removed = []
-    for entry in matches:
-        entry['task'].stop = True
-        entry['thread'].join() if entry['status'] == 'running' else None
-        handler.queue.remove(entry)
-        WebSocket().emit(TaskEndedEvent(entry['task']))
-        removed.append(entry['task'].display_title)
-    print('REMOVED:' + json.dumps(removed))
-"""
-
 # Python snippet to update a task's interval in the DB.
+# Note: the in-process timer will pick up the new value on its next tick.
 _SET_INTERVAL_SNIPPET = """\
 import sys, os
 os.chdir('/app')
 sys.path.insert(0, '/app')
 
-from backend.internals.db import get_db, commit
-from backend.features.tasks import task_library, TaskHandler
+from flask import Flask
+from backend.internals.db import close_db, get_db, commit, set_db_location
+from backend.features.tasks import task_library
 
-task_name   = {task_name!r}
+task_name    = {task_name!r}
 new_interval = {new_interval_s!r}
 
 if task_name not in task_library:
     print('UNKNOWN_TASK')
 else:
-    db = get_db()
-    rows = db.execute(
-        'UPDATE task_intervals SET interval = ? WHERE task_name = ?;',
-        (new_interval, task_name)
-    ).rowcount
-    commit()
-    if rows == 0:
-        print('NOT_FOUND_IN_DB')
-    else:
-        # Reschedule the interval timer
-        th = TaskHandler()
-        if th.task_interval_waiter:
-            th.task_interval_waiter.cancel()
-        th.handle_intervals()
-        print('OK')
+    set_db_location(None)  # use default /app/db/Kapowarr.db
+    app = Flask('set_interval')
+    app.teardown_appcontext(close_db)
+    with app.app_context():
+        rows = get_db().execute(
+            'UPDATE task_intervals SET interval = ? WHERE task_name = ?;',
+            (new_interval, task_name)
+        ).rowcount
+        commit()
+    print('OK' if rows else 'NOT_FOUND_IN_DB')
 """
+
+
+# Log line format (detailed formatter):
+# 2026-03-11T12:00:00+0000 | MainProcess | TaskThread-3 | tasks.pyL578 | INFO | Running task Search All
+_LOG_THREAD_COL = 2   # 0-based column index after splitting on " | "
+_LOG_ADDED_RE   = None  # compiled lazily
+
+
+def _find_thread_names(log_text: str, name_lower: str) -> dict[str, str]:
+    """
+    Scan log lines for 'Added task: <title> (<id>)' entries that match
+    name_lower, and return {thread_name: display_title}.
+    """
+    import re
+    pattern = re.compile(
+        r'Added task: (.+?) \((\d+)\)'
+    )
+    results: dict[str, str] = {}
+    for line in log_text.splitlines():
+        m = pattern.search(line)
+        if m:
+            title, task_id = m.group(1), m.group(2)
+            if name_lower in title.lower():
+                results[f"TaskThread-{task_id}"] = title
+    return results
+
+
+def cmd_logs(
+    client: KapowarrClient,
+    container: str,
+    name: str,
+    follow: bool,
+    level: str,
+) -> None:
+    name_lower = name.lower()
+    level_upper = level.upper()
+
+    if follow:
+        # Determine the thread name for the currently running task
+        tasks = client.get_tasks()
+        running = next(
+            (t for t in tasks
+             if name_lower in t.get("display_title", "").lower()
+             or name_lower in t.get("action", "").lower()),
+            None
+        )
+        if not running:
+            print(f"No running or queued task matching '{name}' found.")
+            return
+
+        thread_name = f"TaskThread-{running['id']}"
+        title = running.get("display_title", running.get("action", "?"))
+        status = "running" if tasks.index(running) == 0 else "queued"
+        print(f"Following logs for [{status}] '{title}' ({thread_name}) — Ctrl-C to stop\n")
+
+        _check_container(container)
+        # Stream the log file from inside the container, filtering by thread name and level
+        proc = subprocess.Popen(
+            ["docker", "exec", container, "tail", "-f", "-n", "+1", "/app/Kapowarr.log"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                line = line.rstrip()
+                parts = line.split(" | ")
+                if len(parts) < 5:
+                    continue
+                if parts[_LOG_THREAD_COL].strip() != thread_name:
+                    continue
+                if level_upper != "DEBUG" and parts[4].strip() not in _levels_gte(level_upper):
+                    continue
+                print(_fmt_log_line(parts))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            proc.terminate()
+
+    else:
+        # Fetch the full log via API, filter by all matching thread names
+        print("Fetching logs...", end="", flush=True)
+        log_text = client.get_logs()
+        print("\r              \r", end="", flush=True)
+
+        thread_map = _find_thread_names(log_text, name_lower)
+        if not thread_map:
+            print(f"No log entries found for tasks matching '{name}'.")
+            print("(Tasks may have run before the current log file was started.)")
+            return
+
+        matched_lines = []
+        for line in log_text.splitlines():
+            parts = line.split(" | ")
+            if len(parts) < 5:
+                continue
+            thread = parts[_LOG_THREAD_COL].strip()
+            if thread not in thread_map:
+                continue
+            if level_upper != "DEBUG" and parts[4].strip() not in _levels_gte(level_upper):
+                continue
+            matched_lines.append((thread, parts))
+
+        if not matched_lines:
+            print(f"No log lines at level >={level_upper} for tasks matching '{name}'.")
+            return
+
+        # Group by thread so runs are clearly separated
+        current_thread = None
+        for thread, parts in matched_lines:
+            if thread != current_thread:
+                current_thread = thread
+                print(f"\n--- {thread_map[thread]} ({thread}) ---")
+            print(_fmt_log_line(parts))
+        print()
+
+
+def _levels_gte(level: str) -> set[str]:
+    """Return all log level names at or above the given level."""
+    order = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+    idx = order.index(level) if level in order else 0
+    return set(order[idx:])
+
+
+def _fmt_log_line(parts: list[str]) -> str:
+    """Reformat a split detailed log line as a compact readable string."""
+    # parts: timestamp | process | thread | file:line | level | message
+    timestamp = parts[0].split("T")[1][:8] if "T" in parts[0] else parts[0]
+    level = parts[4].strip() if len(parts) > 4 else ""
+    message = " | ".join(parts[5:]).strip() if len(parts) > 5 else ""
+    return f"[{timestamp}] [{level:<8}] {message}"
 
 
 def cmd_stop(client: KapowarrClient, container: str, name: str) -> None:
@@ -366,43 +448,15 @@ def cmd_stop(client: KapowarrClient, container: str, name: str) -> None:
             print(f"  [{status}] {t.get('display_title', t.get('action'))} (ID {t['id']})")
         return
 
-    _check_container(container)
-
     for i, task in matches:
         title = task.get("display_title", task.get("action", "?"))
-
-        if i == 0:
-            # Running task — signal stop via docker exec
-            print(f"  Signalling stop for running task '{title}'...", flush=True)
-            rc, out, err = _docker_exec(container, _STOP_RUNNING_SNIPPET)
-            if rc != 0:
-                print(f"  ✗ docker exec failed:\n{err}")
-            elif out == "STOPPED:" + title:
-                print(f"  ✓ Running task '{title}' stopped.")
-            elif out.startswith("STOPPED:"):
-                print(f"  ✓ Running task stopped: {out[8:]}")
-            elif out == "NO_TASKS":
-                print("  (task finished on its own before the stop signal arrived)")
-            else:
-                print(f"  Unexpected response: {out or err}")
-        else:
-            # Queued task — use the API first (fast path), fall back to docker exec
-            try:
-                client.delete_task(task["id"])
-                print(f"  ✓ Removed queued task '{title}' (ID {task['id']}) via API.")
-            except requests.HTTPError:
-                snippet = _STOP_QUEUED_SNIPPET.format(name_lower=repr(name_lower)[1:-1])
-                rc, out, err = _docker_exec(container, snippet)
-                if rc != 0:
-                    print(f"  ✗ docker exec fallback failed:\n{err}")
-                elif out == "NO_MATCH":
-                    print(f"  '{title}' already finished.")
-                elif out.startswith("REMOVED:"):
-                    removed = json.loads(out[8:])
-                    for r in removed:
-                        print(f"  ✓ Removed queued task '{r}'.")
-                else:
-                    print(f"  Unexpected response: {out or err}")
+        status = "running" if i == 0 else "queued"
+        try:
+            client.delete_task(task["id"])
+            print(f"  \u2713 Stopped {status} task '{title}' (ID {task['id']}).")
+        except requests.HTTPError as exc:
+            code = exc.response.status_code if exc.response is not None else "?"
+            print(f"  \u2717 Failed to stop '{title}' (HTTP {code}): {exc}")
 
 
 def cmd_intervals(client: KapowarrClient) -> None:
@@ -509,6 +563,20 @@ def build_parser() -> argparse.ArgumentParser:
     si_p.add_argument("task", help="Task name (e.g. update_all, search_all, search_recent)")
     si_p.add_argument("hours", type=float, help="New interval in hours")
 
+    logs_p = sub.add_parser("logs", help="Show log output for a job (historical or live)")
+    logs_p.add_argument("name", help="Job name or partial name to match")
+    logs_p.add_argument(
+        "--follow", "-f",
+        action="store_true",
+        help="Stream live log output for the currently running/queued job (requires docker)",
+    )
+    logs_p.add_argument(
+        "--level", "-l",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Minimum log level to show (default: INFO)",
+    )
+
     return parser
 
 
@@ -528,6 +596,8 @@ def main() -> None:
             cmd_intervals(client)
         elif args.command == "set-interval":
             cmd_set_interval(client, container, args.task, args.hours)
+        elif args.command == "logs":
+            cmd_logs(client, container, args.name, args.follow, args.level)
     except requests.ConnectionError:
         print(f"Error: could not connect to Kapowarr at '{base_url}'.")
         sys.exit(1)

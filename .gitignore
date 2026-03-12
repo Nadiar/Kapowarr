@@ -141,3 +141,7 @@ temp_downloads/*
 
 # Project management files
 release*.sh
+
+kapowarr_manager.cfg
+tools/
+.*/

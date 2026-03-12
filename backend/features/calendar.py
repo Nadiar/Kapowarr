@@ -41,6 +41,7 @@ class CalendarIssue(TypedDict):
     monitored: bool
     volume_monitored: bool
     volume_id_local: Optional[int]
+    issue_id_local: Optional[int]
     has_files: bool
 
 
@@ -120,20 +121,21 @@ def _enrich_with_library_status(
             }
 
     # Look up which issues are in the library and whether they have files
-    # Returns: {cv_issue_id: (monitored, has_files)}
+    # Returns: {cv_issue_id: (local_id, monitored, has_files)}
     issue_map: Dict[int, Dict[str, Any]] = {}
     if cv_issue_ids:
         placeholders = ','.join('?' * len(cv_issue_ids))
         rows = db.execute(
-            f"SELECT i.comicvine_id, i.monitored, "
+            f"SELECT i.id, i.comicvine_id, i.monitored, "
             f"  EXISTS(SELECT 1 FROM issues_files WHERE issue_id = i.id) "
             f"FROM issues i WHERE i.comicvine_id IN ({placeholders});",
             tuple(cv_issue_ids)
         ).fetchall()
         for row in rows:
-            issue_map[row[0]] = {
-                'monitored': bool(row[1]),
-                'has_files': bool(row[2])
+            issue_map[row[1]] = {
+                'local_id': row[0],
+                'monitored': bool(row[2]),
+                'has_files': bool(row[3])
             }
 
     # Apply status to each issue
@@ -147,6 +149,9 @@ def _enrich_with_library_status(
         )
         issue['volume_monitored'] = (
             vol_info['monitored'] if vol_info else False
+        )
+        issue['issue_id_local'] = (
+            iss_info['local_id'] if iss_info else None
         )
         issue['monitored'] = (
             iss_info['monitored'] if iss_info else False
@@ -184,37 +189,40 @@ def get_calendar(
     now = time()
 
     # Check cache — exact match first, then look for a superset range
-    issues: Optional[List[CalendarIssue]] = None
+    # Cache stores raw issues without library status (enrichment is always fresh)
+    cached_issues: Optional[List[CalendarIssue]] = None
 
     if not force_refresh:
         # Exact match
         cached = _calendar_cache.get(cache_key)
         if cached and (now - cached[0]) < _CACHE_TTL:
             LOGGER.debug('Calendar cache hit for %s to %s', start_date, end_date)
-            issues = [dict(i) for i in cached[1]]
+            cached_issues = [dict(i) for i in cached[1]]
         else:
             # Check if any cached range fully contains the requested range
-            for (cs, ce), (ts, cached_issues) in _calendar_cache.items():
+            for (cs, ce), (ts, cached_range_issues) in _calendar_cache.items():
                 if cs <= start_date and ce >= end_date and (now - ts) < _CACHE_TTL:
                     LOGGER.debug(
-                        'Calendar cache subset hit: %s–%s within %s–%s',
+                        'Calendar cache superset hit: %s–%s within %s–%s',
                         start_date, end_date, cs, ce
                     )
-                    issues = [
-                        dict(i) for i in cached_issues
-                        if start_date <= (i.get('effective_date') or '') <= end_date
-                    ]
+                    # Use all cached issues — they're all within the requested range
+                    # since our cache key is the original fetch range
+                    cached_issues = [dict(i) for i in cached_range_issues]
                     break
 
-    if issues is None:
+    if cached_issues is None:
         LOGGER.info('Calendar cache miss for %s to %s', start_date, end_date)
-        issues = fetch_calendar_issues(start_date, end_date)
+        cached_issues = fetch_calendar_issues(start_date, end_date)
 
         # Store in cache (evict oldest if over limit)
         if len(_calendar_cache) >= _CACHE_MAX_ENTRIES:
             oldest_key = min(_calendar_cache, key=lambda k: _calendar_cache[k][0])
             del _calendar_cache[oldest_key]
-        _calendar_cache[cache_key] = (now, issues)
+        _calendar_cache[cache_key] = (now, cached_issues)
+
+    # Create a working copy for this response
+    issues = [dict(i) for i in cached_issues]
 
     # Filter by publisher if requested
     if publisher_ids:

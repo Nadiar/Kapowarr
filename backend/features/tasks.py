@@ -469,12 +469,21 @@ class SearchAll(Task):
 
     def run(self) -> List[Tuple[str, int, Union[int, None]]]:
         cursor = get_db(force_new=True)
-        cursor.execute(
-            "SELECT id, title FROM volumes WHERE monitored = 1;"
-        )
+        # Only search volumes that have at least one open issue
+        # (monitored issue with no file) — skip fully downloaded volumes
+        volumes = cursor.execute("""
+            SELECT DISTINCT v.id, v.title
+            FROM volumes v
+            INNER JOIN issues i ON i.volume_id = v.id
+            LEFT JOIN issues_files if_ ON if_.issue_id = i.id
+            WHERE v.monitored = 1
+              AND i.monitored = 1
+              AND if_.id IS NULL
+            ORDER BY v.title;
+        """).fetchall()
         downloads: List[Tuple[str, int, Union[int, None]]] = []
         ws = WebSocket()
-        for volume_id, volume_title in cursor:
+        for volume_id, volume_title in volumes:
             if self.stop:
                 break
             self.message = f'Searching for {volume_title}'
@@ -487,6 +496,46 @@ class SearchAll(Task):
                     for result in results
                 ]
         return downloads
+
+
+class RefreshCalendar(Task):
+    """Pre-warm the calendar cache with +/- 1 week from today."""
+
+    stop = False
+    message = ''
+    action = 'refresh_calendar'
+    display_title = 'Refresh Calendar'
+    category = 'maintenance'
+    interval = 86400  # 24 hours
+
+    @property
+    def volume_id(self) -> None:
+        return None
+
+    @property
+    def issue_id(self) -> None:
+        return None
+
+    def __init__(self) -> None:
+        return
+
+    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+        from backend.features.calendar import get_calendar
+        today = date.today()
+        window_start = (today - timedelta(days=7)).isoformat()
+        window_end = (today + timedelta(days=7)).isoformat()
+
+        self.message = 'Refreshing calendar cache'
+        ws = WebSocket()
+        ws.emit(TaskStatusEvent(self.message))
+
+        # Force refresh to update the cache
+        get_calendar(window_start, window_end, force_refresh=True)
+
+        self.message = 'Calendar cache refreshed'
+        ws.emit(TaskStatusEvent(self.message))
+
+        return []
 
 
 class SearchRecent(Task):
@@ -514,32 +563,41 @@ class SearchRecent(Task):
         today = date.today()
         window_start = (today - timedelta(days=14)).isoformat()
         window_end = (today + timedelta(days=7)).isoformat()
-        cursor = get_db(force_new=True)
-        cursor.execute(
-            """
-            SELECT DISTINCT i.volume_id, v.title
-            FROM issues i
-            JOIN volumes v ON v.id = i.volume_id
-            LEFT JOIN issues_files if ON i.id = if.issue_id
-            WHERE
-                v.monitored = 1
-                AND i.monitored = 1
-                AND if.file_id IS NULL
-                AND i.date BETWEEN ? AND ?;
-            """,
-            (window_start, window_end)
-        )
+
+        # Use calendar data (keyed by store_date, the actual shelf date) so we
+        # find genuinely recent releases rather than relying on the local `date`
+        # column which may hold cover_date (printed 2-3 months after release).
+        # get_calendar() serves from the in-memory cache when available, so
+        # this is free if the calendar page was visited recently.
+        from backend.features.calendar import get_calendar
+        calendar_issues = get_calendar(window_start, window_end)
+
         downloads: List[Tuple[str, int, Union[int, None]]] = []
         ws = WebSocket()
-        for volume_id, volume_title in cursor:
+
+        for issue in calendar_issues:
             if self.stop:
                 break
-            self.message = f'Searching for {volume_title}'
+            if not (
+                issue['in_library']
+                and issue['volume_monitored']
+                and issue['monitored']
+                and not issue['has_files']
+            ):
+                continue
+            vol_id = issue['volume_id_local']
+            iss_id = issue['issue_id_local']
+            if vol_id is None or iss_id is None:
+                continue
+            self.message = (
+                f'Searching for {issue["volume_name"]} '
+                f'#{issue.get("issue_number", "?")}'
+            )
             ws.emit(TaskStatusEvent(self.message))
-            results = auto_search(volume_id)
+            results = auto_search(vol_id, iss_id)
             if results:
                 downloads += [
-                    (result['link'], volume_id, None)
+                    (result['link'], vol_id, iss_id)
                     for result in results
                 ]
         return downloads
@@ -682,8 +740,29 @@ class TaskHandler(metaclass=Singleton):
                 "SELECT task_name, interval, next_run FROM task_intervals;"
             ).fetchall()
             LOGGER.debug(f'Task intervals: {list(map(dict, interval_tasks))}')
+
+            # Collect task types already queued/running to prevent duplicates
+            queued_actions = {
+                t['task'].action for t in self.queue
+            }
+
             for task in interval_tasks:
                 if task['next_run'] <= current_time:
+                    # Update next_run regardless of whether we queue
+                    # (prevents accumulating missed intervals)
+                    next_run = round(current_time + task['interval'])
+                    cursor.execute(
+                        "UPDATE task_intervals SET next_run = ? WHERE task_name = ?;",
+                        (next_run, task['task_name']))
+
+                    # Skip if this task type is already queued or running
+                    if task['task_name'] in queued_actions:
+                        LOGGER.info(
+                            'Skipping %s — already in queue',
+                            task['task_name']
+                        )
+                        continue
+
                     # Add task to queue
                     task_class = task_library[task['task_name']]
                     if task_class is UpdateAll:
@@ -691,12 +770,6 @@ class TaskHandler(metaclass=Singleton):
                     else:
                         inst = task_class()
                     self.add(inst)
-
-                    # Update next_run
-                    next_run = round(current_time + task['interval'])
-                    cursor.execute(
-                        "UPDATE task_intervals SET next_run = ? WHERE task_name = ?;",
-                        (next_run, task['task_name']))
 
         self.handle_intervals()
         return
@@ -775,28 +848,49 @@ class TaskHandler(metaclass=Singleton):
         raise TaskNotFound(task_id)
 
     def remove(self, task_id: int) -> None:
-        """Remove a task from the queue
+        """Remove a task from the queue, including the currently running task.
 
         Args:
             task_id (int): The id of the task to delete from the queue
 
         Raises:
-            TaskNotDeletable: The task is not allowed to be deleted from the queue
             TaskNotFound: The id doesn't map to any task in the queue
         """
-        # Get task and check if id exists
-        # Raises TaskNotFound if the id isn't found
-        task = self.get_one(task_id)
+        # Find the raw queue entry (get_one returns a formatted dict, not usable here)
+        raw_entry = None
+        for entry in self.queue:
+            if entry['id'] == task_id:
+                raw_entry = entry
+                break
 
-        # Check if task is allowed to be deleted
-        if self.queue[0] == task:
-            raise TaskNotDeletable(task_id)
+        if raw_entry is None:
+            raise TaskNotFound(task_id)
 
-        task['task'].stop = True
-        task['thread'].join()
-        self.queue.remove(task)
-        LOGGER.info(f'Removed task: {task["task"].display_name} ({task_id})')
-        WebSocket().emit(TaskEndedEvent(task['task']))
+        was_running = (raw_entry['status'] == 'running')
+
+        # Signal the task to stop at the next safe checkpoint
+        raw_entry['task'].stop = True
+
+        if was_running:
+            # Wait for the thread to honour the stop flag and exit.
+            # __run_task's finally block skips queue cleanup when task.stop is True,
+            # so we handle it here instead.
+            raw_entry['thread'].join()
+
+        try:
+            self.queue.remove(raw_entry)
+        except ValueError:
+            # Task finished naturally between our was_running check and the join —
+            # __run_task already cleaned up the queue, nothing left to do.
+            return
+
+        LOGGER.info(f'Removed task: {raw_entry["task"].display_title} ({task_id})')
+        WebSocket().emit(TaskEndedEvent(raw_entry['task']))
+
+        if was_running:
+            # Kick off the next queued task (normally done by __run_task)
+            self._process_queue()
+
         return
 
 
