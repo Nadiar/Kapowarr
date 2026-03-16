@@ -1454,13 +1454,12 @@ def api_calendar():
     if not start or not end:
         raise KeyNotFound('start' if not start else 'end')
     publishers_raw = request.values.get('publishers', '')
-    publisher_ids = None
+    publisher_names = None
     if publishers_raw:
-        try:
-            publisher_ids = [int(p) for p in publishers_raw.split(',') if p]
-        except ValueError:
-            raise InvalidKeyValue('publishers', publishers_raw)
-    result = get_calendar(start, end, publisher_ids,
+        publisher_names = [
+            p.strip() for p in publishers_raw.split(',') if p.strip()
+        ]
+    result = get_calendar(start, end, publisher_names,
                           force_refresh=bool(request.values.get('force')))
     return return_api(result)
 
@@ -1469,4 +1468,8 @@ def api_calendar():
 @error_handler
 @auth
 def api_calendar_publishers():
-    return return_api(get_publisher_presets())
+    from backend.features.calendar_publishers import get_publisher_categories
+    return return_api({
+        'publishers': get_publisher_presets(),
+        'categories': get_publisher_categories()
+    })

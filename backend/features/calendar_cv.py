@@ -13,6 +13,8 @@ from typing import Any, Dict, List
 from backend.base.custom_exceptions import InvalidComicVineApiKey
 from backend.base.logging import LOGGER
 from backend.features.calendar import CalendarIssue
+from backend.features.calendar_publishers import (normalize_publisher_name,
+                                                  resolve_parent_publisher)
 from backend.implementations.comicvine import ComicVine
 
 
@@ -72,11 +74,21 @@ def _enrich_with_publishers(
             or ''
         )
 
+        pub_id = vol_info.get('publisher_id')
+        pub_name = vol_info.get('publisher_name')
+        parent_name = resolve_parent_publisher(
+            pub_name
+        ) if pub_name else None
+
         calendar_issue: CalendarIssue = {
             'comicvine_id': int(issue['id']),
             'volume_id': vol_id,
-            'volume_name': vol_info.get('volume_name', vol.get('name', '')),
-            'issue_number': (issue.get('issue_number') or '').strip(),
+            'volume_name': vol_info.get(
+                'volume_name', vol.get('name', '')
+            ),
+            'issue_number': (
+                issue.get('issue_number') or ''
+            ).strip(),
             'title': issue.get('name') or None,
             'store_date': issue.get('store_date') or None,
             'cover_date': issue.get('cover_date') or None,
@@ -85,8 +97,10 @@ def _enrich_with_publishers(
                 issue.get('cover_date')
             ),
             'image_url': image_url,
-            'publisher_name': vol_info.get('publisher_name'),
-            'publisher_id': vol_info.get('publisher_id'),
+            'publisher_name': pub_name,
+            'publisher_id': pub_id,
+            'parent_publisher_name': parent_name,
+            'parent_publisher_id': None,
             'site_url': issue.get('site_detail_url') or '',
             # Library status defaults (enriched later)
             'in_library': False,
@@ -125,8 +139,12 @@ def _fetch_missing_volumes(
             pub = vol.get('publisher') or {}
             volume_publisher_map[vid] = {
                 'volume_name': vol.get('name', ''),
-                'publisher_id': int(pub['id']) if pub.get('id') else None,
-                'publisher_name': pub.get('name')
+                'publisher_id': (
+                    int(pub['id']) if pub.get('id') else None
+                ),
+                'publisher_name': normalize_publisher_name(
+                    pub.get('name')
+                )
             }
     except Exception as e:
         LOGGER.warning('Failed to fetch missing volumes for calendar: %s', e)

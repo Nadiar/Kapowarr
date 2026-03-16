@@ -167,6 +167,37 @@
 	cursor: pointer;
 }
 
+/* Category toggles */
+#category-toggles {
+	display: flex;
+	gap: .35rem;
+	margin-bottom: .5rem;
+	flex-wrap: wrap;
+}
+
+.category-toggle {
+	padding: .25rem .6rem;
+	border: 1px solid var(--border-color);
+	border-radius: 12px;
+	background-color: var(--background-color);
+	color: var(--dimmed-text-color);
+	font-size: .7rem;
+	font-weight: 500;
+	cursor: pointer;
+	transition: all 150ms ease;
+}
+
+.category-toggle:hover {
+	border-color: var(--accent-color);
+	color: var(--text-color);
+}
+
+.category-toggle.active {
+	background-color: var(--accent-color);
+	border-color: var(--accent-color);
+	color: var(--header-color);
+}
+
 .publisher-option.any-publisher {
 	margin-bottom: .5rem;
 	padding-bottom: .5rem;
@@ -455,7 +486,7 @@
 		gap: .25rem;
 	}
 
-	#week-label {
+	#period-label {
 		font-size: .75rem;
 		min-width: 7rem;
 	}

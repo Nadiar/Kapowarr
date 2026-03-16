@@ -49,8 +49,9 @@ const pre_build_els = {
 // State
 let currentWeekStart = getMonday(new Date());
 let viewMode = 'week'; // 'week' or 'month'
-let publishers = [];
-let selectedPublisherIds = new Set();
+let publishers = [];          // ["Marvel", "DC Comics", ...]
+let publisherCategories = {}; // {category_name: ["Marvel", ...]}
+let selectedPublisherNames = new Set();
 let anyPublisherMode = true;
 let cachedIssues = [];
 let showTPBs = true;
@@ -174,7 +175,10 @@ function updatePeriodLabel() {
 function loadPublishers(api_key) {
 	fetchAPI('/calendar/publishers', api_key)
 	.then(json => {
-		publishers = json.result;
+		const data = json.result;
+		publishers = data.publishers || [];
+		publisherCategories = data.categories || {};
+		renderCategoryToggles();
 		renderPublisherList();
 		restorePublisherPrefs();
 	})
@@ -184,18 +188,21 @@ function loadPublishers(api_key) {
 };
 
 function renderPublisherList() {
-	calendar_els.filter.list.innerHTML = '';
+	while (calendar_els.filter.list.firstChild)
+		calendar_els.filter.list.removeChild(
+			calendar_els.filter.list.firstChild
+		);
 	publishers.forEach(pub => {
 		const label = document.createElement('label');
 		label.className = 'publisher-option';
 
 		const checkbox = document.createElement('input');
 		checkbox.type = 'checkbox';
-		checkbox.value = pub.id;
+		checkbox.value = pub;
 		checkbox.checked = true;
 
 		const span = document.createElement('span');
-		span.textContent = pub.name;
+		span.textContent = pub;
 
 		label.appendChild(checkbox);
 		label.appendChild(span);
@@ -211,9 +218,8 @@ function onPublisherCheckboxChange() {
 	// When individual publishers change, update "any" checkbox
 	const checkboxes = calendar_els.filter.list.querySelectorAll('input[type="checkbox"]');
 	const allChecked = Array.from(checkboxes).every(c => c.checked);
-	const noneChecked = Array.from(checkboxes).every(c => !c.checked);
 
-	if (allChecked || noneChecked) {
+	if (allChecked) {
 		calendar_els.filter.any_checkbox.checked = true;
 		anyPublisherMode = true;
 	} else {
@@ -223,36 +229,41 @@ function onPublisherCheckboxChange() {
 
 	updateSelectedPublishers();
 	savePublisherPrefs();
+	updateFilterButtonLabel();
+	updateCategoryToggleStates();
 	renderIssues();
 };
 
 function updateSelectedPublishers() {
-	selectedPublisherIds.clear();
+	selectedPublisherNames.clear();
 	if (anyPublisherMode) return;
 
 	const checkboxes = calendar_els.filter.list.querySelectorAll('input[type="checkbox"]');
 	checkboxes.forEach(cb => {
 		if (cb.checked) {
-			selectedPublisherIds.add(parseInt(cb.value));
+			selectedPublisherNames.add(cb.value);
 		}
 	});
 };
 
 function savePublisherPrefs() {
-	const checkedIds = [];
+	const checkedNames = [];
 	const checkboxes = calendar_els.filter.list.querySelectorAll('input[type="checkbox"]');
 	checkboxes.forEach(cb => {
-		if (cb.checked) checkedIds.push(parseInt(cb.value));
+		if (cb.checked) checkedNames.push(cb.value);
 	});
 	setLocalStorage({
 		calendar_any_publisher: anyPublisherMode,
-		calendar_publisher_ids: checkedIds
+		calendar_publisher_names: checkedNames
 	});
 };
 
 function restorePublisherPrefs() {
-	const prefs = getLocalStorage('calendar_any_publisher', 'calendar_publisher_ids');
-	if (prefs.calendar_any_publisher === undefined || prefs.calendar_any_publisher === null) {
+	const prefs = getLocalStorage(
+		'calendar_any_publisher', 'calendar_publisher_names'
+	);
+	if (prefs.calendar_any_publisher === undefined
+		|| prefs.calendar_any_publisher === null) {
 		// First time: default to "any"
 		anyPublisherMode = true;
 		calendar_els.filter.any_checkbox.checked = true;
@@ -262,14 +273,18 @@ function restorePublisherPrefs() {
 	anyPublisherMode = prefs.calendar_any_publisher;
 	calendar_els.filter.any_checkbox.checked = anyPublisherMode;
 
-	if (!anyPublisherMode && Array.isArray(prefs.calendar_publisher_ids)) {
-		const savedIds = new Set(prefs.calendar_publisher_ids);
-		const checkboxes = calendar_els.filter.list.querySelectorAll('input[type="checkbox"]');
+	if (!anyPublisherMode
+		&& Array.isArray(prefs.calendar_publisher_names)) {
+		const savedNames = new Set(prefs.calendar_publisher_names);
+		const checkboxes = calendar_els.filter.list
+			.querySelectorAll('input[type="checkbox"]');
 		checkboxes.forEach(cb => {
-			cb.checked = savedIds.has(parseInt(cb.value));
+			cb.checked = savedNames.has(cb.value);
 		});
 	}
 	updateSelectedPublishers();
+	updateFilterButtonLabel();
+	updateCategoryToggleStates();
 };
 
 //
@@ -302,10 +317,20 @@ function fetchCalendar(api_key, forceRefresh) {
 function renderIssues() {
 	// Filter by publisher client-side
 	let issues = cachedIssues;
-	if (!anyPublisherMode && selectedPublisherIds.size > 0) {
-		issues = issues.filter(
-			i => i.publisher_id && selectedPublisherIds.has(i.publisher_id)
-		);
+	if (!anyPublisherMode) {
+		// When specific publishers are selected, filter to only those
+		if (selectedPublisherNames.size > 0) {
+			issues = issues.filter(
+				i => (i.publisher_name
+					&& selectedPublisherNames.has(i.publisher_name))
+					|| (i.parent_publisher_name
+					&& selectedPublisherNames.has(
+						i.parent_publisher_name))
+			);
+		} else {
+			// When no publishers are selected, show no issues
+			issues = [];
+		}
 	}
 
 	// Filter by format
@@ -447,8 +472,12 @@ function buildIssueCard(issue) {
 		titleEl.classList.add('hidden');
 	}
 
-	card.querySelector('.calendar-issue-publisher').textContent =
-		issue.publisher_name || '';
+	const publisherEl = card.querySelector('.calendar-issue-publisher');
+	if (issue.parent_publisher_name && issue.parent_publisher_name !== issue.publisher_name) {
+		publisherEl.textContent = `${issue.parent_publisher_name} / ${issue.publisher_name}`;
+	} else {
+		publisherEl.textContent = issue.publisher_name || '';
+	}
 
 	// Add button: show only if NOT in library
 	const addBtn = card.querySelector('.calendar-add-btn');
@@ -510,6 +539,85 @@ calendar_els.toolbar.refresh.onclick = () => {
 	usingApiKey().then(api_key => fetchCalendar(api_key, true));
 };
 
+// Filter button label
+function updateFilterButtonLabel() {
+	const label = calendar_els.filter.toggle.querySelector('p');
+	if (!label) return;
+	if (anyPublisherMode) {
+		label.textContent = 'Publishers';
+	} else {
+		const checkboxes = calendar_els.filter.list.querySelectorAll('input[type="checkbox"]');
+		const count = Array.from(checkboxes).filter(c => c.checked).length;
+		label.textContent = `Publishers (${count})`;
+	}
+};
+
+// Category toggles
+function renderCategoryToggles() {
+	const container = document.querySelector('#category-toggles');
+	if (!container) return;
+	while (container.firstChild) container.removeChild(container.firstChild);
+
+	for (const [catName, catPubs] of Object.entries(publisherCategories)) {
+		const btn = document.createElement('button');
+		btn.type = 'button';
+		btn.className = 'category-toggle active';
+		btn.dataset.category = catName;
+		btn.textContent = catName.charAt(0).toUpperCase() + catName.slice(1);
+		btn.title = `Toggle ${btn.textContent} publishers`;
+
+		btn.addEventListener('click', () => {
+			toggleCategory(catName);
+		});
+
+		container.appendChild(btn);
+	}
+};
+
+function toggleCategory(catName) {
+	const catPubs = publisherCategories[catName];
+	if (!catPubs) return;
+
+	const catNames = new Set(catPubs);
+	const checkboxes = calendar_els.filter.list
+		.querySelectorAll('input[type="checkbox"]');
+
+	// Check if all publishers in this category are checked
+	const allChecked = Array.from(checkboxes)
+		.filter(cb => catNames.has(cb.value))
+		.every(cb => cb.checked);
+
+	// Toggle: if all checked, uncheck all; otherwise check all
+	checkboxes.forEach(cb => {
+		if (catNames.has(cb.value)) {
+			cb.checked = !allChecked;
+		}
+	});
+
+	onPublisherCheckboxChange();
+	updateCategoryToggleStates();
+};
+
+function updateCategoryToggleStates() {
+	const container = document.querySelector('#category-toggles');
+	if (!container) return;
+
+	const checkboxes = calendar_els.filter.list.querySelectorAll('input[type="checkbox"]');
+
+	container.querySelectorAll('.category-toggle').forEach(btn => {
+		const catName = btn.dataset.category;
+		const catPubs = publisherCategories[catName];
+		if (!catPubs) return;
+
+		const catNames = new Set(catPubs);
+		const allChecked = Array.from(checkboxes)
+			.filter(cb => catNames.has(cb.value))
+			.every(cb => cb.checked);
+
+		btn.classList.toggle('active', allChecked);
+	});
+};
+
 // Publisher filter toggle
 calendar_els.filter.toggle.onclick = () => {
 	calendar_els.filter.panel.classList.toggle('hidden');
@@ -526,6 +634,8 @@ calendar_els.filter.any_checkbox.addEventListener('change', () => {
 	}
 	updateSelectedPublishers();
 	savePublisherPrefs();
+	updateFilterButtonLabel();
+	updateCategoryToggleStates();
 	renderIssues();
 });
 
@@ -574,6 +684,8 @@ calendar_els.filter.select_all.onclick = () => {
 	checkboxes.forEach(cb => { cb.checked = true; });
 	updateSelectedPublishers();
 	savePublisherPrefs();
+	updateFilterButtonLabel();
+	updateCategoryToggleStates();
 	renderIssues();
 };
 
@@ -584,6 +696,8 @@ calendar_els.filter.select_none.onclick = () => {
 	checkboxes.forEach(cb => { cb.checked = false; });
 	updateSelectedPublishers();
 	savePublisherPrefs();
+	updateFilterButtonLabel();
+	updateCategoryToggleStates();
 	renderIssues();
 };
 
@@ -664,9 +778,13 @@ calendar_els.add_window.form.action = 'javascript:addVolumeFromCalendar();';
 function addAllUnmonitored() {
 	// Collect unique volumes not in library from visible (filtered) issues
 	let issues = cachedIssues;
-	if (!anyPublisherMode && selectedPublisherIds.size > 0) {
+	if (!anyPublisherMode && selectedPublisherNames.size > 0) {
 		issues = issues.filter(
-			i => i.publisher_id && selectedPublisherIds.has(i.publisher_id)
+			i => (i.publisher_name
+				&& selectedPublisherNames.has(i.publisher_name))
+				|| (i.parent_publisher_name
+				&& selectedPublisherNames.has(
+					i.parent_publisher_name))
 		);
 	}
 	if (!showTPBs || !showHardCovers || !showWebcomics) {

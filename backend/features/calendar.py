@@ -35,6 +35,8 @@ class CalendarIssue(TypedDict):
     image_url: str
     publisher_name: Optional[str]
     publisher_id: Optional[int]
+    parent_publisher_name: Optional[str]
+    parent_publisher_id: Optional[int]
     site_url: str
     # Library status fields
     in_library: bool
@@ -45,42 +47,36 @@ class CalendarIssue(TypedDict):
     has_files: bool
 
 
-class PublisherPreset(TypedDict):
-    """A preset publisher for filtering."""
-    id: int
-    name: str
-
-
-# Hardcoded publisher presets with ComicVine IDs
-PUBLISHER_PRESETS: List[PublisherPreset] = [
-    {"id": 31, "name": "Marvel"},
-    {"id": 10, "name": "DC Comics"},
-    {"id": 1868, "name": "Image"},
-    {"id": 1190, "name": "IDW Publishing"},
-    {"id": 314, "name": "Dark Horse Comics"},
-    {"id": 4141, "name": "BOOM! Studios"},
-    {"id": 1300, "name": "Dynamite Entertainment"},
-    {"id": 2849, "name": "VIZ Media"},
-    {"id": 582, "name": "Oni Press"},
-    {"id": 10984, "name": "Kodansha Comics"},
-    {"id": 291, "name": "Archie Comics"},
-    {"id": 6450, "name": "Titan Comics"},
-    {"id": 89, "name": "Fantagraphics Books"},
-    {"id": 222, "name": "Drawn and Quarterly"},
-    {"id": 1649, "name": "Zenescope Entertainment"},
-    {"id": 11068, "name": "Vault Comics"},
-    {"id": 10838, "name": "AfterShock Comics"},
-    {"id": 12551, "name": "AWA Studios"},
-    {"id": 295, "name": "Antarctic Press"},
-    {"id": 12237, "name": "Mad Cave Studios"},
+# Publisher presets — name-based (IDs vary between CV and CV proxies)
+PUBLISHER_PRESETS: List[str] = [
+    "Marvel",
+    "DC Comics",
+    "Image",
+    "IDW Publishing",
+    "Dark Horse Comics",
+    "BOOM! Studios",
+    "Dynamite Entertainment",
+    "VIZ Media",
+    "Oni Press",
+    "Kodansha Comics",
+    "Archie Comics",
+    "Titan Comics",
+    "Fantagraphics Books",
+    "Drawn and Quarterly",
+    "Zenescope Entertainment",
+    "Vault Comics",
+    "AfterShock Comics",
+    "AWA Studios",
+    "Antarctic Press",
+    "Mad Cave Studios",
 ]
 
 # Lookup set for quick membership checks
-_PRESET_IDS = {p["id"] for p in PUBLISHER_PRESETS}
+_PRESET_NAMES = set(PUBLISHER_PRESETS)
 
 
-def get_publisher_presets() -> List[PublisherPreset]:
-    """Return the list of preset publishers for the calendar filter UI."""
+def get_publisher_presets() -> List[str]:
+    """Return the list of preset publisher names for the calendar filter."""
     return PUBLISHER_PRESETS
 
 
@@ -164,21 +160,21 @@ def _enrich_with_library_status(
 def get_calendar(
     start_date: str,
     end_date: str,
-    publisher_ids: Optional[Sequence[int]] = None,
+    publisher_names: Optional[Sequence[str]] = None,
     force_refresh: bool = False
 ) -> List[CalendarIssue]:
-    """Fetch new comic issues for a date range, optionally filtered by publisher.
+    """Fetch new comic issues for a date range, optionally filtered.
 
-    Uses an in-memory cache keyed by (start_date, end_date) with a 24-hour
-    TTL so repeated requests for the same range are instant. Library status
-    is always refreshed from the DB (cheap local query).
+    Uses an in-memory cache keyed by (start_date, end_date) with a
+    24-hour TTL so repeated requests for the same range are instant.
+    Library status is always refreshed from the DB.
 
     Args:
         start_date: Start of date range in YYYY-MM-DD format.
         end_date: End of date range in YYYY-MM-DD format.
-        publisher_ids: Optional list of ComicVine publisher IDs to filter by.
+        publisher_names: Optional list of publisher names to filter by.
             If None or empty, all publishers are included.
-        force_refresh: If True, bypass the cache and re-fetch from CV API.
+        force_refresh: If True, bypass the cache and re-fetch.
 
     Returns:
         List of CalendarIssue dicts sorted by store_date ascending.
@@ -189,19 +185,24 @@ def get_calendar(
     now = time()
 
     # Check cache — exact match first, then look for a superset range
-    # Cache stores raw issues without library status (enrichment is always fresh)
+    # Cache stores raw issues without library status (enrichment is always
+    # fresh)
     cached_issues: Optional[List[CalendarIssue]] = None
 
     if not force_refresh:
         # Exact match
         cached = _calendar_cache.get(cache_key)
         if cached and (now - cached[0]) < _CACHE_TTL:
-            LOGGER.debug('Calendar cache hit for %s to %s', start_date, end_date)
+            LOGGER.debug(
+                'Calendar cache hit for %s to %s',
+                start_date,
+                end_date)
             cached_issues = [dict(i) for i in cached[1]]
         else:
             # Check if any cached range fully contains the requested range
             for (cs, ce), (ts, cached_range_issues) in _calendar_cache.items():
-                if cs <= start_date and ce >= end_date and (now - ts) < _CACHE_TTL:
+                if cs <= start_date and ce >= end_date and (
+                    now - ts) < _CACHE_TTL:
                     LOGGER.debug(
                         'Calendar cache superset hit: %s–%s within %s–%s',
                         start_date, end_date, cs, ce
@@ -217,19 +218,22 @@ def get_calendar(
 
         # Store in cache (evict oldest if over limit)
         if len(_calendar_cache) >= _CACHE_MAX_ENTRIES:
-            oldest_key = min(_calendar_cache, key=lambda k: _calendar_cache[k][0])
+            oldest_key = min(
+                _calendar_cache,
+                key=lambda k: _calendar_cache[k][0])
             del _calendar_cache[oldest_key]
         _calendar_cache[cache_key] = (now, cached_issues)
 
     # Create a working copy for this response
     issues = [dict(i) for i in cached_issues]
 
-    # Filter by publisher if requested
-    if publisher_ids:
-        id_set = set(publisher_ids)
+    # Filter by publisher name if requested
+    if publisher_names:
+        name_set = set(publisher_names)
         issues = [
             issue for issue in issues
-            if issue["publisher_id"] in id_set
+            if issue.get("publisher_name") in name_set
+            or issue.get("parent_publisher_name") in name_set
         ]
 
     # Always refresh library status (cheap local DB query)
