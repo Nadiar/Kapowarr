@@ -282,6 +282,67 @@ def set_file_properties(download: Download) -> None:
     return
 
 
+def notify_download(download: Download) -> None:
+    """Fire a notification for a completed download."""
+    try:
+        from backend.features.notifications import (DownloadEvent,
+                                                    NotificationService)
+        from backend.implementations.volumes import Issue, Volume
+
+        volume = Volume(download.volume_id)
+        vd = volume.vd
+
+        issue_number = ''
+        issue_title = ''
+        if download.issue_id is not None:
+            try:
+                issue_data = Issue(download.issue_id).get_data()
+                issue_number = issue_data.issue_number or ''
+                issue_title = issue_data.title or ''
+            except Exception:
+                pass
+
+        # Determine is_upgrade: check download history for previous successes
+        # Note: add_to_history already ran, so count >= 2 means upgrade
+        try:
+            count = get_db().execute(
+                """
+                SELECT COUNT(*) FROM download_history
+                WHERE volume_id = ?
+                  AND (issue_id = ? OR (issue_id IS NULL AND ? IS NULL))
+                  AND success = 1;
+                """,
+                (download.volume_id, download.issue_id, download.issue_id)
+            ).fetchone()[0]
+            is_upgrade = count >= 2
+        except Exception:
+            is_upgrade = False
+
+        file_path = download.files[0] if download.files else ''
+
+        event = DownloadEvent(
+            volume_id=vd.id,
+            volume_title=vd.title,
+            volume_year=vd.year or 0,
+            volume_comicvine_id=vd.comicvine_id,
+            volume_path=vd.folder or '',
+            issue_id=download.issue_id,
+            issue_number=issue_number,
+            issue_title=issue_title,
+            file_path=file_path,
+            download_source=download.source_type.value,
+            is_upgrade=is_upgrade
+        )
+
+        NotificationService().notify_download(event)
+    except Exception:
+        LOGGER.exception(
+            'Failed to build or dispatch download notification '
+            'for download %s', getattr(download, 'id', '?')
+        )
+    return
+
+
 # region Post-Processors
 class PostProcessor:
     actions_success = [
@@ -291,7 +352,8 @@ class PostProcessor:
         rename_with_proper_extension,
         add_file_to_database,
         convert_file,
-        set_file_properties
+        set_file_properties,
+        notify_download
     ]
 
     actions_seeding = []
@@ -369,7 +431,8 @@ class PostProcessorTorrentsComplete(PostProcessor):
         add_to_history,
         move_torrent_to_dest,
         convert_file,
-        set_file_properties
+        set_file_properties,
+        notify_download
     ]
 
 
@@ -384,5 +447,6 @@ class PostProcessorTorrentsCopy(PostProcessor):
         copy_file_torrent,
         convert_file,
         set_file_properties,
-        reset_file_link
+        reset_file_link,
+        notify_download
     ]

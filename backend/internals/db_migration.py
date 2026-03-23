@@ -1193,3 +1193,24 @@ def _migrate_add_comicvine_api_url():
         VALUES ('comicvine_api_url', 'https://comicvine.gamespot.com/api');
     """)
     return
+
+
+@DatabaseMigrationHandler.register_handler(46)
+def _migrate_add_notifications():
+    get_db().executescript("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            provider_type TEXT NOT NULL,
+            settings TEXT NOT NULL DEFAULT '{}',
+            on_download BOOL NOT NULL DEFAULT 1,
+            on_health_check BOOL NOT NULL DEFAULT 1,
+            on_volume_add BOOL NOT NULL DEFAULT 1,
+            on_application_update BOOL NOT NULL DEFAULT 1,
+            enabled BOOL NOT NULL DEFAULT 1
+        );
+
+        INSERT OR IGNORE INTO task_intervals(task_name, interval, next_run)
+        VALUES ('health_check', 86400, 0);
+    """)
+    return

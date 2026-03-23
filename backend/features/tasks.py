@@ -574,33 +574,140 @@ class SearchRecent(Task):
 
         downloads: List[Tuple[str, int, Union[int, None]]] = []
         ws = WebSocket()
+        # Track volumes already searched at volume level so we don't
+        # repeat for every issue in the same volume.
+        searched_volumes: set = set()
 
         for issue in calendar_issues:
             if self.stop:
                 break
-            if not (
-                issue['in_library']
-                and issue['volume_monitored']
-                and issue['monitored']
-                and not issue['has_files']
-            ):
+            if not issue['in_library'] or not issue['volume_monitored']:
                 continue
+
             vol_id = issue['volume_id_local']
-            iss_id = issue['issue_id_local']
-            if vol_id is None or iss_id is None:
+            if vol_id is None:
                 continue
-            self.message = (
-                f'Searching for {issue["volume_name"]} '
-                f'#{issue.get("issue_number", "?")}'
-            )
-            ws.emit(TaskStatusEvent(self.message))
-            results = auto_search(vol_id, iss_id)
-            if results:
-                downloads += [
-                    (result['link'], vol_id, iss_id)
-                    for result in results
-                ]
+
+            iss_id = issue['issue_id_local']
+
+            if iss_id is not None:
+                # Issue exists in local DB — check it individually
+                if not issue['monitored'] or issue['has_files']:
+                    continue
+                self.message = (
+                    f'Searching for {issue["volume_name"]} '
+                    f'#{issue.get("issue_number", "?")}'
+                )
+                ws.emit(TaskStatusEvent(self.message))
+                results = auto_search(vol_id, iss_id)
+                if results:
+                    downloads += [
+                        (result['link'], vol_id, iss_id)
+                        for result in results
+                    ]
+            else:
+                # Issue not yet in local DB (CV knows about it but
+                # Kapowarr hasn't synced). Refresh the volume first
+                # so the issue gets added locally, then search by
+                # the specific issue — not the whole volume.
+                if vol_id in searched_volumes:
+                    continue
+                searched_volumes.add(vol_id)
+                self.message = (
+                    f'Syncing {issue["volume_name"]} '
+                    f'(new issue #{issue.get("issue_number", "?")})'
+                )
+                ws.emit(TaskStatusEvent(self.message))
+                try:
+                    from backend.implementations.volumes import \
+                        refresh_and_scan
+                    refresh_and_scan(
+                        vol_id,
+                        allow_skipping=False
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        'Failed to refresh volume %d '
+                        'during SearchRecent',
+                        vol_id
+                    )
+                    continue
+
+                # After refresh, look up the now-synced issue by
+                # its ComicVine ID so we search only this issue.
+                cv_issue_id = issue.get('comicvine_id')
+                local_iss_id = None
+                if cv_issue_id:
+                    row = get_db().execute(
+                        "SELECT id FROM issues "
+                        "WHERE comicvine_id = ?",
+                        (cv_issue_id,)
+                    ).fetchone()
+                    if row:
+                        local_iss_id = row[0]
+
+                self.message = (
+                    f'Searching for {issue["volume_name"]} '
+                    f'#{issue.get("issue_number", "?")}'
+                )
+                ws.emit(TaskStatusEvent(self.message))
+                results = auto_search(vol_id, local_iss_id)
+                if results:
+                    downloads += [
+                        (result['link'], vol_id, local_iss_id)
+                        for result in results
+                    ]
         return downloads
+
+
+class HealthCheck(Task):
+    """Run health checks and dispatch notifications for any issues found."""
+
+    stop = False
+    message = ''
+    action = 'health_check'
+    display_title = 'Health Check'
+    category = 'maintenance'
+
+    @property
+    def volume_id(self) -> None:
+        return None
+
+    @property
+    def issue_id(self) -> None:
+        return None
+
+    def __init__(self) -> None:
+        return
+
+    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+        from backend.features.health_checks import run_health_checks
+        from backend.features.notifications import NotificationService
+
+        self.message = 'Running health checks'
+        ws = WebSocket()
+        ws.emit(TaskStatusEvent(self.message))
+
+        issues = run_health_checks()
+
+        if issues:
+            ns = NotificationService()
+            for issue in issues:
+                try:
+                    ns.notify_health_check(issue)
+                except Exception:
+                    LOGGER.exception(
+                        'Failed to dispatch health check notification'
+                    )
+
+        count = len(issues)
+        self.message = (
+            f'Health check complete: {count} issue(s) found'
+            if count else 'Health check complete: no issues found'
+        )
+        ws.emit(TaskStatusEvent(self.message))
+
+        return []
 
 
 # =====================
@@ -856,7 +963,8 @@ class TaskHandler(metaclass=Singleton):
         Raises:
             TaskNotFound: The id doesn't map to any task in the queue
         """
-        # Find the raw queue entry (get_one returns a formatted dict, not usable here)
+        # Find the raw queue entry (get_one returns a formatted dict, not usable
+        # here)
         raw_entry = None
         for entry in self.queue:
             if entry['id'] == task_id:
@@ -884,7 +992,8 @@ class TaskHandler(metaclass=Singleton):
             # __run_task already cleaned up the queue, nothing left to do.
             return
 
-        LOGGER.info(f'Removed task: {raw_entry["task"].display_title} ({task_id})')
+        LOGGER.info(
+            f'Removed task: {raw_entry["task"].display_title} ({task_id})')
         WebSocket().emit(TaskEndedEvent(raw_entry['task']))
 
         if was_running:
