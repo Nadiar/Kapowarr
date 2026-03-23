@@ -478,7 +478,7 @@ class SearchAll(Task):
             LEFT JOIN issues_files if_ ON if_.issue_id = i.id
             WHERE v.monitored = 1
               AND i.monitored = 1
-              AND if_.id IS NULL
+              AND if_.issue_id IS NULL
             ORDER BY v.title;
         """).fetchall()
         downloads: List[Tuple[str, int, Union[int, None]]] = []
