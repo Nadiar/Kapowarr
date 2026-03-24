@@ -470,7 +470,9 @@ class SearchAll(Task):
     def run(self) -> List[Tuple[str, int, Union[int, None]]]:
         cursor = get_db(force_new=True)
         # Only search volumes that have at least one open issue
-        # (monitored issue with no file) — skip fully downloaded volumes
+        # (monitored issue with no file) — skip fully downloaded volumes.
+        # Most-recently-added volumes first so new additions get searched
+        # before old back-catalogue volumes that rarely yield results.
         volumes = cursor.execute("""
             SELECT DISTINCT v.id, v.title
             FROM volumes v
@@ -479,7 +481,7 @@ class SearchAll(Task):
             WHERE v.monitored = 1
               AND i.monitored = 1
               AND if_.issue_id IS NULL
-            ORDER BY v.title;
+            ORDER BY v.id DESC;
         """).fetchall()
         downloads: List[Tuple[str, int, Union[int, None]]] = []
         ws = WebSocket()
