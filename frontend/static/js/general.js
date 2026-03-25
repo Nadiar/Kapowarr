@@ -103,7 +103,7 @@ function mapButtons(id) {
 	} else if (window.location.pathname === (url_base + '/system/tasks')) {
 		document.querySelectorAll('.task-interval-table > tbody > tr').forEach(entry => {
 			task_to_button[entry.dataset.task_name] = {
-				'button': entry.querySelector('button'),
+				'button': entry.querySelector('button[title="Run the task"]'),
 				'icon': `${url_base}/static/img/refresh.svg`,
 				'loading_icon': `${url_base}/static/img/loading.svg`
 			};

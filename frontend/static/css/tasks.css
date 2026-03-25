@@ -24,6 +24,11 @@
 	min-width: 6rem;
 }
 
+.task-name {
+	display: inline-block;
+	vertical-align: middle;
+}
+
 .task-interval-table tr > :where(.interval-column, .prev-column, .next-column) {
 	width: 8.5rem;
 }
@@ -32,16 +37,32 @@
 	width: 4rem;
 }
 
+.task-info-btn {
+	margin-left: 0.4rem;
+	padding: 0;
+	border: none;
+	background: transparent;
+	color: var(--dimmed-text-color);
+	font-size: 0.95rem;
+	line-height: 1;
+	vertical-align: middle;
+	cursor: pointer;
+}
+
+.task-info-btn:hover {
+	color: var(--text-color);
+}
+
 .task-interval-table tr > td {
 	border-top: 1px solid var(--border-color);
 }
 
-.task-entry button {
+.task-entry .run-column button {
 	height: 2rem;
 	padding: .4rem;
 }
 
-.task-entry button img {
+.task-entry .run-column button img {
 	height: 100%;
 }
 

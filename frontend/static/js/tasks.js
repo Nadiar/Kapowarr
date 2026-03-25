@@ -14,6 +14,20 @@ const TaskEls = {
 //
 // Task planning
 //
+function formatDuration(seconds) {
+	if (seconds == null) return '\u2014';
+	if (seconds < 1) return '< 1s';
+	if (seconds < 60) return `${seconds}s`;
+	if (seconds < 3600) {
+		const m = Math.floor(seconds / 60);
+		const s = seconds % 60;
+		return s > 0 ? `${m}m ${s}s` : `${m}m`;
+	}
+	const h = Math.floor(seconds / 3600);
+	const m = Math.floor((seconds % 3600) / 60);
+	return m > 0 ? `${h}h ${m}m` : `${h}h`;
+};
+
 function convertInterval(interval) {
 	result = Math.round(interval / 3600); // seconds -> hours
 	return `${result} hours`;
@@ -33,14 +47,16 @@ function fillPlanning(api_key) {
 			const entry = TaskEls.pre_build.task.cloneNode(true);
 			entry.dataset.task_name = task.task_name;
 
-			entry.querySelector('.name-column').innerText = task.display_name;
+			entry.querySelector('.task-name').innerText = task.display_name;
 			entry.querySelector('.interval-column').innerText =
 				convertInterval(task.interval);
 			entry.querySelector('.prev-column').innerText =
 				convertTime(task.last_run, false);
 			entry.querySelector('.next-column').innerText =
 				convertTime(task.next_run, true);
-			entry.querySelector('button').onclick =
+			entry.querySelector('.task-info-btn').title =
+				task.description || 'No description available';
+			entry.querySelector('button[title="Run the task"]').onclick =
 				e => sendAPI('POST', '/system/tasks', api_key, {}, {'cmd': task.task_name})
 
 			TaskEls.intervals.appendChild(entry);
@@ -64,6 +80,8 @@ function fillHistory(api_key) {
 			var d = new Date(obj.run_at * 1000);
 			var formatted_date = d.toLocaleString('en-CA').slice(0,10) + ' ' + d.toTimeString().slice(0,5)
 			entry.querySelector('.date-column').innerText = formatted_date;
+			entry.querySelector('.duration-column').innerText =
+				formatDuration(obj.duration_seconds);
 
 			TaskEls.history.appendChild(entry);
 		});

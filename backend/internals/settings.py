@@ -462,7 +462,8 @@ class Settings(metaclass=Singleton):
 
         elif key == 'comicvine_api_url':
             converted_value = value.strip().rstrip('/')
-            if converted_value and not converted_value.startswith(('http://', 'https://')):
+            if converted_value and not converted_value.startswith(
+                ('http://', 'https://')):
                 raise InvalidKeyValue(key, value)
 
         elif key == 'download_folder':
@@ -591,7 +592,7 @@ class Settings(metaclass=Singleton):
             InvalidKeyValue: Value of the key is not allowed.
         """
         settings_after_update = SettingsValues(**{
-            **self.get_settings().todict(),
+            **self.get_settings().todict(to_public=False),
             **formatted_data
         })
 

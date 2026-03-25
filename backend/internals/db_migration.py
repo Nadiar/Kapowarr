@@ -1256,3 +1256,20 @@ def _migrate_split_update_all():
     )
     cursor.connection.commit()
     return
+
+
+@DatabaseMigrationHandler.register_handler(49)
+def _migrate_task_history_duration():
+    cursor = get_db()
+    existing_columns = {
+        row['name']
+        for row in cursor.execute("PRAGMA table_info(task_history);").fetchall()
+    }
+    if 'duration_seconds' in existing_columns:
+        return
+
+    cursor.execute(
+        "ALTER TABLE task_history"
+        " ADD COLUMN duration_seconds INTEGER;"
+    )
+    return

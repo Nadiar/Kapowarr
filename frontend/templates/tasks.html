@@ -10,7 +10,12 @@
 
 {% block pre_build_rows %}
 <tr class="task-entry">
-	<td class="name-column"></td>
+	<td class="name-column">
+		<span class="task-name"></span>
+		<button class="task-info-btn" type="button"
+			aria-label="Task info"
+			title="What does this task do?">&#10068;</button>
+	</td>
 	<td class="interval-column"></td>
 	<td class="prev-column"></td>
 	<td class="next-column"></td>
@@ -21,8 +26,9 @@
 <tr class="history-entry">
 	<td class="title-column"></td>
 	<td class="date-column"></td>
+	<td class="duration-column"></td>
 </tr>
-{% endblock %}
+{% endblock pre_build_rows %}
 
 {% block main %}
 <main>
@@ -54,6 +60,7 @@
 				<tr>
 					<th>Title</th>
 					<th>Date</th>
+					<th>Duration</th>
 				</tr>
 			</thead>
 			<tbody id="history"></tbody>

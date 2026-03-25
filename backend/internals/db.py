@@ -483,7 +483,8 @@ CREATE TABLE IF NOT EXISTS download_history(
 CREATE TABLE IF NOT EXISTS task_history(
     task_name NOT NULL,
     display_title NOT NULL,
-    run_at INTEGER NOT NULL
+    run_at INTEGER NOT NULL,
+    duration_seconds INTEGER
 );
 CREATE TABLE IF NOT EXISTS task_intervals(
     task_name PRIMARY KEY,

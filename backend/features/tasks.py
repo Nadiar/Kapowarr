@@ -434,7 +434,6 @@ class MassConvertVolume(Task):
 # =====================
 
 
-
 class SyncIssues(Task):
     "Fetch new/updated issues from ComicVine for all monitored volumes"
 
@@ -442,6 +441,10 @@ class SyncIssues(Task):
     message = ''
     action = 'sync_issues'
     display_title = 'Sync Issues'
+    description = (
+        'Fetches new and updated issues from ComicVine for all monitored'
+        ' volumes, using the timestamp of the last successful sync.'
+    )
     category = ''
     priority = 3
 
@@ -501,6 +504,10 @@ class RefreshMetadata(Task):
     message = ''
     action = 'refresh_metadata'
     display_title = 'Refresh Metadata'
+    description = (
+        'Refreshes volume metadata (cover images and descriptions) from'
+        ' ComicVine for volumes not updated in over 30 days or missing data.'
+    )
     category = ''
     priority = 3
 
@@ -560,6 +567,10 @@ class ScanFiles(Task):
     message = ''
     action = 'scan_files'
     display_title = 'Scan Files'
+    description = (
+        'Scans files on disk for all monitored volumes and updates'
+        ' which issues have local files.'
+    )
     category = ''
     priority = 3
 
@@ -600,6 +611,10 @@ class SpecialVersionRefresh(Task):
     message = ''
     action = 'special_version_refresh'
     display_title = 'Refresh Special Versions'
+    description = (
+        'Re-evaluates the special version type (TPB, Hardcover, One Shot,'
+        ' etc.) for all volumes that have not been manually locked.'
+    )
     category = ''
     priority = 4
 
@@ -645,6 +660,10 @@ class SearchAll(Task):
     message = ''
     action = 'search_all'
     display_title = 'Search All'
+    description = (
+        'Searches for missing issues across every monitored volume in the'
+        ' library. Volumes with recent consecutive misses are deprioritised.'
+    )
     category = 'download'
     priority = 5
 
@@ -717,6 +736,10 @@ class RefreshCalendar(Task):
     message = ''
     action = 'refresh_calendar'
     display_title = 'Refresh Calendar'
+    description = (
+        'Pre-warms the calendar cache with releases in the \u00b17-day window'
+        ' around today so that calendar page loads are instant.'
+    )
     category = 'maintenance'
     interval = 86400  # 24 hours
     priority = 3
@@ -759,6 +782,11 @@ class SearchRecent(Task):
     message = ''
     action = 'search_recent'
     display_title = 'Search Recent'
+    description = (
+        'Searches for missing issues released in the past 2 weeks or'
+        ' releasing in the next week, using ComicVine store dates and'
+        ' GetComics weekly packs.'
+    )
     category = 'download'
     priority = 3
 
@@ -960,6 +988,10 @@ class HealthCheck(Task):
     message = ''
     action = 'health_check'
     display_title = 'Health Check'
+    description = (
+        'Runs library health checks (missing root folders, invalid API keys,'
+        ' etc.) and dispatches any configured notifications for issues found.'
+    )
     category = 'maintenance'
     priority = 3
 
@@ -1073,15 +1105,17 @@ class TaskHandler(metaclass=Singleton):
         """
         LOGGER.debug(f'Running task {task.display_title}')
         with self.context():
+            _start = round(time())
             socket = WebSocket()
             try:
                 result = task.run()
+                _duration = round(time()) - _start
                 cursor = get_db()
 
                 # Note in history
                 cursor.execute(
-                    "INSERT INTO task_history VALUES (?,?,?);",
-                    (task.action, task.display_title, round(time()))
+                    "INSERT INTO task_history VALUES (?,?,?,?);",
+                    (task.action, task.display_title, round(time()), _duration)
                 )
 
                 if not task.stop:
@@ -1407,7 +1441,7 @@ def get_task_history(offset: int = 0) -> List[dict]:
     result = get_db().execute(
         """
         SELECT
-            task_name, display_title, run_at
+            task_name, display_title, run_at, duration_seconds
         FROM task_history
         ORDER BY run_at DESC
         LIMIT 50
@@ -1457,7 +1491,9 @@ def get_task_planning() -> List[dict]:
                 t['task_name']
             )
             t['display_name'] = t['task_name'].replace('_', ' ').title()
+            t['description'] = ''
         else:
             t['display_name'] = task_class.display_title
+            t['description'] = getattr(task_class, 'description', '')
 
     return tasks
