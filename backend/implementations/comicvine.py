@@ -152,7 +152,8 @@ class ComicVine:
         'cover_date',
         'store_date',
         'description',
-        'volume'
+        'volume',
+        'date_last_updated'
     ))
     search_field_list = ','.join((
         'aliases',
@@ -626,6 +627,103 @@ class ComicVine:
                             ))
 
             return issue_infos
+
+    async def fetch_issues_since(
+        self,
+        cv_ids: Sequence[Union[str, int]],
+        since_timestamp: int
+    ) -> List[IssueMetadata]:
+        """Get issues updated after a given timestamp.
+
+        Uses the CV ``date_last_updated`` filter to fetch only issues
+        that have been modified since ``since_timestamp``.
+
+        Args:
+            cv_ids: The CV IDs of the volumes to check.
+            since_timestamp: Unix timestamp; only issues updated
+                after this time are returned.
+
+        Returns:
+            List of formatted issue metadata dicts.  May be
+            incomplete if the rate limit is hit.
+        """
+        from datetime import datetime, timezone
+        try:
+            formatted_cv_ids = to_string_cv_id(cv_ids)
+        except ValueError:
+            raise VolumeNotMatched
+
+        since_dt = datetime.fromtimestamp(
+            since_timestamp, tz=timezone.utc
+        )
+        since_str = since_dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        LOGGER.debug(
+            'Fetching issues updated since %s for %d volumes',
+            since_str, len(formatted_cv_ids)
+        )
+
+        issue_infos: List[IssueMetadata] = []
+        async with AsyncSession() as session:
+            for id_batch in batched(formatted_cv_ids, 50):
+                batch_filter = "|".join(id_batch)
+                filt = (
+                    f'volume:{batch_filter},'
+                    f'date_last_updated:'
+                    f'{since_str}|2099-01-01 00:00:00'
+                )
+                try:
+                    results = await self.__call_api(
+                        session,
+                        '/issues',
+                        {
+                            'field_list': self.issue_field_list,
+                            'filter': filt
+                        }
+                    )
+                except CVRateLimitReached:
+                    break
+
+                issue_infos.extend(
+                    self.__format_issue_output(r)
+                    for r in results['results']
+                )
+
+                if results['number_of_total_results'] > 100:
+                    async for offset_batch in self.__sleep_iter(
+                        batched(
+                            range(
+                                100,
+                                results['number_of_total_results'],
+                                100
+                            ),
+                            10
+                        ),
+                        10
+                    ):
+                        tasks = (
+                            self.__call_api(
+                                session,
+                                '/issues',
+                                {
+                                    'field_list': (
+                                        self.issue_field_list
+                                    ),
+                                    'filter': filt,
+                                    'offset': offset
+                                },
+                                {'results': []}
+                            )
+                            for offset in offset_batch
+                        )
+                        responses = await gather(*tasks)
+                        for batch in responses:
+                            issue_infos.extend(
+                                self.__format_issue_output(r)
+                                for r in batch['results']
+                            )
+
+        return issue_infos
 
     async def __search_volume(
         self, query: str

@@ -28,6 +28,7 @@ class DownloadEvent:
     volume_comicvine_id: int
     volume_path: str
     issue_id: Union[int, None]
+    issue_comicvine_id: Union[int, None]
     issue_number: str
     issue_title: str
     file_path: str

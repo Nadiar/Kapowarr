@@ -560,6 +560,7 @@ class Settings(metaclass=Singleton):
 
             if (
                 converted_value
+                and converted_value != self.sv.flaresolverr_base_url
                 and not FlareSolverr.test_flaresolverr(converted_value)
             ):
                 raise InvalidKeyValue(key, value)

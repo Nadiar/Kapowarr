@@ -1214,3 +1214,45 @@ def _migrate_add_notifications():
         VALUES ('health_check', 86400, 0);
     """)
     return
+
+
+@DatabaseMigrationHandler.register_handler(47)
+def _migrate_add_volume_search_stats():
+    get_db().executescript("""
+        CREATE TABLE IF NOT EXISTS volume_search_stats (
+            volume_id INTEGER PRIMARY KEY,
+            last_searched INTEGER NOT NULL DEFAULT 0,
+            consecutive_misses INTEGER NOT NULL DEFAULT 0,
+            total_searches INTEGER NOT NULL DEFAULT 0,
+            total_hits INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (volume_id) REFERENCES volumes(id) ON DELETE CASCADE
+        );
+    """)
+    return
+
+
+@DatabaseMigrationHandler.register_handler(48)
+def _migrate_split_update_all():
+    from time import time as _time
+    now = int(_time())
+    cursor = get_db()
+    cursor.execute(
+        "DELETE FROM task_intervals WHERE task_name = 'update_all';"
+    )
+    cursor.executemany(
+        "INSERT OR IGNORE INTO task_intervals"
+        " (task_name, interval, next_run)"
+        " VALUES (?, ?, ?);",
+        [
+            ('sync_issues', 86400, now),
+            ('refresh_metadata', 604800, now),
+            ('scan_files', 86400, now),
+            ('special_version_refresh', 86400, now),
+        ]
+    )
+    cursor.execute(
+        "INSERT OR IGNORE INTO config (key, value)"
+        " VALUES ('last_issue_sync', '0');"
+    )
+    cursor.connection.commit()
+    return

@@ -824,6 +824,114 @@ async def search_getcomics(
     return formatted_results
 
 
+def _extract_pack_links(html: str) -> List[str]:
+    """Extract GetComics article links from a weekly pack page.
+
+    Scans every ``<li>`` tag in the HTML for ``<a href>`` values that point
+    to ``https://getcomics.org/``, excluding duplicates.  This captures the
+    per-comic download links listed inside each weekly pack article.
+
+    Args:
+        html (str): HTML source of a GC weekly pack page.
+
+    Returns:
+        List[str]: Unique links to individual comic article pages.
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    seen: set = set()
+    links: List[str] = []
+    for li in soup.find_all('li'):
+        for a in li.find_all('a', href=True):
+            href = str(a.get('href', ''))
+            if (
+                href.startswith('https://getcomics.org/')
+                and href not in seen
+            ):
+                seen.add(href)
+                links.append(href)
+    return links
+
+
+def _filter_pack_results(
+    results: List[SearchResultData]
+) -> List[SearchResultData]:
+    """Keep only results whose display_title contains 'Weekly Pack'.
+
+    Used to discard non-pack articles that happened to appear in the
+    search results for the query 'Weekly Pack'.
+
+    Args:
+        results (List[SearchResultData]): Raw results from search_getcomics.
+
+    Returns:
+        List[SearchResultData]: Only the weekly pack listing articles.
+    """
+    return [
+        r for r in results
+        if 'weekly pack' in r.get('display_title', '').lower()
+    ]
+
+
+async def scrape_weekly_packs(
+    session: AsyncSession,
+    pack_count: int = 3
+) -> List[SearchResultData]:
+    """Search GC for 'Weekly Pack', fetch the N most recent packs, and
+    return all individual comic article links as SearchResultData.
+
+    Each weekly pack page lists ~80-90 comics.  This function:
+    1. Searches GC for "Weekly Pack" and filters the listing articles.
+    2. Fetches up to ``pack_count`` pack pages.
+    3. Extracts every ``<a href>`` pointing to a GC article page.
+    4. Deduplicates across packs (a comic may appear in overlapping weeks).
+    5. Derives series/issue metadata via ``extract_filename_data`` on the
+       URL slug so results can be matched against the library.
+
+    Args:
+        session (AsyncSession): The session to make the requests with.
+        pack_count (int, optional): How many recent weekly pack pages to
+            process.  Defaults to 3.
+
+    Returns:
+        List[SearchResultData]: Individual comic articles from pack pages,
+            deduplicated by link URL.
+    """
+    pack_search = await search_getcomics(session, 'Weekly Pack')
+    pack_articles = _filter_pack_results(pack_search)[:pack_count]
+
+    seen: set = set()
+    results: List[SearchResultData] = []
+
+    for pack in pack_articles:
+        pack_url = pack['link']
+        html = await session.get_text(pack_url, quiet_fail=True)
+        if not html:
+            continue
+
+        for link in _extract_pack_links(html):
+            if link in seen:
+                continue
+            seen.add(link)
+
+            # Derive a human-readable title from the URL slug.
+            # e.g. "https://getcomics.org/dc/batman-150-2026/" → "batman 150 2026"
+            slug = [p for p in link.rstrip('/').split('/') if p][-1]
+            title = slug.replace('-', ' ')
+
+            results.append({
+                **extract_filename_data(
+                    title,
+                    assume_volume_number=False,
+                    fix_year=True
+                ),
+                'link': link,
+                'display_title': title,
+                'source': Constants.GC_SOURCE_TERM
+            })
+
+    return results
+
+
 # region Processing
 class GetComicsPage:
     def __init__(self, link: str) -> None:

@@ -1367,91 +1367,22 @@ def determine_special_version(volume_id: int) -> SpecialVersion:
     return SpecialVersion.NORMAL
 
 
-def refresh_and_scan(
-    volume_id: Union[int, None] = None,
-    update_websocket: bool = False,
-    allow_skipping: bool = True
+# ------------------------------------------------------------------
+# Shared helpers (used by individual tasks and refresh_and_scan)
+# ------------------------------------------------------------------
+
+def update_volume_metadata(
+    cv_to_id_fetch: Dict[int, Tuple[int, int]],
+    volume_datas: list
 ) -> None:
-    """Refresh and scan one or more volumes, which means to pull metadata from
-    the online database and to scan for files.
+    """Update volume metadata and covers from CV data.
 
     Args:
-        volume_id (Union[int, None], optional): The ID of the volume if it is
-            desired to only refresh and scan one. If left to `None`, all volumes
-            are refreshed and scanned.
-            Defaults to None.
-
-        update_websocket (bool, optional): Send task progress updates over
-            the websocket.
-            Defaults to False.
-
-        allow_skipping (bool, optional): Skip volumes that have been updated in
-            the last 24 hours or that have the same amount of issues as what
-            the metadata source reports.
-            Defaults to True.
+        cv_to_id_fetch: Map CV ID -> (local volume id, last_cv_fetch).
+        volume_datas: List of VolumeMetadata dicts from CV.
     """
-    current_time = datetime.now()
-    one_day_ago = current_time - ONE_DAY
-    thirty_days_ago = current_time - THIRTY_DAYS
-
     cursor = get_db()
-    if volume_id:
-        cursor.execute("""
-            SELECT comicvine_id, id, last_cv_fetch
-            FROM volumes
-            WHERE id = ?
-            LIMIT 1;
-            """,
-            (volume_id,)
-        )
-
-    else:
-        cursor.execute("""
-            SELECT comicvine_id, id, last_cv_fetch
-            FROM volumes
-            WHERE last_cv_fetch <= ?
-            ORDER BY last_cv_fetch ASC;
-            """,
-            (
-                one_day_ago.timestamp()
-                if allow_skipping else
-                current_time.timestamp(),
-            )
-        )
-
-    cv_to_id_fetch: Dict[int, Tuple[int, int]] = {
-        e["comicvine_id"]: (e["id"], e["last_cv_fetch"])
-        for e in cursor
-    }
-    if not cv_to_id_fetch:
-        return
-
-    # Update volumes
-    cv = ComicVine()
-    volume_datas = filtered_volume_datas = run(
-        cv.fetch_volumes(tuple(cv_to_id_fetch.keys()))
-    )
-
-    if not volume_id and allow_skipping:
-        cv_id_to_issue_count: Dict[int, int] = dict(cursor.execute("""
-            SELECT v.comicvine_id, COUNT(i.id)
-            FROM volumes v
-            LEFT JOIN issues i
-            ON v.id = i.volume_id
-            WHERE v.last_cv_fetch <= ?
-            GROUP BY v.id;
-            """,
-            (one_day_ago.timestamp(),)
-        ))
-
-        filtered_volume_datas = [
-            v
-            for v in volume_datas
-            if cv_id_to_issue_count[v["comicvine_id"]] != v["issue_count"]
-            # Do a fetch anyway if it hasn't been done for 30 days
-            or cv_to_id_fetch[v["comicvine_id"]][1] <= thirty_days_ago.timestamp()
-        ]
-
+    current_ts = time()
     cursor.executemany(
         """
         UPDATE volumes
@@ -1474,8 +1405,7 @@ def refresh_and_scan(
             "volume_number": vd["volume_number"],
             "description": vd["description"],
             "site_url": vd["site_url"],
-            "last_cv_fetch": current_time.timestamp(),
-
+            "last_cv_fetch": current_ts,
             "id": cv_to_id_fetch[vd["comicvine_id"]][0]
         }
             for vd in volume_datas
@@ -1497,11 +1427,19 @@ def refresh_and_scan(
 
     commit()
 
-    # Update issues
-    issue_datas = run(cv.fetch_issues(
-        tuple(vd["comicvine_id"] for vd in filtered_volume_datas)
-    ))
-    monitor_issues_volume_ids: Set[int] = set(first_of_subarrays(cursor.execute(
+
+def upsert_issues(
+    cv_to_id_fetch: Dict[int, Tuple[int, int]],
+    issue_datas: list
+) -> None:
+    """Insert or update issues from CV data.
+
+    Args:
+        cv_to_id_fetch: Map CV ID -> (local volume id, last_cv_fetch).
+        issue_datas: List of IssueMetadata dicts from CV.
+    """
+    cursor = get_db()
+    monitor_ids: Set[int] = set(first_of_subarrays(cursor.execute(
         "SELECT id FROM volumes WHERE monitor_new_issues = 1;"
     )))
     cursor.executemany(
@@ -1516,7 +1454,8 @@ def refresh_and_scan(
             description,
             monitored
         ) VALUES (
-            :volume_id, :comicvine_id, :issue_number, :calculated_issue_number,
+            :volume_id, :comicvine_id, :issue_number,
+            :calculated_issue_number,
             :title, :date, :description, :monitored
         )
         ON CONFLICT(comicvine_id) DO
@@ -1532,32 +1471,50 @@ def refresh_and_scan(
             "volume_id": cv_to_id_fetch[isd["volume_id"]][0],
             "comicvine_id": isd["comicvine_id"],
             "issue_number": isd["issue_number"],
-            "calculated_issue_number": isd["calculated_issue_number"] or 0.0,
+            "calculated_issue_number": (
+                isd["calculated_issue_number"] or 0.0
+            ),
             "title": isd["title"],
             "date": isd["date"],
             "description": isd["description"],
-            "monitored": cv_to_id_fetch[isd["volume_id"]][0] in monitor_issues_volume_ids
+            "monitored": (
+                cv_to_id_fetch[isd["volume_id"]][0] in monitor_ids
+            )
         }
             for isd in issue_datas
         ))
 
     commit()
 
-    # Delete issues from DB that aren't found in response
+
+def delete_orphaned_issues(
+    cv_to_id_fetch: Dict[int, Tuple[int, int]],
+    volume_datas: list,
+    issue_datas: list
+) -> None:
+    """Delete issues from DB that aren't in the CV response.
+
+    Only deletes when ALL issues of a volume were fetched (determined
+    by comparing fetched count to ``issue_count``).
+
+    Args:
+        cv_to_id_fetch: Map CV ID -> (local volume id, last_cv_fetch).
+        volume_datas: List of VolumeMetadata dicts with issue_count.
+        issue_datas: List of IssueMetadata dicts from CV.
+    """
+    cursor = get_db()
     volume_issues_fetched: Dict[int, Set[int]] = {}
     for isd in issue_datas:
         (volume_issues_fetched
             .setdefault(isd["volume_id"], set())
             .add(isd["comicvine_id"]))
 
-    for vd in filtered_volume_datas:
+    for vd in volume_datas:
         if len(volume_issues_fetched.get(
             vd["comicvine_id"]
         ) or tuple()) != vd["issue_count"]:
             continue
 
-        # All issues of the volume have been fetched, which is not guaranteed
-        # because of rate limits.
         issue_cv_to_id = dict(cursor.execute("""
             SELECT i.comicvine_id, i.id
             FROM issues i
@@ -1568,13 +1525,25 @@ def refresh_and_scan(
             (vd["comicvine_id"],)
         ).fetchall())
         for issue_cv, issue_id in issue_cv_to_id.items():
-            if issue_cv not in volume_issues_fetched[vd["comicvine_id"]]:
-                # Issue is in database but not in response, so remove
+            if issue_cv not in volume_issues_fetched[
+                vd["comicvine_id"]
+            ]:
                 Issue(issue_id).delete()
                 commit()
 
-    # Refresh Special Version
-    updated_special_versions = tuple(
+
+def refresh_special_versions(
+    cv_to_id_fetch: Dict[int, Tuple[int, int]],
+    volume_datas: list
+) -> None:
+    """Recalculate special version for volumes.
+
+    Args:
+        cv_to_id_fetch: Map CV ID -> (local volume id, last_cv_fetch).
+        volume_datas: List of VolumeMetadata dicts from CV.
+    """
+    cursor = get_db()
+    updated = tuple(
         {
             "special_version": determine_special_version(
                 cv_to_id_fetch[vd["comicvine_id"]][0]
@@ -1588,43 +1557,64 @@ def refresh_and_scan(
         SET special_version = :special_version
         WHERE id = :id AND special_version_locked = 0;
         """,
-        updated_special_versions
+        updated
     )
-
     commit()
 
-    # Scan for files
-    if volume_id:
-        scan_files(volume_id, update_websocket=update_websocket)
 
-    else:
-        v_ids = [
-            (v[0], [], False, update_websocket)
-            for v in cv_to_id_fetch.values()
-        ]
-        total_count = len(v_ids)
+def refresh_and_scan(
+    volume_id: int,
+    update_websocket: bool = False
+) -> None:
+    """Refresh and scan a single volume.
 
-        if not total_count:
-            return
+    Pulls the latest metadata from ComicVine and then scans the
+    volume's root folder for matching files.
 
-        with PortablePool(max_processes=min(
-            Constants.DB_MAX_CONCURRENT_CONNECTIONS,
-            total_count
-        )) as pool:
-            if update_websocket:
-                ws = WebSocket()
-                for idx, _ in enumerate(
-                    pool.istarmap_unordered(scan_files, v_ids)
-                ):
-                    ws.emit(TaskStatusEvent(
-                        f'Scanned files for volume {idx+1}/{total_count}'
-                    ))
+    Args:
+        volume_id (int): The ID of the volume to refresh and scan.
+        update_websocket (bool, optional): Send task progress updates over
+            the websocket.
+            Defaults to False.
+    """
+    cursor = get_db()
+    cursor.execute("""
+        SELECT comicvine_id, id, last_cv_fetch
+        FROM volumes
+        WHERE id = ?
+        LIMIT 1;
+        """,
+        (volume_id,)
+    )
 
-            else:
-                pool.starmap(scan_files, v_ids)
+    cv_to_id_fetch: Dict[int, Tuple[int, int]] = {
+        e["comicvine_id"]: (e["id"], e["last_cv_fetch"])
+        for e in cursor
+    }
+    if not cv_to_id_fetch:
+        return
 
-        FilesDB.delete_unmatched_files()
+    cv = ComicVine()
+    volume_datas = run(cv.fetch_volumes(tuple(cv_to_id_fetch.keys())))
+    update_volume_metadata(cv_to_id_fetch, volume_datas)
 
+    issue_datas = run(cv.fetch_issues(tuple(cv_to_id_fetch.keys())))
+    upsert_issues(cv_to_id_fetch, issue_datas)
+    delete_orphaned_issues(cv_to_id_fetch, volume_datas, issue_datas)
+    refresh_special_versions(cv_to_id_fetch, volume_datas)
+
+    # Reset consecutive-miss count so the volume floats back up in
+    # SearchAll priority. Wrapped in try/except — stats failure must
+    # never break the refresh.
+    try:
+        from backend.internals.db_models_search_stats import reset_misses
+        reset_misses(volume_id)
+    except Exception:
+        LOGGER.debug(
+            'Failed to reset search miss counter for volume %d', volume_id
+        )
+
+    scan_files(volume_id, update_websocket=update_websocket)
     return
 
 

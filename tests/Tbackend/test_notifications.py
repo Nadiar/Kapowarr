@@ -33,6 +33,7 @@ def make_download_event():
         volume_comicvine_id=12345,
         volume_path='/comics/batman',
         issue_id=10,
+        issue_comicvine_id=67890,
         issue_number='5',
         issue_title='The Dark Knight',
         file_path='/comics/batman/batman_005.cbz',

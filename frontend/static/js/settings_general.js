@@ -71,8 +71,10 @@ function saveSettings(api_key) {
 		document.querySelector("#save-button p").innerText = 'Saved';
 	})
 	.catch(async e => {
-		document.querySelector("#save-button p").innerText = 'Failed';
+		const saveButtonText = document.querySelector("#save-button p");
+		saveButtonText.innerText = 'Failed';
 		const json = await e.json();
+		console.error('Settings save failed:', json);
 		if (json.error === 'InvalidComicVineApiKey')
 			document.querySelector('#cv-input').classList.add('error-input');
 
@@ -96,8 +98,11 @@ function saveSettings(api_key) {
 		)
 			document.querySelector("#flaresolverr-input").classList.add('error-input');
 
+		else if (json.error === "InvalidKeyValue" && json.result?.key)
+			saveButtonText.innerText = `Failed: ${json.result.key}`;
+
 		else
-			console.log(json.error);
+			saveButtonText.innerText = `Failed: ${json.error || 'Unknown error'}`;
 	});
 };
 

@@ -92,6 +92,7 @@ class CustomScriptProvider(NotificationProvider):
             'kapowarr_volume_comicvine_id': str(event.volume_comicvine_id),
             'kapowarr_volume_path': event.volume_path,
             'kapowarr_issue_id': str(event.issue_id or ''),
+            'kapowarr_issue_comicvine_id': str(event.issue_comicvine_id or ''),
             'kapowarr_issue_number': event.issue_number,
             'kapowarr_issue_title': event.issue_title or '',
             'kapowarr_file_path': event.file_path,

@@ -358,12 +358,6 @@ def api_tasks():
                 raise InvalidKeyValue('filepath_filter', filepath_filter)
             kwargs['filepath_filter'] = filepath_filter or []
 
-        if task.action == 'update_all':
-            allow_skipping = data.get('allow_skipping', True)
-            if not isinstance(allow_skipping, bool):
-                raise InvalidKeyValue('allow_skipping', allow_skipping)
-            kwargs['allow_skipping'] = allow_skipping
-
         task_instance = task(**kwargs)
         result = task_handler.add(task_instance)
         return return_api({'id': result}, code=201)

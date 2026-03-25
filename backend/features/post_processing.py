@@ -294,11 +294,13 @@ def notify_download(download: Download) -> None:
 
         issue_number = ''
         issue_title = ''
+        issue_comicvine_id = None
         if download.issue_id is not None:
             try:
                 issue_data = Issue(download.issue_id).get_data()
                 issue_number = issue_data.issue_number or ''
                 issue_title = issue_data.title or ''
+                issue_comicvine_id = issue_data.comicvine_id or None
             except Exception:
                 pass
 
@@ -327,6 +329,7 @@ def notify_download(download: Download) -> None:
             volume_comicvine_id=vd.comicvine_id,
             volume_path=vd.folder or '',
             issue_id=download.issue_id,
+            issue_comicvine_id=issue_comicvine_id,
             issue_number=issue_number,
             issue_title=issue_title,
             file_path=file_path,
