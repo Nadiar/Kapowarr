@@ -9,13 +9,25 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from threading import Thread
-from typing import TYPE_CHECKING, Dict, List, Type, Union
+from typing import TYPE_CHECKING, Dict, List, Tuple, Type, Union
 
 from backend.base.helpers import Singleton
 from backend.base.logging import LOGGER
 
 if TYPE_CHECKING:
     pass
+
+
+def get_application_url() -> str:
+    """Return the base URL of this Kapowarr instance."""
+    try:
+        from backend.internals.settings import Settings
+        sv = Settings().sv
+        host = sv.host if sv.host != '0.0.0.0' else 'localhost'
+        url_base = sv.url_base.rstrip('/')
+        return f'http://{host}:{sv.port}{url_base}'
+    except Exception:
+        return 'http://localhost:5656'
 
 
 # region Event dataclasses
@@ -65,6 +77,62 @@ class TestEvent:
     pass
 
 
+# region Event formatters
+
+def format_download_notification(
+    event: DownloadEvent
+) -> Tuple[str, str]:
+    """Return (title, body) for a download-complete event."""
+    title = 'Download Complete'
+    body = (
+        f'{event.volume_title} ({event.volume_year})'
+        f' #{event.issue_number}\n'
+        f'Source: {event.download_source}'
+    )
+    return title, body
+
+
+def format_volume_add_notification(
+    event: VolumeAddEvent
+) -> Tuple[str, str]:
+    """Return (title, body) for a volume-added event."""
+    title = 'Volume Added'
+    body = (
+        f'{event.volume_title} ({event.volume_year})'
+        f' added to library\n'
+        f'Publisher: {event.publisher}'
+    )
+    return title, body
+
+
+def format_health_check_notification(
+    event: HealthCheckEvent
+) -> Tuple[str, str]:
+    """Return (title, body) for a health-check event."""
+    title = f'Health Issue [{event.level}]'
+    body = f'{event.check_type}: {event.message}'
+    return title, body
+
+
+def format_application_update_notification(
+    event: ApplicationUpdateEvent
+) -> Tuple[str, str]:
+    """Return (title, body) for an application-update event."""
+    title = 'Application Updated'
+    body = (
+        f'Kapowarr updated'
+        f' {event.previous_version} \u2192 {event.new_version}'
+    )
+    return title, body
+
+
+def format_test_notification(event: TestEvent) -> Tuple[str, str]:
+    """Return (title, body) for a test event."""
+    title = 'Test Notification'
+    body = 'This is a test notification from Kapowarr'
+    return title, body
+
+
 # region Provider ABC
 
 class NotificationProvider(ABC):
@@ -101,6 +169,56 @@ class NotificationProvider(ABC):
             InvalidNotificationSettings: Settings are invalid.
         """
         ...
+
+
+class AppriseNotificationProvider(NotificationProvider, ABC):
+    """Base class for Apprise-backed providers.
+
+    Subclasses implement ``_send`` and ``validate_settings``;
+    all ``on_*`` methods are provided here.
+    """
+
+    @abstractmethod
+    def _send(
+        self, title: str, body: str, settings: Dict
+    ) -> None:
+        """Send a notification via the concrete provider.
+
+        Args:
+            title: Notification title.
+            body: Notification body text.
+            settings: Provider-specific settings dict.
+        """
+        ...
+
+    def on_download(
+        self, event: DownloadEvent, settings: Dict
+    ) -> None:
+        title, body = format_download_notification(event)
+        self._send(title, body, settings)
+
+    def on_volume_add(
+        self, event: VolumeAddEvent, settings: Dict
+    ) -> None:
+        title, body = format_volume_add_notification(event)
+        self._send(title, body, settings)
+
+    def on_health_check(
+        self, event: HealthCheckEvent, settings: Dict
+    ) -> None:
+        title, body = format_health_check_notification(event)
+        self._send(title, body, settings)
+
+    def on_application_update(
+        self, event: ApplicationUpdateEvent, settings: Dict
+    ) -> None:
+        title, body = format_application_update_notification(event)
+        self._send(title, body, settings)
+
+    def on_test(self, event: TestEvent, settings: Dict) -> None:
+        self.validate_settings(settings)
+        title, body = format_test_notification(event)
+        self._send(title, body, settings)
 
 
 # Provider registry: maps provider_type string -> provider class
