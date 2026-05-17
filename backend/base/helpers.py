@@ -17,6 +17,7 @@ from os.path import basename, dirname, exists, isfile, join
 from subprocess import run
 from sys import base_exec_prefix, executable, maxsize, platform, version_info
 from threading import current_thread
+from time import time as _time
 from typing import (TYPE_CHECKING, Any, Callable, Collection, Dict, Iterable,
                     Iterator, List, Mapping, Sequence, Tuple, Union)
 from urllib.parse import quote_plus, unquote
@@ -1036,69 +1037,110 @@ class AsyncSession(ClientSession):
 
     async def _request(self, *args, **kwargs):
         method, url = args[0], args[1]
-        sleep_time = Constants.BACKOFF_FACTOR_RETRIES
 
-        ua, cf_cookies = self.fs.get_ua_cookies(url)
-        self.headers.update({"User-Agent": ua})
-        self.cookie_jar.update_cookies(cf_cookies)
+        while True:
+            # Wait if GC is currently throttled
+            if AsyncSession._GC_HOST in str(url):
+                remaining = AsyncSession._gc_throttle_until - _time()
+                if remaining > 0:
+                    LOGGER.info(
+                        'GC throttled; sleeping %.0fs before request'
+                        ' to %s',
+                        remaining, url
+                    )
+                    await sleep(remaining)
 
-        for round in range(1, Constants.TOTAL_RETRIES + 1):
-            try:
-                response = await super()._request(*args, **kwargs)
-                LOGGER.debug(
-                    'Made async request: %s "%s" %d %d',
-                    method, response.url,
-                    response.status,
-                    int(response.headers.get('Content-Length', -1))
-                )
+            sleep_time = Constants.BACKOFF_FACTOR_RETRIES
 
-                if response.status in Constants.STATUS_FORCELIST_RETRIES:
-                    raise ClientError
+            ua, cf_cookies = self.fs.get_ua_cookies(url)
+            self.headers.update({"User-Agent": ua})
+            self.cookie_jar.update_cookies(cf_cookies)
 
-            except ClientError:
-                if round == Constants.TOTAL_RETRIES:
-                    # Exhausted retries
-                    raise
+            for round in range(1, Constants.TOTAL_RETRIES + 1):
+                try:
+                    response = await super()._request(*args, **kwargs)
+                    LOGGER.debug(
+                        'Made async request: %s "%s" %d %d',
+                        method, response.url,
+                        response.status,
+                        int(response.headers.get('Content-Length', -1))
+                    )
 
-                LOGGER.warning(
-                    "%s request failed for url %s. Retrying for round %d...",
-                    method, url, round + 1
-                )
+                    if response.status in Constants.STATUS_FORCELIST_RETRIES:
+                        raise ClientError
 
-                await sleep(sleep_time)
-                sleep_time = (
-                    Constants.BACKOFF_FACTOR_RETRIES *
-                    (2 ** (round - 1))
-                )
-                continue
+                except ClientError:
+                    if round == Constants.TOTAL_RETRIES:
+                        # Exhausted retries
+                        raise
 
-            if response.status == 403:
-                fs_result = await self.fs.handle_cf_block_async(
-                    self, str(response.url), response.headers
-                )
+                    LOGGER.warning(
+                        "%s request failed for url %s."
+                        " Retrying for round %d...",
+                        method, url, round + 1
+                    )
 
-                if fs_result:
-                    response._url = URL(fs_result["url"])
-                    response._real_url = URL(fs_result["url"])
-                    response.status = fs_result["status"]
-                    response._body = fs_result["response"].encode("utf-8")
-                    response._headers = CIMultiDictProxy(CIMultiDict(
-                        fs_result["headers"]
-                    ))
+                    await sleep(sleep_time)
+                    sleep_time = (
+                        Constants.BACKOFF_FACTOR_RETRIES *
+                        (2 ** (round - 1))
+                    )
+                    continue
 
-            if 400 <= response.status < 500:
-                LOGGER.warning(
-                    "%s request to %s returned with code %d",
-                    method, url, response.status
-                )
-                LOGGER.debug(
-                    "Request response for %s %s: %s",
-                    method, url, await response.text()
-                )
+                # 429 from GetComics: set site-wide throttle, sleep, retry
+                if (
+                    response.status == 429
+                    and AsyncSession._GC_HOST in str(url)
+                ):
+                    retry_after = int(
+                        response.headers.get(
+                            'Retry-After',
+                            Constants.GC_THROTTLE_DEFAULT_WAIT
+                        )
+                    )
+                    AsyncSession._gc_throttle_until = _time() + retry_after
+                    LOGGER.warning(
+                        'GetComics returned 429; backing off %ds'
+                        ' before retry',
+                        retry_after
+                    )
+                    await sleep(retry_after)
+                    break  # break inner loop -> outer while True retries
 
-            return response
+                if response.status == 403:
+                    fs_result = await self.fs.handle_cf_block_async(
+                        self, str(response.url), response.headers
+                    )
 
-        raise ClientError
+                    if fs_result:
+                        response._url = URL(fs_result["url"])
+                        response._real_url = URL(fs_result["url"])
+                        response.status = fs_result["status"]
+                        response._body = (
+                            fs_result["response"].encode("utf-8")
+                        )
+                        response._headers = CIMultiDictProxy(CIMultiDict(
+                            fs_result["headers"]
+                        ))
+
+                if 400 <= response.status < 500:
+                    LOGGER.warning(
+                        "%s request to %s returned with code %d",
+                        method, url, response.status
+                    )
+                    LOGGER.debug(
+                        "Request response for %s %s: %s",
+                        method, url, await response.text()
+                    )
+
+                return response
+
+            else:
+                # for/else: inner loop exhausted without break -> network
+                # failure
+                raise ClientError
+
+            # Inner loop broke due to 429 -> outer while True retries
 
     async def __aenter__(self):
         return self
