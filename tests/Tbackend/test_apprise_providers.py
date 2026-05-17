@@ -67,5 +67,71 @@ class TestFormatters(unittest.TestCase):
         self.assertIn('Kapowarr', body)
 
 
+class TestDiscordProvider(unittest.TestCase):
+    def setUp(self):
+        from backend.implementations.notification_providers.discord_apprise import \
+            DiscordProvider
+        self.provider = DiscordProvider()
+
+    def test_validate_rejects_missing_url(self):
+        from backend.base.custom_exceptions import InvalidNotificationSettings
+        with self.assertRaises(InvalidNotificationSettings):
+            self.provider.validate_settings({})
+
+    def test_validate_rejects_non_discord_url(self):
+        from backend.base.custom_exceptions import InvalidNotificationSettings
+        with self.assertRaises(InvalidNotificationSettings):
+            self.provider.validate_settings(
+                {'webhook_url': 'https://example.com/webhook'})
+
+    def test_validate_accepts_valid_url(self):
+        # Should not raise
+        self.provider.validate_settings({
+            'webhook_url':
+                'https://discord.com/api/webhooks/123456789/abcdefghij'
+        })
+
+    def test_send_calls_apprise_with_discord_url(self):
+        from unittest.mock import MagicMock, patch
+        settings = {
+            'webhook_url':
+                'https://discord.com/api/webhooks/123456789/abcdefghij'
+        }
+        mock_apprise = MagicMock()
+        mock_apprise_instance = MagicMock()
+        mock_apprise.return_value = mock_apprise_instance
+        with patch(
+            'backend.implementations.notification_providers'
+            '.discord_apprise.apprise.Apprise',
+            mock_apprise
+        ):
+            self.provider._send('Title', 'Body', settings)
+        mock_apprise_instance.add.assert_called_once()
+        url_arg = mock_apprise_instance.add.call_args[0][0]
+        self.assertTrue(url_arg.startswith('discord://'))
+        mock_apprise_instance.notify.assert_called_once_with(
+            title='Title', body='Body')
+
+    def test_on_download_sends_notification(self):
+        from unittest.mock import patch
+        ev = DownloadEvent(
+            volume_id=1, volume_title='Batman', volume_year=2011,
+            volume_comicvine_id=12345, volume_path='/comics/batman',
+            issue_id=10, issue_comicvine_id=67890, issue_number='42',
+            issue_title='The Dark Knight',
+            file_path='/comics/batman/042.cbz',
+            download_source='getcomics', is_upgrade=False
+        )
+        settings = {
+            'webhook_url':
+                'https://discord.com/api/webhooks/123456789/abcdefghij'
+        }
+        with patch.object(self.provider, '_send') as mock_send:
+            self.provider.on_download(ev, settings)
+        mock_send.assert_called_once()
+        title_arg = mock_send.call_args[0][0]
+        self.assertEqual(title_arg, 'Download Complete')
+
+
 if __name__ == '__main__':
     unittest.main()
