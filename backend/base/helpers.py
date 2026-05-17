@@ -1013,6 +1013,12 @@ class AsyncSession(ClientSession):
     `aiohttp.client_exceptions.ClientError`.
     """
 
+    _GC_HOST: str = "getcomics.org"
+    "Hostname used to scope the GC throttle to GetComics requests only"
+
+    _gc_throttle_until: float = 0.0
+    "Epoch seconds until which all GC requests must wait; 0.0 means not throttled"
+
     def __init__(self) -> None:
         from backend.implementations.flaresolverr import FlareSolverr
 
