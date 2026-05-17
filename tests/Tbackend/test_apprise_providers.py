@@ -133,5 +133,50 @@ class TestDiscordProvider(unittest.TestCase):
         self.assertEqual(title_arg, 'Download Complete')
 
 
+class TestProwlProvider(unittest.TestCase):
+    def setUp(self):
+        from backend.implementations.notification_providers.prowl_apprise import \
+            ProwlProvider
+        self.provider = ProwlProvider()
+
+    def test_validate_rejects_missing_api_key(self):
+        from backend.base.custom_exceptions import InvalidNotificationSettings
+        with self.assertRaises(InvalidNotificationSettings):
+            self.provider.validate_settings({})
+        with self.assertRaises(InvalidNotificationSettings):
+            self.provider.validate_settings({'api_key': ''})
+
+    def test_validate_accepts_valid_settings(self):
+        # Should not raise
+        self.provider.validate_settings({'api_key': 'mykey123'})
+
+    def test_build_url_minimal(self):
+        url = self.provider._build_prowl_url({'api_key': 'mykey123'})
+        self.assertTrue(url.startswith('prowl://mykey123'))
+
+    def test_build_url_with_appname(self):
+        url = self.provider._build_prowl_url({
+            'api_key': 'mykey123',
+            'application': 'MyApp'
+        })
+        self.assertIn('MyApp', url)
+
+    def test_send_calls_apprise(self):
+        from unittest.mock import MagicMock, patch
+        settings = {'api_key': 'mykey123', 'application': 'Kapowarr'}
+        mock_apprise = MagicMock()
+        mock_instance = MagicMock()
+        mock_apprise.return_value = mock_instance
+        with patch(
+            'backend.implementations.notification_providers'
+            '.prowl_apprise.apprise.Apprise',
+            mock_apprise
+        ):
+            self.provider._send('Title', 'Body', settings)
+        mock_instance.add.assert_called_once()
+        mock_instance.notify.assert_called_once_with(
+            title='Title', body='Body')
+
+
 if __name__ == '__main__':
     unittest.main()
