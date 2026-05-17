@@ -2,6 +2,7 @@
 
 """Tests for apprise notification infrastructure."""
 import unittest
+from unittest.mock import MagicMock, patch
 
 from backend.features.notifications import (
     ApplicationUpdateEvent, DownloadEvent, HealthCheckEvent, TestEvent,
@@ -176,6 +177,84 @@ class TestProwlProvider(unittest.TestCase):
         mock_instance.add.assert_called_once()
         mock_instance.notify.assert_called_once_with(
             title='Title', body='Body')
+
+
+class TestAppriseGenericProvider(unittest.TestCase):
+    def setUp(self):
+        from backend.implementations.notification_providers.apprise_generic import \
+            AppriseGenericProvider
+        self.provider = AppriseGenericProvider()
+
+    def test_validate_rejects_when_both_empty(self):
+        from backend.base.custom_exceptions import InvalidNotificationSettings
+        with self.assertRaises(InvalidNotificationSettings):
+            self.provider.validate_settings({})
+        with self.assertRaises(InvalidNotificationSettings):
+            self.provider.validate_settings(
+                {'server_url': '', 'stateless_urls': '   '})
+
+    def test_validate_accepts_server_url_only(self):
+        self.provider.validate_settings(
+            {'server_url': 'http://localhost:8000'})
+
+    def test_validate_accepts_stateless_urls_only(self):
+        self.provider.validate_settings(
+            {'stateless_urls': 'slack://token1/token2'})
+
+    def test_send_stateless_uses_apprise_lib(self):
+        settings = {'stateless_urls': 'slack://t1/t2, discord://123/abc'}
+        mock_apprise = MagicMock()
+        mock_instance = MagicMock()
+        mock_apprise.return_value = mock_instance
+        with patch(
+            'backend.implementations.notification_providers'
+            '.apprise_generic.apprise.Apprise',
+            mock_apprise
+        ):
+            self.provider._send('Title', 'Body', settings)
+        # Should have added 2 URLs
+        self.assertEqual(mock_instance.add.call_count, 2)
+        mock_instance.notify.assert_called_once_with(
+            title='Title', body='Body')
+
+    def test_send_server_posts_to_api(self):
+        settings = {
+            'server_url': 'http://localhost:8000',
+            'config_key': 'mykey',
+            'notify_type': 'Info',
+        }
+        with patch(
+            'backend.implementations.notification_providers'
+            '.apprise_generic.requests.post'
+        ) as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            self.provider._send('Title', 'Body', settings)
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args
+        url_arg = call_args[0][0]
+        self.assertIn('localhost:8000', url_arg)
+        self.assertIn('mykey', url_arg)
+
+    def test_send_both_modes_fires_both(self):
+        settings = {
+            'server_url': 'http://localhost:8000',
+            'stateless_urls': 'slack://token1/token2',
+        }
+        mock_apprise = MagicMock()
+        mock_instance = MagicMock()
+        mock_apprise.return_value = mock_instance
+        with patch(
+            'backend.implementations.notification_providers'
+            '.apprise_generic.apprise.Apprise',
+            mock_apprise
+        ), patch(
+            'backend.implementations.notification_providers'
+            '.apprise_generic.requests.post'
+        ) as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            self.provider._send('Title', 'Body', settings)
+        mock_instance.notify.assert_called_once()
+        mock_post.assert_called_once()
 
 
 if __name__ == '__main__':
