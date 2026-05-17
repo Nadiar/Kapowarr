@@ -343,7 +343,8 @@ class NotificationService(metaclass=Singleton):
 def _import_providers() -> None:
     """Import provider modules to trigger registration in provider_registry."""
     from backend.implementations.notification_providers import (  # noqa: F401
-        custom_script, webhook)
+        apprise_generic, custom_script,
+        discord_apprise, prowl_apprise, webhook)
 
 
 _import_providers()

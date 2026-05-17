@@ -4,12 +4,18 @@
 // 2. Config modal with Name, Triggers, provider fields
 
 var PROVIDER_LABELS = {
+	apprise: 'Apprise',
 	custom_script: 'Custom Script',
+	discord: 'Discord',
+	prowl: 'Prowl',
 	webhook: 'Webhook'
 };
 
 var PROVIDER_INFO = {
+	apprise: 'Connect to a self-hosted Apprise API server, or enter stateless Apprise URLs directly.',
 	custom_script: 'Testing will execute the script with the EventType set to Test, ensure your script handles this correctly',
+	discord: 'Paste your Discord channel webhook URL from Server Settings \u2192 Integrations \u2192 Webhooks.',
+	prowl: 'Requires a Prowl API key from prowlapp.com.',
 	webhook: ''
 };
 
