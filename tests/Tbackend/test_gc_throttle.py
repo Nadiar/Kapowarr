@@ -227,6 +227,43 @@ class TestAsyncSession429Logic(unittest.TestCase):
             "Must sleep GC_THROTTLE_DEFAULT_WAIT when Retry-After is absent"
         )
 
+    def test_429_uses_default_wait_when_retry_after_is_http_date(self):
+        """HTTP-date format in Retry-After must fall back to GC_THROTTLE_DEFAULT_WAIT."""
+        from backend.base.definitions import Constants
+
+        session = self._build_session()
+        gc_url = 'https://getcomics.org/?s=batman'
+
+        # RFC 7231 HTTP-date format
+        http_date = 'Fri, 16 May 2026 12:00:00 GMT'
+        resp_429 = self._make_response(429, {'Retry-After': http_date})
+        resp_200 = self._make_response(200)
+        calls = [resp_429, resp_200]
+        idx = [0]
+
+        async def fake_parent_request(*args, **kwargs):
+            r = calls[idx[0]]
+            idx[0] += 1
+            return r
+
+        slept = []
+
+        async def fake_sleep(s):
+            slept.append(s)
+
+        with patch(
+            'aiohttp.ClientSession._request',
+            new=fake_parent_request
+        ), patch('backend.base.helpers.sleep', side_effect=fake_sleep):
+            result = self._run(session._request('GET', gc_url))
+
+        self.assertEqual(result.status, 200,
+                         "Must retry and succeed after HTTP-date Retry-After")
+        self.assertIn(
+            Constants.GC_THROTTLE_DEFAULT_WAIT, slept,
+            "Must sleep GC_THROTTLE_DEFAULT_WAIT when Retry-After is HTTP-date"
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

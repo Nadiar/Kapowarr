@@ -1092,12 +1092,15 @@ class AsyncSession(ClientSession):
                     response.status == 429
                     and AsyncSession._GC_HOST in str(url)
                 ):
-                    retry_after = int(
-                        response.headers.get(
-                            'Retry-After',
-                            Constants.GC_THROTTLE_DEFAULT_WAIT
+                    try:
+                        retry_after = int(
+                            response.headers.get(
+                                'Retry-After',
+                                Constants.GC_THROTTLE_DEFAULT_WAIT
+                            )
                         )
-                    )
+                    except ValueError:
+                        retry_after = Constants.GC_THROTTLE_DEFAULT_WAIT
                     AsyncSession._gc_throttle_until = _time() + retry_after
                     LOGGER.warning(
                         'GetComics returned 429; backing off %ds'
