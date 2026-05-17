@@ -1,10 +1,11 @@
-typing_extensions ~= 4.12
-requests[socks] ~= 2.31
-beautifulsoup4 ~= 4.12
-flask ~= 3.0
-waitress ~= 3.0
-cryptography ~= 46.0, >= 46.0.5
-bencoding ~= 0.2
 aiohttp ~= 3.9
+apprise ~= 1.9
+beautifulsoup4 ~= 4.12
+bencoding ~= 0.2
+cryptography ~= 46.0, >= 46.0.5
+flask ~= 3.0
 flask-socketio ~= 5.3
+requests[socks] ~= 2.31
+typing_extensions ~= 4.12
+waitress ~= 3.0
 websocket-client ~= 1.3
