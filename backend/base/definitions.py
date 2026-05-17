@@ -92,6 +92,9 @@ class Constants:
     STATUS_FORCELIST_RETRIES = (500, 502, 503, 504)
     "The HTTP status codes for which a retry should be done"
 
+    GC_THROTTLE_DEFAULT_WAIT = 60
+    "Default seconds to back off when GetComics returns 429 with no Retry-After header"
+
     PROXY_TEST_URL = "https://httpbin.org/ip"
 
     CV_SITE_URL = "https://comicvine.gamespot.com"
