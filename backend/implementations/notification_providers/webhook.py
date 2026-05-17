@@ -15,19 +15,9 @@ from backend.base.logging import LOGGER
 from backend.features.notifications import (ApplicationUpdateEvent,
                                             DownloadEvent, HealthCheckEvent,
                                             NotificationProvider, TestEvent,
-                                            VolumeAddEvent, provider_registry)
-
-
-def _get_application_url() -> str:
-    """Build the application URL from settings."""
-    try:
-        from backend.internals.settings import Settings
-        sv = Settings().sv
-        host = sv.host if sv.host != '0.0.0.0' else 'localhost'
-        url_base = sv.url_base.rstrip('/')
-        return f'http://{host}:{sv.port}{url_base}'
-    except Exception:
-        return 'http://localhost:5656'
+                                            VolumeAddEvent,
+                                            get_application_url,
+                                            provider_registry)
 
 
 class WebhookProvider(NotificationProvider):
@@ -81,7 +71,7 @@ class WebhookProvider(NotificationProvider):
         return {
             'eventType': event_type,
             'instanceName': 'Kapowarr',
-            'applicationUrl': _get_application_url(),
+            'applicationUrl': get_application_url(),
         }
 
     def _send(self, settings: Dict, payload: Dict) -> None:
