@@ -13,7 +13,7 @@ from typing import Callable, Dict, List, Tuple, Type, Union
 
 from aiohttp import ClientError
 from bencoding import bencode
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 from backend.base.custom_exceptions import (DownloadLimitReached,
                                             EnqueuingDownloadFailure,
@@ -824,32 +824,56 @@ async def search_getcomics(
     return formatted_results
 
 
-def _extract_pack_links(html: str) -> List[str]:
-    """Extract GetComics article links from a weekly pack page.
+def _extract_pack_entries(html: str) -> List[Tuple[str, str]]:
+    """Extract (title, article_url) entries from a weekly pack page.
 
-    Scans every ``<li>`` tag in the HTML for ``<a href>`` values that point
-    to ``https://getcomics.org/``, excluding duplicates.  This captures the
-    per-comic download links listed inside each weekly pack article.
+    Each list item usually has the shape:
+        "Title : <a href=\"...\">Download</a>"
+
+    We capture only links whose anchor text is exactly "Download" and return
+    the text before the first anchor as the title.
 
     Args:
         html (str): HTML source of a GC weekly pack page.
 
     Returns:
-        List[str]: Unique links to individual comic article pages.
+        List[Tuple[str, str]]: Unique ``(title, article_url)`` entries.
     """
     soup = BeautifulSoup(html, 'html.parser')
     seen: set = set()
-    links: List[str] = []
+    entries: List[Tuple[str, str]] = []
+
     for li in soup.find_all('li'):
-        for a in li.find_all('a', href=True):
-            href = str(a.get('href', ''))
-            if (
-                href.startswith('https://getcomics.org/')
-                and href not in seen
-            ):
-                seen.add(href)
-                links.append(href)
-    return links
+        download_link: Union[Tag, None] = None
+        for anchor in li.find_all('a', href=True):
+            if anchor.get_text(strip=True).lower() == 'download':
+                download_link = anchor
+                break
+
+        if not download_link:
+            continue
+
+        href = str(download_link.get('href', '')).strip()
+        if not href.startswith('https://getcomics.org/'):
+            continue
+
+        title_parts: List[str] = []
+        for node in li.descendants:
+            if isinstance(node, Tag) and node.name == 'a':
+                break
+            if isinstance(node, NavigableString):
+                text = str(node).strip()
+                if text:
+                    title_parts.append(text.strip(':').strip())
+
+        title = ' '.join(title_parts).strip().strip(':').strip()
+        if not title or href in seen:
+            continue
+
+        seen.add(href)
+        entries.append((title, href))
+
+    return entries
 
 
 def _filter_pack_results(
@@ -882,10 +906,10 @@ async def scrape_weekly_packs(
     Each weekly pack page lists ~80-90 comics.  This function:
     1. Searches GC for "Weekly Pack" and filters the listing articles.
     2. Fetches up to ``pack_count`` pack pages.
-    3. Extracts every ``<a href>`` pointing to a GC article page.
+    3. Extracts every pack entry as ``(title, article_url)``.
     4. Deduplicates across packs (a comic may appear in overlapping weeks).
-    5. Derives series/issue metadata via ``extract_filename_data`` on the
-       URL slug so results can be matched against the library.
+    5. Verifies each article page can be fetched.
+    6. Derives series/issue metadata from the extracted list-item title.
 
     Args:
         session (AsyncSession): The session to make the requests with.
@@ -894,7 +918,7 @@ async def scrape_weekly_packs(
 
     Returns:
         List[SearchResultData]: Individual comic articles from pack pages,
-            deduplicated by link URL.
+            deduplicated by article URL.
     """
     pack_search = await search_getcomics(session, 'Weekly Pack')
     pack_articles = _filter_pack_results(pack_search)[:pack_count]
@@ -908,23 +932,25 @@ async def scrape_weekly_packs(
         if not html:
             continue
 
-        for link in _extract_pack_links(html):
-            if link in seen:
+        for title, article_url in _extract_pack_entries(html):
+            if article_url in seen:
                 continue
-            seen.add(link)
+            seen.add(article_url)
 
-            # Derive a human-readable title from the URL slug.
-            # e.g. "https://getcomics.org/dc/batman-150-2026/" → "batman 150 2026"
-            slug = [p for p in link.rstrip('/').split('/') if p][-1]
-            title = slug.replace('-', ' ')
+            # Touch the article page so dead links are skipped early.
+            article_html = await session.get_text(article_url, quiet_fail=True)
+            if not article_html:
+                continue
+
+            parsed_data = extract_filename_data(
+                title,
+                assume_volume_number=False,
+                fix_year=True
+            )
 
             results.append({
-                **extract_filename_data(
-                    title,
-                    assume_volume_number=False,
-                    fix_year=True
-                ),
-                'link': link,
+                **parsed_data,
+                'link': article_url,
                 'display_title': title,
                 'source': Constants.GC_SOURCE_TERM
             })

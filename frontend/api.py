@@ -769,10 +769,22 @@ def api_volumes():
         query = extract_key(request, 'query', False)
         sort = extract_key(request, 'sort', False)
         filter = extract_key(request, 'filter', False)
+        limit = extract_key(request, 'limit', False) or 0
+        offset = extract_key(request, 'offset', False) or 0
         if query:
             volumes = Library.search(query, sort, filter)
-        else:
-            volumes = Library.get_public_volumes(sort, filter)
+            return return_api(volumes)
+
+        if limit > 0:
+            volumes, has_more = Library.get_public_volumes(
+                sort,
+                filter,
+                limit,
+                offset
+            )
+            return return_api({'has_more': has_more, 'result': volumes})
+
+        volumes = Library.get_public_volumes(sort, filter)
 
         return return_api(volumes)
 

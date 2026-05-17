@@ -17,6 +17,7 @@ from flask import Flask
 
 from backend.base.custom_exceptions import (InvalidComicVineApiKey,
                                             TaskNotDeletable, TaskNotFound)
+from backend.base.definitions import BlocklistReasonID
 from backend.base.helpers import Singleton, get_subclasses
 from backend.base.logging import LOGGER
 from backend.features.download_queue import DownloadHandler
@@ -813,6 +814,30 @@ class SearchRecent(Task):
         # this is free if the calendar page was visited recently.
         from backend.features.calendar import get_calendar
         calendar_issues = get_calendar(window_start, window_end)
+
+        # Clear stale automatic blocklist reasons for in-scope issues so
+        # SearchRecent can retry links that may now be available.
+        in_scope_issue_ids = sorted({
+            i['issue_id_local']
+            for i in calendar_issues
+            if i.get('issue_id_local')
+            and i.get('in_library')
+            and not i.get('has_files')
+        })
+        if in_scope_issue_ids:
+            placeholders = ','.join('?' * len(in_scope_issue_ids))
+            with get_db() as cursor:
+                cursor.execute(
+                    "DELETE FROM blocklist "
+                    f"WHERE issue_id IN ({placeholders}) "
+                    "AND reason != ?",
+                    (*in_scope_issue_ids,
+                     BlocklistReasonID.ADDED_BY_USER.value)
+                )
+            LOGGER.debug(
+                'SearchRecent: cleared stale blocklist for %d in-scope issues',
+                len(in_scope_issue_ids)
+            )
 
         downloads: List[Tuple[str, int, Union[int, None]]] = []
         ws = WebSocket()

@@ -882,8 +882,10 @@ class Library:
     def get_public_volumes(
         cls,
         sort: LibrarySorting = LibrarySorting.TITLE,
-        filter: Union[LibraryFilter, int, None] = None
-    ) -> List[Dict[str, Any]]:
+        filter: Union[LibraryFilter, int, None] = None,
+        limit: int = 0,
+        offset: int = 0
+    ) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], bool]]:
         """Get all the volumes in the library.
 
         Args:
@@ -904,7 +906,7 @@ class Library:
         else:
             sql_filter = ''
 
-        volumes = get_db().execute(f"""
+        query = f"""
             WITH
                 vol_issues AS (
                     SELECT id, monitored, date
@@ -943,9 +945,19 @@ class Library:
                 ) AS total_size
             FROM volumes
             {sql_filter}
-            ORDER BY {sort.value};
-            """
-        ).fetchalldict()
+            ORDER BY {sort.value}
+        """
+
+        db = get_db()
+        if limit > 0:
+            volumes = db.execute(
+                query + " LIMIT ? OFFSET ?;",
+                (limit + 1, offset)
+            ).fetchalldict()
+            has_more = len(volumes) > limit
+            return volumes[:limit], has_more
+
+        volumes = db.execute(query + ";").fetchalldict()
 
         return volumes
 

@@ -207,9 +207,15 @@ def get_calendar(
                         'Calendar cache superset hit: %s–%s within %s–%s',
                         start_date, end_date, cs, ce
                     )
-                    # Use all cached issues — they're all within the requested range
-                    # since our cache key is the original fetch range
-                    cached_issues = [dict(i) for i in cached_range_issues]
+                    # Filter superset cache data down to the requested window.
+                    cached_issues = [
+                        dict(i) for i in cached_range_issues
+                        if start_date <= (
+                            i.get('effective_date')
+                            or i.get('store_date')
+                            or ''
+                        ) <= end_date
+                    ]
                     break
 
     if cached_issues is None:

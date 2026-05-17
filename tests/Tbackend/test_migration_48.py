@@ -14,7 +14,6 @@ from unittest.mock import patch
 
 from backend.internals.db import KapowarrCursor
 
-
 # Minimal schema matching what migration 48 starts from
 _SCHEMA_PRE = """
     CREATE TABLE config (
@@ -46,8 +45,7 @@ class TestMigration48(unittest.TestCase):
     """Migration 48 replaces update_all with 4 focused task intervals."""
 
     def _run_migration(self):
-        from backend.internals.db_migration import \
-            DatabaseMigrationHandler
+        from backend.internals.db_migration import DatabaseMigrationHandler
         handler = DatabaseMigrationHandler.handlers.get(48)
         self.assertIsNotNone(handler, "Migration 48->49 not registered")
 

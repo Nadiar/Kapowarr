@@ -122,8 +122,7 @@ class TestUpdateVolumeMetadata(unittest.TestCase):
             'backend.implementations.volumes.commit',
             side_effect=lambda: cursor.connection.commit()
         ):
-            from backend.implementations.volumes import \
-                update_volume_metadata
+            from backend.implementations.volumes import update_volume_metadata
             update_volume_metadata(cv_to_id_fetch, volume_datas)
 
         row = cursor.execute(
@@ -240,8 +239,7 @@ class TestDeleteOrphanedIssues(unittest.TestCase):
             'backend.implementations.volumes.Issue',
             mock_issue_cls
         ):
-            from backend.implementations.volumes import \
-                delete_orphaned_issues
+            from backend.implementations.volumes import delete_orphaned_issues
             delete_orphaned_issues(
                 cv_to_id_fetch, volume_datas, issue_datas
             )

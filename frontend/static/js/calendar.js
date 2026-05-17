@@ -354,6 +354,8 @@ function renderIssues() {
 
 	// Sort dates
 	const sortedDates = Object.keys(byDate).sort();
+	if (viewMode === 'month')
+		sortedDates.reverse();
 
 	// Render
 	calendar_els.grid.innerHTML = '';

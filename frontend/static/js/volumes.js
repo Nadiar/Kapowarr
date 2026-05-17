@@ -46,6 +46,12 @@ const pre_build_els = {
 	table_entry: document.querySelector('.pre-build-els .table-entry')
 };
 
+let _currentOffset = 0;
+let _isLoading = false;
+let _hasMore = true;
+let _observer = null;
+const PAGE_SIZE = 50;
+
 function showLibraryPage(el) {
 	hide(Object.values(library_els.pages), [el]);
 };
@@ -122,10 +128,6 @@ class LibraryEntry {
 };
 
 function populateLibrary(volumes, api_key) {
-	library_els.views.list.querySelectorAll('.list-entry').forEach(
-		e => e.remove()
-	);
-	library_els.views.table.innerHTML = '';
 	const space_taker = document.querySelector('.space-taker');
 
 	const list_fragment = document.createDocumentFragment(),
@@ -199,27 +201,99 @@ function populateLibrary(volumes, api_key) {
 	library_els.views.table.appendChild(table_fragment);
 };
 
+function clearLibrary() {
+	library_els.views.list.querySelectorAll('.list-entry').forEach(
+		e => e.remove()
+	);
+	library_els.views.table.innerHTML = '';
+}
+
+function _toggleSentinel(visible) {
+	const sentinel = document.querySelector('#load-more-sentinel');
+	if (!sentinel)
+		return;
+	sentinel.style.display = visible ? '' : 'none';
+}
+
+async function _fetchPage(api_key) {
+	if (_isLoading || !_hasMore)
+		return;
+
+	_isLoading = true;
+
+	const sort = library_els.view_options.sort.value;
+	const filter = library_els.view_options.filter.value;
+	const query = library_els.search.input.value;
+	const params = {sort, filter};
+
+	if (query !== '') {
+		params.query = query;
+	} else {
+		params.limit = PAGE_SIZE;
+		params.offset = _currentOffset;
+	}
+
+	try {
+		const json = await fetchAPI('/volumes', api_key, params);
+		let volumes = [];
+
+		if (query !== '') {
+			volumes = json.result || [];
+			_hasMore = false;
+		} else {
+			volumes = (json.result && json.result.result) || [];
+			_hasMore = Boolean(json.result && json.result.has_more);
+			_currentOffset += volumes.length;
+		}
+
+		if (_currentOffset === 0 && volumes.length === 0) {
+			showLibraryPage(library_els.pages.empty);
+			_toggleSentinel(false);
+			if (_observer)
+				_observer.disconnect();
+			return;
+		}
+
+		populateLibrary(volumes, api_key);
+		showLibraryPage(library_els.pages.view);
+
+		if (!_hasMore) {
+			_toggleSentinel(false);
+			if (_observer)
+				_observer.disconnect();
+		} else {
+			_toggleSentinel(true);
+		}
+	} catch (error) {
+		showLibraryPage(library_els.pages.empty);
+		_toggleSentinel(false);
+	} finally {
+		_isLoading = false;
+	}
+}
+
 function fetchLibrary(api_key) {
 	library_els.mass_edit.progress.innerText = '';
+	_currentOffset = 0;
+	_isLoading = false;
+	_hasMore = true;
+	clearLibrary();
 	showLibraryPage(library_els.pages.loading);
+	_toggleSentinel(true);
 
-	const params = {
-		sort: library_els.view_options.sort.value,
-		filter: library_els.view_options.filter.value
-	};
-	const query = library_els.search.input.value;
-	if (query !== '')
-		params.query = query;
+	if (_observer)
+		_observer.disconnect();
 
-	fetchAPI('/volumes', api_key, params)
-	.then(json => {
-		if (json.result.length === 0) {
-			showLibraryPage(library_els.pages.empty);
-		} else {
-			populateLibrary(json.result, api_key);
-			showLibraryPage(library_els.pages.view);
-		};
-	});
+	const sentinel = document.querySelector('#load-more-sentinel');
+	if (sentinel) {
+		_observer = new IntersectionObserver(entries => {
+			if (entries[0].isIntersecting)
+				_fetchPage(api_key);
+		}, {rootMargin: '200px'});
+		_observer.observe(sentinel);
+	}
+
+	_fetchPage(api_key);
 };
 
 function searchLibrary() {

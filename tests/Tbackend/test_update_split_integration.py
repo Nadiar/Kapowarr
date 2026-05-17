@@ -32,16 +32,18 @@ class TestTaskLibraryRegistration(unittest.TestCase):
         self.assertNotIn('update_all', lib)
 
     def test_action_strings(self):
-        from backend.features.tasks import (SyncIssues, RefreshMetadata,
-                                            ScanFiles, SpecialVersionRefresh)
+        from backend.features.tasks import (RefreshMetadata, ScanFiles,
+                                            SpecialVersionRefresh, SyncIssues)
         self.assertEqual(SyncIssues.action, 'sync_issues')
         self.assertEqual(RefreshMetadata.action, 'refresh_metadata')
         self.assertEqual(ScanFiles.action, 'scan_files')
-        self.assertEqual(SpecialVersionRefresh.action, 'special_version_refresh')
+        self.assertEqual(
+            SpecialVersionRefresh.action,
+            'special_version_refresh')
 
     def test_priority_ordering(self):
-        from backend.features.tasks import (SyncIssues, RefreshMetadata,
-                                            ScanFiles, SpecialVersionRefresh)
+        from backend.features.tasks import (RefreshMetadata, ScanFiles,
+                                            SpecialVersionRefresh, SyncIssues)
         self.assertEqual(SyncIssues.priority, 3)
         self.assertEqual(RefreshMetadata.priority, 3)
         self.assertEqual(ScanFiles.priority, 3)
@@ -49,6 +51,7 @@ class TestTaskLibraryRegistration(unittest.TestCase):
 
     def test_refresh_and_scan_requires_volume_id(self):
         import inspect
+
         from backend.implementations.volumes import refresh_and_scan
         sig = inspect.signature(refresh_and_scan)
         params = sig.parameters
@@ -61,6 +64,7 @@ class TestTaskLibraryRegistration(unittest.TestCase):
 
     def test_refresh_and_scan_no_allow_skipping(self):
         import inspect
+
         from backend.implementations.volumes import refresh_and_scan
         sig = inspect.signature(refresh_and_scan)
         self.assertNotIn('allow_skipping', sig.parameters)

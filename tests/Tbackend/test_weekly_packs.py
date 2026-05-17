@@ -43,6 +43,21 @@ _PACK_PAGE_HTML = """
 </html>
 """
 
+_PACK_PAGE_HTML_WITH_READ_ONLINE = """
+<html><body>
+<ul>
+    <li>Absolute Martian Manhunter #10 :
+        <a href="https://getcomics.org/dc/absolute-martian-manhunter-10-2026/">Download</a>
+        |
+        <a href="https://example.org/read/absolute-martian-manhunter-10">Read Online</a>
+    </li>
+    <li>Preview item :
+        <a href="https://getcomics.org/dc/preview-item/">Read Online</a>
+    </li>
+</ul>
+</body></html>
+"""
+
 # A second pack page that has one duplicate link and one new link
 _PACK_PAGE_HTML_2 = """
 <html>
@@ -84,41 +99,59 @@ def _run(coro):
 
 
 # ---------------------------------------------------------------------------
-# Tests: _extract_pack_links (internal HTML parser)
+# Tests: _extract_pack_entries (internal HTML parser)
 # ---------------------------------------------------------------------------
 
-class TestExtractPackLinks(unittest.TestCase):
-    """Test the function that extracts GC article links from a pack page."""
+class TestExtractPackEntries(unittest.TestCase):
+    """Test the function that extracts title/url entries from a pack page."""
 
-    def test_extracts_gc_article_links(self) -> None:
-        """Should return all <a href> values pointing to getcomics.org."""
-        from backend.implementations.getcomics import _extract_pack_links
-        links = _extract_pack_links(_PACK_PAGE_HTML)
+    def test_extracts_title_and_download_link_pairs(self) -> None:
+        """Should return (title, link) pairs for Download anchors."""
+        from backend.implementations.getcomics import _extract_pack_entries
+        entries = _extract_pack_entries(_PACK_PAGE_HTML)
 
-        self.assertEqual(len(links), 3)
+        self.assertEqual(len(entries), 3)
         self.assertIn(
-            'https://getcomics.org/dc/batman-150-2026/', links
+            (
+                'Batman #150',
+                'https://getcomics.org/dc/batman-150-2026/'
+            ),
+            entries
         )
         self.assertIn(
-            'https://getcomics.org/dc/superman-25-2026/', links
-        )
-        self.assertIn(
-            'https://getcomics.org/marvel/amazing-spider-man-50-2026/', links
+            (
+                'Superman #25',
+                'https://getcomics.org/dc/superman-25-2026/'
+            ),
+            entries
         )
 
-    def test_ignores_non_gc_links(self) -> None:
-        """Links not pointing to getcomics.org should be excluded."""
-        from backend.implementations.getcomics import _extract_pack_links
-        links = _extract_pack_links(_PACK_PAGE_HTML)
+    def test_ignores_non_download_anchors(self) -> None:
+        """Read Online links should not be captured as entries."""
+        from backend.implementations.getcomics import _extract_pack_entries
+        entries = _extract_pack_entries(_PACK_PAGE_HTML_WITH_READ_ONLINE)
 
-        for link in links:
-            self.assertIn('getcomics.org', link)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(
+            entries[0],
+            (
+                'Absolute Martian Manhunter #10',
+                'https://getcomics.org/dc/absolute-martian-manhunter-10-2026/'
+            )
+        )
 
     def test_returns_empty_for_blank_page(self) -> None:
         """Empty/junk HTML should return an empty list."""
-        from backend.implementations.getcomics import _extract_pack_links
-        links = _extract_pack_links('<html><body></body></html>')
-        self.assertEqual(links, [])
+        from backend.implementations.getcomics import _extract_pack_entries
+        entries = _extract_pack_entries('<html><body></body></html>')
+        self.assertEqual(entries, [])
+
+    def test_extracts_title_text_before_first_anchor(self) -> None:
+        """Should parse list-item text before the first anchor as title."""
+        from backend.implementations.getcomics import _extract_pack_entries
+        entries = _extract_pack_entries(_PACK_PAGE_HTML_WITH_READ_ONLINE)
+
+        self.assertEqual(entries[0][0], 'Absolute Martian Manhunter #10')
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +256,8 @@ class TestScrapeWeeklyPacks(unittest.TestCase):
                 return _PACK_PAGE_HTML
             elif '2026-03-11' in url:
                 return _PACK_PAGE_HTML_2
+            elif url.startswith('https://getcomics.org/'):
+                return '<html><body><article class="post"></article></body></html>'
             return ''
 
         session.get_text = fake_get_text
@@ -247,6 +282,23 @@ class TestScrapeWeeklyPacks(unittest.TestCase):
             self.assertIn('display_title', r)
             self.assertIn('source', r)
 
+    def test_uses_entry_title_not_slug(self) -> None:
+        """Display title should come from list-item text, not URL slug."""
+        from backend.implementations.getcomics import scrape_weekly_packs
+
+        session, fake_search = self._make_mock_session()
+
+        with patch(
+            'backend.implementations.getcomics.search_getcomics',
+            side_effect=fake_search
+        ):
+            results = _run(scrape_weekly_packs(session, pack_count=2))
+
+        self.assertTrue(
+            any(r['display_title'] == 'Batman #150' for r in results))
+        self.assertFalse(
+            any('batman-150-2026' in r['display_title'] for r in results))
+
     def test_deduplicates_links_across_packs(self) -> None:
         """A link appearing in two packs should only be returned once."""
         from backend.implementations.getcomics import scrape_weekly_packs
@@ -265,7 +317,9 @@ class TestScrapeWeeklyPacks(unittest.TestCase):
             l for l in links
             if 'batman-150' in l
         ]
-        self.assertEqual(len(batman_links), 1, 'Duplicate link should appear once')
+        self.assertEqual(
+            len(batman_links),
+            1, 'Duplicate link should appear once')
 
     def test_only_weekly_packs_processed(self) -> None:
         """Non-pack results from the search should not become sources."""

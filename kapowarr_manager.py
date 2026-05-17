@@ -296,9 +296,10 @@ else:
 
 
 # Log line format (detailed formatter):
-# 2026-03-11T12:00:00+0000 | MainProcess | TaskThread-3 | tasks.pyL578 | INFO | Running task Search All
+# 2026-03-11T12:00:00+0000 | MainProcess | TaskThread-3 | tasks.pyL578 |
+# INFO | Running task Search All
 _LOG_THREAD_COL = 2   # 0-based column index after splitting on " | "
-_LOG_ADDED_RE   = None  # compiled lazily
+_LOG_ADDED_RE = None  # compiled lazily
 
 
 def _find_thread_names(log_text: str, name_lower: str) -> dict[str, str]:
@@ -346,10 +347,12 @@ def cmd_logs(
         thread_name = f"TaskThread-{running['id']}"
         title = running.get("display_title", running.get("action", "?"))
         status = "running" if tasks.index(running) == 0 else "queued"
-        print(f"Following logs for [{status}] '{title}' ({thread_name}) — Ctrl-C to stop\n")
+        print(
+            f"Following logs for [{status}] '{title}' ({thread_name}) — Ctrl-C to stop\n")
 
         _check_container(container)
-        # Stream the log file from inside the container, filtering by thread name and level
+        # Stream the log file from inside the container, filtering by thread
+        # name and level
         proc = subprocess.Popen(
             ["docker", "exec", container, "tail", "-f", "-n", "+1", "/app/Kapowarr.log"],
             stdout=subprocess.PIPE,
@@ -364,7 +367,8 @@ def cmd_logs(
                     continue
                 if parts[_LOG_THREAD_COL].strip() != thread_name:
                     continue
-                if level_upper != "DEBUG" and parts[4].strip() not in _levels_gte(level_upper):
+                if level_upper != "DEBUG" and parts[4].strip(
+                ) not in _levels_gte(level_upper):
                     continue
                 print(_fmt_log_line(parts))
         except KeyboardInterrupt:
@@ -392,12 +396,14 @@ def cmd_logs(
             thread = parts[_LOG_THREAD_COL].strip()
             if thread not in thread_map:
                 continue
-            if level_upper != "DEBUG" and parts[4].strip() not in _levels_gte(level_upper):
+            if level_upper != "DEBUG" and parts[4].strip(
+            ) not in _levels_gte(level_upper):
                 continue
             matched_lines.append((thread, parts))
 
         if not matched_lines:
-            print(f"No log lines at level >={level_upper} for tasks matching '{name}'.")
+            print(
+                f"No log lines at level >={level_upper} for tasks matching '{name}'.")
             return
 
         # Group by thread so runs are clearly separated
@@ -445,7 +451,8 @@ def cmd_stop(client: KapowarrClient, container: str, name: str) -> None:
         print("Currently active tasks:")
         for i, t in enumerate(tasks):
             status = "running" if i == 0 else "queued"
-            print(f"  [{status}] {t.get('display_title', t.get('action'))} (ID {t['id']})")
+            print(
+                f"  [{status}] {t.get('display_title', t.get('action'))} (ID {t['id']})")
         return
 
     for i, task in matches:
@@ -453,7 +460,8 @@ def cmd_stop(client: KapowarrClient, container: str, name: str) -> None:
         status = "running" if i == 0 else "queued"
         try:
             client.delete_task(task["id"])
-            print(f"  \u2713 Stopped {status} task '{title}' (ID {task['id']}).")
+            print(
+                f"  \u2713 Stopped {status} task '{title}' (ID {task['id']}).")
         except requests.HTTPError as exc:
             code = exc.response.status_code if exc.response is not None else "?"
             print(f"  \u2717 Failed to stop '{title}' (HTTP {code}): {exc}")
@@ -469,8 +477,7 @@ def cmd_intervals(client: KapowarrClient) -> None:
     col_w = (4, 22, 24, 12, 20, 0)
     header = (
         f"{'#':<{col_w[0]}} {'Task Name':<{col_w[1]}} {'Display Name':<{col_w[2]}}"
-        f" {'Interval':<{col_w[3]}} {'Last Run':<{col_w[4]}} Next Run"
-    )
+        f" {'Interval':<{col_w[3]}} {'Last Run':<{col_w[4]}} Next Run")
     print(f"\n{header}")
     print("-" * max(100, len(header)))
 
@@ -545,28 +552,39 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--url", metavar="URL", help=f"Kapowarr base URL (default: {DEFAULT_URL})")
+    parser.add_argument(
+        "--url", metavar="URL",
+        help=f"Kapowarr base URL (default: {DEFAULT_URL})")
     parser.add_argument("--key", metavar="API_KEY", help="Kapowarr API key")
-    parser.add_argument("--container", metavar="NAME", help=f"Docker container name (default: {DEFAULT_CONTAINER})")
+    parser.add_argument(
+        "--container", metavar="NAME",
+        help=f"Docker container name (default: {DEFAULT_CONTAINER})")
 
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     sub.required = True
 
     sub.add_parser("list", help="Show running and queued jobs")
 
-    stop_p = sub.add_parser("stop", help="Stop a job by name (partial match, including running task)")
+    stop_p = sub.add_parser(
+        "stop", help="Stop a job by name (partial match, including running task)")
     stop_p.add_argument("name", help="Job name or partial name to match")
 
     sub.add_parser("intervals", help="Show scheduled task intervals")
 
-    si_p = sub.add_parser("set-interval", help="Update a task interval in hours")
-    si_p.add_argument("task", help="Task name (e.g. update_all, search_all, search_recent)")
+    si_p = sub.add_parser(
+        "set-interval",
+        help="Update a task interval in hours")
+    si_p.add_argument(
+        "task",
+        help="Task name (e.g. update_all, search_all, search_recent)")
     si_p.add_argument("hours", type=float, help="New interval in hours")
 
-    logs_p = sub.add_parser("logs", help="Show log output for a job (historical or live)")
+    logs_p = sub.add_parser(
+        "logs", help="Show log output for a job (historical or live)")
     logs_p.add_argument("name", help="Job name or partial name to match")
     logs_p.add_argument(
-        "--follow", "-f",
+        "--follow",
+        "-f",
         action="store_true",
         help="Stream live log output for the currently running/queued job (requires docker)",
     )
