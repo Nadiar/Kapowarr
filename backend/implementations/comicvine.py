@@ -950,38 +950,41 @@ class ComicVine:
     ) -> List[Dict[str, Any]]:
         """Fetch raw volume data for publisher enrichment.
 
+        All batches are dispatched concurrently via asyncio.gather so
+        latency scales with the slowest single batch rather than the sum.
+
         Args:
             volume_ids: CV volume IDs to fetch.
 
         Returns:
             List of raw API result dicts for matching volumes.
         """
+        if not volume_ids:
+            return []
+
         enrichment_field_list = ','.join((
             'id', 'name', 'publisher', 'image', 'site_detail_url',
             'aliases', 'count_of_issues', 'deck', 'description', 'start_year'
         ))
 
-        all_vols: List[Dict[str, Any]] = []
-
         async with AsyncSession() as session:
-            for id_batch in batched(volume_ids, 100):
-                str_ids = [str(vid) for vid in id_batch]
-                try:
-                    result = await self.__call_api(
-                        session,
-                        '/volumes',
-                        {
-                            'field_list': enrichment_field_list,
-                            'filter': 'id:{}'.format('|'.join(str_ids))
-                        },
-                        {'results': []}
-                    )
-                except CVRateLimitReached:
-                    LOGGER.warning(
-                        'CV rate limit while enriching calendar volumes'
-                    )
-                    break
+            tasks = [
+                self.__call_api(
+                    session,
+                    '/volumes',
+                    {
+                        'field_list': enrichment_field_list,
+                        'filter': 'id:{}'.format(
+                            '|'.join(str(vid) for vid in id_batch)
+                        )
+                    },
+                    {'results': []}
+                )
+                for id_batch in batched(volume_ids, 100)
+            ]
+            responses = await gather(*tasks)
 
-                all_vols.extend(result.get('results', []))
-
+        all_vols: List[Dict[str, Any]] = []
+        for resp in responses:
+            all_vols.extend(resp.get('results', []))
         return all_vols
