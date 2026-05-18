@@ -8,6 +8,7 @@ publisher information from the CV API.
 """
 
 from asyncio import run
+from time import time as _time
 from typing import Any, Dict, List
 
 from backend.base.custom_exceptions import InvalidComicVineApiKey
@@ -16,6 +17,10 @@ from backend.features.calendar import CalendarIssue
 from backend.features.calendar_publishers import (normalize_publisher_name,
                                                   resolve_parent_publisher)
 from backend.implementations.comicvine import ComicVine
+from backend.internals.db import get_db
+
+# Volume-publisher cache TTL: 30 days (publishers rarely change)
+VOLUME_PUBLISHER_CACHE_TTL: float = 30 * 86400
 
 
 def _pick_effective_date(
@@ -55,7 +60,7 @@ def _enrich_with_publishers(
 
     volume_publisher_map: Dict[int, Dict[str, Any]] = {}
 
-    # Fetch all volumes from CV API
+    # Fetch all volumes from CV API (or local SQLite cache)
     if volume_ids:
         _fetch_missing_volumes(list(volume_ids), volume_publisher_map)
 
@@ -118,12 +123,47 @@ def _fetch_missing_volumes(
     volume_ids: List[int],
     volume_publisher_map: Dict[int, Dict[str, Any]]
 ) -> None:
-    """Fetch volumes from the CV API and update the publisher map.
+    """Fetch volumes from the SQLite cache or CV API and update the publisher map.
+
+    Checks the local ``volume_publisher_cache`` table first (30-day TTL).
+    Only calls CVProxy for IDs that are absent or expired.
+    Freshly fetched results are upserted into the cache.
 
     Args:
-        volume_ids: CV volume IDs to fetch.
+        volume_ids: CV volume IDs to look up.
         volume_publisher_map: Dict to update with fetched publisher info.
     """
+    if not volume_ids:
+        return
+
+    now = _time()
+    cursor = get_db()
+    placeholders = ','.join('?' * len(volume_ids))
+
+    # --- 1. Load fresh cached entries ---
+    rows = cursor.execute(
+        f'SELECT comicvine_id, volume_name, publisher_name, publisher_id '
+        f'FROM volume_publisher_cache '
+        f'WHERE comicvine_id IN ({placeholders}) '
+        f'  AND cached_at > ?;',
+        (*volume_ids, now - VOLUME_PUBLISHER_CACHE_TTL)
+    ).fetchall()
+
+    cached_ids: set = set()
+    for row in rows:
+        cid = row[0]
+        volume_publisher_map[cid] = {
+            'volume_name': row[1] or '',
+            'publisher_id': row[3],
+            'publisher_name': row[2],
+        }
+        cached_ids.add(cid)
+
+    gap_ids = [vid for vid in volume_ids if vid not in cached_ids]
+    if not gap_ids:
+        return
+
+    # --- 2. Fetch gaps from CVProxy ---
     try:
         cv = ComicVine()
     except InvalidComicVineApiKey:
@@ -133,21 +173,41 @@ def _fetch_missing_volumes(
         return
 
     try:
-        raw_vols = run(cv.fetch_volumes_for_enrichment(volume_ids))
-        for vol in raw_vols:
-            vid = int(vol['id'])
-            pub = vol.get('publisher') or {}
-            volume_publisher_map[vid] = {
-                'volume_name': vol.get('name', ''),
-                'publisher_id': (
-                    int(pub['id']) if pub.get('id') else None
-                ),
-                'publisher_name': normalize_publisher_name(
-                    pub.get('name')
-                )
-            }
+        raw_vols = run(cv.fetch_volumes_for_enrichment(gap_ids))
     except Exception as e:
         LOGGER.warning('Failed to fetch missing volumes for calendar: %s', e)
+        return
+
+    # --- 3. Update map and upsert to cache ---
+    rows_to_upsert = []
+    for vol in raw_vols:
+        vid = int(vol['id'])
+        pub = vol.get('publisher') or {}
+        pub_name = normalize_publisher_name(pub.get('name'))
+        pub_id = int(pub['id']) if pub.get('id') else None
+        info: Dict[str, Any] = {
+            'volume_name': vol.get('name', ''),
+            'publisher_id': pub_id,
+            'publisher_name': pub_name,
+        }
+        volume_publisher_map[vid] = info
+        rows_to_upsert.append((
+            vid,
+            info['volume_name'],
+            info['publisher_name'],
+            info['publisher_id'],
+            now,
+        ))
+
+    if rows_to_upsert:
+        with cursor:
+            cursor.executemany(
+                'INSERT OR REPLACE INTO volume_publisher_cache '
+                '(comicvine_id, volume_name, publisher_name, '
+                ' publisher_id, cached_at) '
+                'VALUES (?, ?, ?, ?, ?);',
+                rows_to_upsert
+            )
 
 
 def fetch_calendar_issues(
