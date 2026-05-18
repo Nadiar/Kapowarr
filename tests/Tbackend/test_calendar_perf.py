@@ -91,5 +91,38 @@ class TestFetchVolumesParallel(unittest.TestCase):
         self.assertEqual(len(result), 50)
 
 
+    def test_failed_batch_returns_partial_results(self):
+        """A batch that returns empty default does not discard other batches."""
+        cv = _make_cv()
+        # 200 IDs → 2 batches; batch 1 (IDs 1–100) returns results,
+        # batch 2 (IDs 101–200) returns empty (simulating default fallback)
+        volume_ids = list(range(1, 201))
+        batch1_vols = [{'id': str(i), 'name': f'Vol{i}', 'publisher': {}}
+                       for i in range(1, 101)]
+
+        call_count = 0
+
+        async def side_effect(session, url, params, default=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {'results': batch1_vols}
+            return {'results': []}  # second batch: empty (error fallback)
+
+        mock_session = AsyncMock()
+        mock_ctx = MagicMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch('backend.implementations.comicvine.AsyncSession',
+                   return_value=mock_ctx), \
+             patch.object(type(cv), '_ComicVine__call_api',
+                          side_effect=side_effect):
+            result = asyncio.run(cv.fetch_volumes_for_enrichment(volume_ids))
+
+        # Only batch 1's results returned, no exception raised
+        self.assertEqual(len(result), 100)
+
+
 if __name__ == '__main__':
     unittest.main()
