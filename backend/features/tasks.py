@@ -731,14 +731,14 @@ class SearchAll(Task):
 
 
 class RefreshCalendar(Task):
-    """Pre-warm the calendar cache with +/- 1 week from today."""
+    """Pre-warm the calendar cache with +/- 30 days from today."""
 
     stop = False
     message = ''
     action = 'refresh_calendar'
     display_title = 'Refresh Calendar'
     description = (
-        'Pre-warms the calendar cache with releases in the \u00b17-day window'
+        'Pre-warms the calendar cache with releases in the \u00b130-day window'
         ' around today so that calendar page loads are instant.'
     )
     category = 'maintenance'
@@ -759,15 +759,26 @@ class RefreshCalendar(Task):
     def run(self) -> List[Tuple[str, int, Union[int, None]]]:
         from backend.features.calendar import get_calendar
         today = date.today()
-        window_start = (today - timedelta(days=7)).isoformat()
-        window_end = (today + timedelta(days=7)).isoformat()
+        window_start = (today - timedelta(days=30)).isoformat()
+        window_end = (today + timedelta(days=30)).isoformat()
 
         self.message = 'Refreshing calendar cache'
         ws = WebSocket()
         ws.emit(TaskStatusEvent(self.message))
 
-        # Force refresh to update the cache
+        # Superset fetch: seeds CVProxy and Kapowarr's in-memory cache
+        # for the full ±30-day window in one request.
         get_calendar(window_start, window_end, force_refresh=True)
+
+        # Week-by-week seeding: populates Kapowarr's per-week cache entries
+        # so individual week navigation is instant after this task runs.
+        # force_refresh=False means these hit the superset cache above —
+        # no extra CVProxy calls are made.
+        current = today - timedelta(days=30)
+        while current <= today + timedelta(days=30):
+            week_end = current + timedelta(days=6)
+            get_calendar(current.isoformat(), week_end.isoformat())
+            current += timedelta(days=7)
 
         self.message = 'Calendar cache refreshed'
         ws.emit(TaskStatusEvent(self.message))
