@@ -1273,3 +1273,17 @@ def _migrate_task_history_duration():
         " ADD COLUMN duration_seconds INTEGER;"
     )
     return
+
+
+@DatabaseMigrationHandler.register_handler(50)
+def _migrate_add_volume_publisher_cache():
+    """Migration 50->51: add volume_publisher_cache for calendar enrichment."""
+    get_db().executescript("""
+        CREATE TABLE IF NOT EXISTS volume_publisher_cache (
+            comicvine_id   INTEGER PRIMARY KEY,
+            volume_name    TEXT    NOT NULL DEFAULT '',
+            publisher_name TEXT,
+            publisher_id   INTEGER,
+            cached_at      REAL    NOT NULL
+        );
+    """)
