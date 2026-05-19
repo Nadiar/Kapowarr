@@ -145,3 +145,4 @@ release*.sh
 kapowarr_manager.cfg
 tools/
 .*/
+.claude/
