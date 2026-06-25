@@ -5,9 +5,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from backend.features.notifications import (
-    ApplicationUpdateEvent, DownloadEvent, TestEvent,
+    ApplicationUpdateEvent, DownloadEvent, HealthCheckEvent, TestEvent,
     VolumeAddEvent, format_application_update_notification,
-    format_download_notification,
+    format_download_notification, format_health_check_notification,
     format_test_notification, format_volume_add_notification)
 
 
@@ -40,6 +40,16 @@ class TestFormatters(unittest.TestCase):
         self.assertEqual(title, 'Volume Added')
         self.assertIn('Spider-Man', body)
         self.assertIn('Marvel', body)
+
+    def test_format_health_check_includes_level(self):
+        ev = HealthCheckEvent(
+            level='warning', message='Invalid API key',
+            check_type='ComicVineApiKey'
+        )
+        title, body = format_health_check_notification(ev)
+        self.assertIn('warning', title.lower())
+        self.assertIn('ComicVineApiKey', body)
+        self.assertIn('Invalid API key', body)
 
     def test_format_application_update_includes_versions(self):
         ev = ApplicationUpdateEvent(

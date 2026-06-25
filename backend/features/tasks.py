@@ -490,6 +490,61 @@ class SearchAll(Task):
         return downloads
 
 
+class HealthCheck(Task):
+    """Run health checks and dispatch notifications for any issues found."""
+
+    stop = False
+    message = ''
+    action = 'health_check'
+    display_title = 'Health Check'
+    description = (
+        'Runs library health checks (missing root folders, invalid API keys,'
+        ' etc.) and dispatches any configured notifications for issues found.'
+    )
+    category = 'maintenance'
+    priority = 3
+
+    @property
+    def volume_id(self) -> None:
+        return None
+
+    @property
+    def issue_id(self) -> None:
+        return None
+
+    def __init__(self) -> None:
+        return
+
+    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+        from backend.features.health_checks import run_health_checks
+        from backend.features.notifications import NotificationService
+
+        self.message = 'Running health checks'
+        ws = WebSocket()
+        ws.emit(TaskStatusEvent(self.message))
+
+        issues = run_health_checks()
+
+        if issues:
+            ns = NotificationService()
+            for issue in issues:
+                try:
+                    ns.notify_health_check(issue)
+                except Exception:
+                    LOGGER.exception(
+                        'Failed to dispatch health check notification'
+                    )
+
+        count = len(issues)
+        self.message = (
+            f'Health check complete: {count} issue(s) found'
+            if count else 'Health check complete: no issues found'
+        )
+        ws.emit(TaskStatusEvent(self.message))
+
+        return []
+
+
 # =====================
 # Task handling
 # =====================

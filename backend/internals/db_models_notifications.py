@@ -22,7 +22,7 @@ class NotificationConnection:
         cursor = get_db()
         cursor.execute("""
             SELECT id, name, provider_type, settings,
-                   on_download, on_volume_add,
+                   on_download, on_health_check, on_volume_add,
                    on_application_update, enabled
             FROM notifications
             ORDER BY id;
@@ -50,7 +50,7 @@ class NotificationConnection:
         cursor = get_db()
         cursor.execute("""
             SELECT id, name, provider_type, settings,
-                   on_download, on_volume_add,
+                   on_download, on_health_check, on_volume_add,
                    on_application_update, enabled
             FROM notifications
             WHERE id = ?
@@ -79,11 +79,11 @@ class NotificationConnection:
             row_id = cursor.execute("""
                 INSERT INTO notifications(
                     name, provider_type, settings,
-                    on_download, on_volume_add,
+                    on_download, on_health_check, on_volume_add,
                     on_application_update, enabled
                 ) VALUES (
                     :name, :provider_type, :settings,
-                    :on_download, :on_volume_add,
+                    :on_download, :on_health_check, :on_volume_add,
                     :on_application_update, :enabled
                 );
             """, {
@@ -91,6 +91,7 @@ class NotificationConnection:
                 'provider_type': data['provider_type'],
                 'settings': json.dumps(data.get('settings', {})),
                 'on_download': int(data.get('on_download', True)),
+                'on_health_check': int(data.get('on_health_check', True)),
                 'on_volume_add': int(data.get('on_volume_add', True)),
                 'on_application_update': int(
                     data.get('on_application_update', True)
@@ -119,6 +120,7 @@ class NotificationConnection:
                     provider_type = :provider_type,
                     settings = :settings,
                     on_download = :on_download,
+                    on_health_check = :on_health_check,
                     on_volume_add = :on_volume_add,
                     on_application_update = :on_application_update,
                     enabled = :enabled
@@ -129,6 +131,7 @@ class NotificationConnection:
                 'provider_type': data['provider_type'],
                 'settings': json.dumps(data.get('settings', {})),
                 'on_download': int(data.get('on_download', True)),
+                'on_health_check': int(data.get('on_health_check', True)),
                 'on_volume_add': int(data.get('on_volume_add', True)),
                 'on_application_update': int(
                     data.get('on_application_update', True)
@@ -170,7 +173,7 @@ class NotificationConnection:
         cursor = get_db()
         cursor.execute(f"""
             SELECT id, name, provider_type, settings,
-                   on_download, on_volume_add,
+                   on_download, on_health_check, on_volume_add,
                    on_application_update, enabled
             FROM notifications
             WHERE enabled = 1 AND {event_flag} = 1

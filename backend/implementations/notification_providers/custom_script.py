@@ -13,7 +13,7 @@ from typing import Dict
 
 from backend.base.logging import LOGGER
 from backend.features.notifications import (ApplicationUpdateEvent,
-                                            DownloadEvent,
+                                            DownloadEvent, HealthCheckEvent,
                                             NotificationProvider, TestEvent,
                                             VolumeAddEvent,
                                             get_application_url,
@@ -102,6 +102,17 @@ class CustomScriptProvider(NotificationProvider):
             'kapowarr_volume_comicvine_id': str(event.volume_comicvine_id),
             'kapowarr_volume_path': event.volume_path,
             'kapowarr_volume_publisher': event.publisher or '',
+        }
+        self._run_script(settings['path'], env)
+
+    def on_health_check(
+        self, event: HealthCheckEvent, settings: Dict
+    ) -> None:
+        env = {
+            **self._common_env('HealthIssue'),
+            'kapowarr_health_issue_level': event.level,
+            'kapowarr_health_issue_message': event.message,
+            'kapowarr_health_issue_type': event.check_type,
         }
         self._run_script(settings['path'], env)
 

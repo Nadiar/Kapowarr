@@ -1221,3 +1221,15 @@ def _migrate_add_notifications():
         );
     """)
     return
+
+
+@DatabaseMigrationHandler.register_handler(48)
+def _migrate_add_health_check_notification():
+    get_db().executescript("""
+        ALTER TABLE notifications
+            ADD COLUMN on_health_check BOOL NOT NULL DEFAULT 1;
+
+        INSERT OR IGNORE INTO task_intervals(task_name, interval, next_run)
+        VALUES ('health_check', 86400, 0);
+    """)
+    return

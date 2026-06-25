@@ -13,7 +13,7 @@ import requests
 
 from backend.base.logging import LOGGER
 from backend.features.notifications import (ApplicationUpdateEvent,
-                                            DownloadEvent,
+                                            DownloadEvent, HealthCheckEvent,
                                             NotificationProvider, TestEvent,
                                             VolumeAddEvent,
                                             get_application_url,
@@ -143,6 +143,17 @@ class WebhookProvider(NotificationProvider):
                 'path': event.volume_path,
                 'publisher': event.publisher,
             },
+        }
+        self._send(settings, payload)
+
+    def on_health_check(
+        self, event: HealthCheckEvent, settings: Dict
+    ) -> None:
+        payload = {
+            **self._common_base('HealthIssue'),
+            'level': event.level,
+            'message': event.message,
+            'type': event.check_type,
         }
         self._send(settings, payload)
 

@@ -55,6 +55,13 @@ class VolumeAddEvent:
 
 
 @dataclass
+class HealthCheckEvent:
+    level: str          # 'warning' or 'error'
+    message: str
+    check_type: str     # e.g. 'ComicVineApiKey', 'RootFolder'
+
+
+@dataclass
 class ApplicationUpdateEvent:
     previous_version: str
     new_version: str
@@ -94,6 +101,15 @@ def format_volume_add_notification(
     return title, body
 
 
+def format_health_check_notification(
+    event: HealthCheckEvent
+) -> Tuple[str, str]:
+    """Return (title, body) for a health-check event."""
+    title = f'Health Issue [{event.level}]'
+    body = f'{event.check_type}: {event.message}'
+    return title, body
+
+
 def format_application_update_notification(
     event: ApplicationUpdateEvent
 ) -> Tuple[str, str]:
@@ -126,6 +142,11 @@ class NotificationProvider(ABC):
     @abstractmethod
     def on_volume_add(
         self, event: VolumeAddEvent, settings: Dict
+    ) -> None: ...
+
+    @abstractmethod
+    def on_health_check(
+        self, event: HealthCheckEvent, settings: Dict
     ) -> None: ...
 
     @abstractmethod
@@ -176,6 +197,12 @@ class AppriseNotificationProvider(NotificationProvider, ABC):
         self, event: VolumeAddEvent, settings: Dict
     ) -> None:
         title, body = format_volume_add_notification(event)
+        self._send(title, body, settings)
+
+    def on_health_check(
+        self, event: HealthCheckEvent, settings: Dict
+    ) -> None:
+        title, body = format_health_check_notification(event)
         self._send(title, body, settings)
 
     def on_application_update(
@@ -324,6 +351,10 @@ class NotificationService(metaclass=Singleton):
     def notify_volume_add(self, event: VolumeAddEvent) -> None:
         """Dispatch a volume-added event asynchronously."""
         self._dispatch_async('on_volume_add', event, 'on_volume_add')
+
+    def notify_health_check(self, event: HealthCheckEvent) -> None:
+        """Dispatch a health-check event asynchronously."""
+        self._dispatch_async('on_health_check', event, 'on_health_check')
 
     def notify_application_update(
         self, event: ApplicationUpdateEvent

@@ -209,6 +209,7 @@ function openAddWindow(providerType) {
 	// Default trigger states
 	document.getElementById('edit-on-download').checked = true;
 	document.getElementById('edit-on-volume-add').checked = true;
+	document.getElementById('edit-on-health-check').checked = false;
 	document.getElementById('edit-on-app-update').checked = true;
 
 	// Build provider-specific fields
@@ -254,6 +255,7 @@ function openEditWindow(id) {
 			buildSettingsFields('edit-settings-fields', conn.provider_type, conn.settings);
 
 			document.getElementById('edit-on-download').checked = !!conn.on_download;
+			document.getElementById('edit-on-health-check').checked = !!conn.on_health_check;
 			document.getElementById('edit-on-volume-add').checked = !!conn.on_volume_add;
 			document.getElementById('edit-on-app-update').checked = !!conn.on_application_update;
 
@@ -275,6 +277,7 @@ document.getElementById('edit-notification-form').onsubmit = function(e) {
 		provider_type: editingProviderType,
 		settings: collectSettings('edit-settings-fields'),
 		on_download: document.getElementById('edit-on-download').checked,
+		on_health_check: document.getElementById('edit-on-health-check').checked,
 		on_volume_add: document.getElementById('edit-on-volume-add').checked,
 		on_application_update: document.getElementById('edit-on-app-update').checked,
 		enabled: true

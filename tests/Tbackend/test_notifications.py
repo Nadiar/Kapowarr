@@ -12,7 +12,7 @@ from typing import Dict, List
 from unittest.mock import MagicMock, call, patch
 
 from backend.features.notifications import (ApplicationUpdateEvent,
-                                            DownloadEvent,
+                                            DownloadEvent, HealthCheckEvent,
                                             NotificationService, TestEvent,
                                             VolumeAddEvent, provider_registry)
 from backend.implementations.notification_providers.custom_script import \
@@ -50,6 +50,14 @@ def make_volume_add_event():
         volume_comicvine_id=99999,
         volume_path='/comics/spiderman',
         publisher='Marvel'
+    )
+
+
+def make_health_event():
+    return HealthCheckEvent(
+        level='error',
+        message='ComicVine API key is not set or invalid.',
+        check_type='ComicVineApiKey'
     )
 
 
@@ -111,6 +119,21 @@ class TestCustomScriptEnvVars(unittest.TestCase):
         self.assertEqual(env.get('kapowarr_volume_title'), 'Spider-Man')
         self.assertEqual(env.get('kapowarr_volume_year'), '1963')
         self.assertEqual(env.get('kapowarr_volume_publisher'), 'Marvel')
+
+    def test_custom_script_builds_env_vars_on_health_check(self):
+        provider = CustomScriptProvider()
+        event = make_health_event()
+        env = self._run_with_capture(provider, 'on_health_check', event)
+
+        self.assertEqual(env.get('kapowarr_eventtype'), 'HealthIssue')
+        self.assertEqual(env.get('kapowarr_health_issue_level'), 'error')
+        self.assertEqual(
+            env.get('kapowarr_health_issue_message'),
+            'ComicVine API key is not set or invalid.'
+        )
+        self.assertEqual(
+            env.get('kapowarr_health_issue_type'),
+            'ComicVineApiKey')
 
     def test_custom_script_timeout_logs_warning(self):
         import subprocess
@@ -307,6 +330,79 @@ class TestNotificationServiceDispatch(unittest.TestCase):
                 )
 
         self.assertEqual(called, ['/script2.sh'])
+
+
+# ---------------------------------------------------------------------------
+# Health check tests
+# ---------------------------------------------------------------------------
+
+class TestHealthCheckRootFolder(unittest.TestCase):
+    """
+    root_folders.py imports settings.py which imports `grp` (Linux-only).
+    To keep health-check tests runnable on Windows we inject a fake module
+    into sys.modules instead of patching the real one.
+    """
+
+    def _fake_rf_module(self, mock_class):
+        """Return a fake backend.implementations.root_folders module."""
+        m = MagicMock()
+        m.RootFolders = mock_class
+        return m
+
+    def test_detects_missing_root_folder(self):
+        from backend.features.health_checks import _check_root_folders
+
+        mock_rf = MagicMock()
+        mock_rf.return_value.get_folder_list.return_value = [
+                                                             '/nonexistent/path']
+
+        with patch.dict('sys.modules', {
+            'backend.implementations.root_folders': self._fake_rf_module(mock_rf)
+        }):
+            with patch('os.path.isdir', return_value=False):
+                issues = _check_root_folders()
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].check_type, 'RootFolder')
+        self.assertEqual(issues[0].level, 'error')
+        self.assertIn('does not exist', issues[0].message)
+
+    def test_healthy_root_folder_returns_no_issues(self):
+        from backend.features.health_checks import _check_root_folders
+
+        mock_rf = MagicMock()
+        mock_rf.return_value.get_folder_list.return_value = ['/comics']
+
+        with patch.dict('sys.modules', {
+            'backend.implementations.root_folders': self._fake_rf_module(mock_rf)
+        }):
+            with patch('os.path.isdir', return_value=True):
+                with patch('os.access', return_value=True):
+                    issues = _check_root_folders()
+
+        self.assertEqual(issues, [])
+
+    def test_detects_low_disk_space(self):
+        from backend.features.health_checks import _check_disk_space
+
+        mock_rf = MagicMock()
+        mock_rf.return_value.get_folder_list.return_value = ['/comics']
+
+        mock_usage = MagicMock()
+        mock_usage.free = 500_000_000  # 500 MB — below 1 GB threshold
+
+        with patch.dict('sys.modules', {
+            'backend.implementations.root_folders': self._fake_rf_module(mock_rf)
+        }):
+            with patch('os.path.isdir', return_value=True):
+                with patch('shutil.disk_usage', return_value=mock_usage):
+                    with patch('os.stat') as mock_stat:
+                        mock_stat.return_value.st_dev = 1
+                        issues = _check_disk_space()
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].check_type, 'DiskSpace')
+        self.assertEqual(issues[0].level, 'warning')
 
 
 # ---------------------------------------------------------------------------
