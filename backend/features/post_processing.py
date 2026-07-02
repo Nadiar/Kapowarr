@@ -7,7 +7,8 @@ The post-download processing (a.k.a. post-processing or PP) of downloads.
 from __future__ import annotations
 
 from os.path import basename, exists, isfile, join, splitext
-from time import time
+from sqlite3 import OperationalError
+from time import sleep, time
 from typing import TYPE_CHECKING, Dict
 
 from backend.base.definitions import (BlocklistReason,
@@ -41,10 +42,28 @@ def reset_file_link(download: TorrentDownload) -> None:
 # region Database
 def remove_from_queue(download: Download) -> None:
     "Delete the download from the queue in the database"
-    get_db().execute(
-        "DELETE FROM download_queue WHERE id = ?",
-        (download.id,)
-    ).connection.commit()
+    retries = 5
+    for attempt in range(1, retries + 1):
+        try:
+            get_db().execute(
+                "DELETE FROM download_queue WHERE id = ?",
+                (download.id,)
+            ).connection.commit()
+            return
+
+        except OperationalError as exc:
+            if 'database is locked' not in str(exc).lower() or attempt == retries:
+                raise
+
+            LOGGER.warning(
+                'Database locked while removing download %s from queue '
+                '(attempt %s/%s); retrying',
+                download.id,
+                attempt,
+                retries
+            )
+            sleep(min(0.2 * attempt, 1.0))
+
     return
 
 
@@ -349,7 +368,6 @@ def notify_download(download: Download) -> None:
 # region Post-Processors
 class PostProcessor:
     actions_success = [
-        remove_from_queue,
         add_to_history,
         move_to_dest,
         rename_with_proper_extension,

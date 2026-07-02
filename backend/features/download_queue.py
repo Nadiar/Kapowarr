@@ -25,7 +25,8 @@ from backend.base.helpers import CommaList, Singleton, get_subclasses
 from backend.base.logging import LOGGER
 from backend.features.post_processing import (PostProcessor,
                                               PostProcessorTorrentsComplete,
-                                              PostProcessorTorrentsCopy)
+                                              PostProcessorTorrentsCopy,
+                                              remove_from_queue)
 from backend.implementations.blocklist import add_to_blocklist
 from backend.implementations.download_clients import (BaseDirectDownload,
                                                       MegaDownload,
@@ -80,6 +81,13 @@ class DownloadHandler(metaclass=Singleton):
             if e.source == DownloadSource.MEGA:
                 self._remove_mega(exclude_id=download.id)
 
+        except Exception:
+            LOGGER.exception(
+                'Uncaught exception while downloading %s',
+                download.id
+            )
+            download.stop(DownloadState.FAILED_STATE)
+
         ws.emit(status_event)
         if download.state == DownloadState.SHUTDOWN_STATE:
             PostProcessor.shutdown(download)
@@ -98,10 +106,25 @@ class DownloadHandler(metaclass=Singleton):
             # While this download is post-processing, start the next one.
             self._process_queue()
 
-            PostProcessor.success(download)
+            try:
+                PostProcessor.success(download)
+            except Exception:
+                LOGGER.exception(
+                    'Uncaught exception while post-processing download %s',
+                    download.id
+                )
 
-        self.queue.remove(download)
-        ws.emit(RemovedFromQueueEvent(download))
+        try:
+            remove_from_queue(download)
+        except Exception:
+            LOGGER.exception(
+                'Failed to remove download %s from queue table during cleanup',
+                download.id
+            )
+
+        if download in self.queue:
+            self.queue.remove(download)
+            ws.emit(RemovedFromQueueEvent(download))
 
         self._process_queue()
         return
