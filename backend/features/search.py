@@ -202,7 +202,7 @@ def manual_search(
         calculated_issue_number = issue_data.calculated_issue_number
 
     LOGGER.info(
-        'Starting manual search: %s (%d) %s',
+        'Starting manual search: %s (%s) %s',
         volume_data.title, volume_data.year,
         f'#{issue_number}' if issue_number else ''
     )
