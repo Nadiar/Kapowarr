@@ -783,6 +783,28 @@ class RefreshCalendar(Task):
         self.message = 'Calendar cache refreshed'
         ws.emit(TaskStatusEvent(self.message))
 
+        # Trigger a metadata refresh if none has run in the past 24 hours.
+        # RefreshCalendar runs daily and is the natural hook for keeping
+        # volume metadata current alongside the release calendar.
+        last_metadata = get_db().execute(
+            "SELECT MAX(run_at) FROM task_history WHERE task_name = 'refresh_metadata';"
+        ).fetchone()[0]
+
+        if last_metadata is None or (time() - last_metadata) > 86400:
+            th = TaskHandler()
+            already_queued = any(
+                isinstance(e['task'], RefreshMetadata)
+                for e in th.queue
+            )
+            if not already_queued:
+                LOGGER.info(
+                    'RefreshCalendar: triggering RefreshMetadata '
+                    '(last run %s)',
+                    'never' if last_metadata is None
+                    else f'{int((time() - last_metadata) / 3600)}h ago'
+                )
+                th.add(RefreshMetadata())
+
         return []
 
 
