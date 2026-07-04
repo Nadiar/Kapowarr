@@ -808,18 +808,220 @@ class RefreshCalendar(Task):
         return []
 
 
-class SearchRecent(Task):
-    """Search for missing issues released in the past 2 weeks or releasing
-    in the next week."""
+def _run_search_recent(
+    task: Task,
+    search_start: str,
+    search_end: str,
+    *,
+    clear_days_back: int = 0,
+    run_packs: bool = False,
+) -> List[Tuple[str, int, Union[int, None]]]:
+    """Shared search logic for windowed SearchRecent tasks.
+
+    Args:
+        task: Calling Task instance — provides stop flag and message field.
+        search_start: ISO date for the start of the search window.
+        search_end: ISO date for the end of the search window.
+        clear_days_back: If > 0, clear auto-blocklist entries for all
+            in-library missing issues in the past N days before searching,
+            so the next Fresh run can retry previously-failed links.
+        run_packs: Whether to run Phase 2 GetComics weekly-pack scraping.
+    """
+    from backend.features.calendar import get_calendar
+
+    ws = WebSocket()
+
+    # Blocklist clearing (Week task only). Fetches a wider range than the
+    # search window so it also un-blocks issues in the Fresh window, causing
+    # the next Fresh run to retry them.
+    if clear_days_back:
+        today_iso = date.today().isoformat()
+        clear_start = (
+            date.today() - timedelta(days=clear_days_back)
+        ).isoformat()
+        clear_issues = get_calendar(clear_start, today_iso)
+        in_scope_ids = sorted({
+            i['issue_id_local']
+            for i in clear_issues
+            if i.get('issue_id_local')
+            and i.get('in_library')
+            and not i.get('has_files')
+        })
+        if in_scope_ids:
+            placeholders = ','.join('?' * len(in_scope_ids))
+            with get_db() as cursor:
+                cursor.execute(
+                    "DELETE FROM blocklist "
+                    f"WHERE issue_id IN ({placeholders}) "
+                    "AND reason != ?",
+                    (*in_scope_ids, BlocklistReasonID.ADDED_BY_USER.value)
+                )
+            LOGGER.debug(
+                '%s: cleared stale blocklist for %d issue(s) '
+                'across the past %d days',
+                task.display_title, len(in_scope_ids), clear_days_back
+            )
+
+    calendar_issues = get_calendar(search_start, search_end)
+    downloads: List[Tuple[str, int, Union[int, None]]] = []
+    searched_volumes: set = set()
+
+    for issue in calendar_issues:
+        if task.stop:
+            break
+        if not issue['in_library'] or not issue['volume_monitored']:
+            continue
+
+        vol_id = issue['volume_id_local']
+        if vol_id is None:
+            continue
+
+        iss_id = issue['issue_id_local']
+
+        if iss_id is not None:
+            if not issue['monitored'] or issue['has_files']:
+                continue
+            task.message = (
+                f'Searching for {issue["volume_name"]} '
+                f'#{issue.get("issue_number", "?")}'
+            )
+            ws.emit(TaskStatusEvent(task.message))
+            results = auto_search(vol_id, iss_id)
+            if results:
+                downloads += [
+                    (result['link'], vol_id, iss_id)
+                    for result in results
+                ]
+        else:
+            # Issue not yet in local DB — refresh the volume first so the
+            # issue gets added, then search for the specific issue only.
+            if vol_id in searched_volumes:
+                continue
+            searched_volumes.add(vol_id)
+            task.message = (
+                f'Syncing {issue["volume_name"]} '
+                f'(new issue #{issue.get("issue_number", "?")})'
+            )
+            ws.emit(TaskStatusEvent(task.message))
+            try:
+                from backend.implementations.volumes import refresh_and_scan
+                refresh_and_scan(vol_id)
+            except Exception:
+                LOGGER.warning(
+                    'Failed to refresh volume %d during %s',
+                    vol_id, task.display_title
+                )
+                continue
+
+            cv_issue_id = issue.get('comicvine_id')
+            local_iss_id = None
+            if cv_issue_id:
+                row = get_db().execute(
+                    "SELECT id FROM issues WHERE comicvine_id = ?",
+                    (cv_issue_id,)
+                ).fetchone()
+                if row:
+                    local_iss_id = row[0]
+
+            task.message = (
+                f'Searching for {issue["volume_name"]} '
+                f'#{issue.get("issue_number", "?")}'
+            )
+            ws.emit(TaskStatusEvent(task.message))
+            results = auto_search(vol_id, local_iss_id)
+            if results:
+                downloads += [
+                    (result['link'], vol_id, local_iss_id)
+                    for result in results
+                ]
+
+    # Phase 2: GetComics weekly packs (Fresh window only — packs are current).
+    if run_packs and not task.stop:
+        try:
+            from asyncio import run as _async_run
+
+            from backend.base.helpers import AsyncSession
+            from backend.implementations.getcomics import scrape_weekly_packs
+            from backend.implementations.matching import match_title
+
+            task.message = 'Scanning GetComics weekly packs'
+            ws.emit(TaskStatusEvent(task.message))
+
+            async def _fetch_packs():
+                async with AsyncSession() as session:
+                    return await scrape_weekly_packs(session, pack_count=3)
+
+            pack_articles = _async_run(_fetch_packs())
+
+            if pack_articles:
+                open_rows = get_db().execute(
+                    """
+                    SELECT v.id AS volume_id, v.title,
+                           i.id AS issue_id,
+                           i.calculated_issue_number
+                    FROM volumes v
+                    INNER JOIN issues i ON i.volume_id = v.id
+                    LEFT JOIN issues_files if_ ON if_.issue_id = i.id
+                    WHERE v.monitored = 1
+                      AND i.monitored = 1
+                      AND if_.issue_id IS NULL
+                    """
+                ).fetchalldict()
+
+                vol_data: Dict[int, tuple] = {}
+                for row in open_rows:
+                    vid = row['volume_id']
+                    if vid not in vol_data:
+                        vol_data[vid] = (row['title'], {})
+                    vol_data[vid][1][
+                        row['calculated_issue_number']
+                    ] = row['issue_id']
+
+                queued_links = {d[0] for d in downloads}
+
+                for article in pack_articles:
+                    if task.stop:
+                        break
+                    art_link = article.get('link', '')
+                    art_series = (article.get('series') or '').strip()
+                    art_issue_num = article.get('issue_number')
+                    if not art_link or not art_series:
+                        continue
+                    if art_link in queued_links:
+                        continue
+                    for vid, (vol_title, issue_map) in vol_data.items():
+                        if match_title(
+                            vol_title, art_series, allow_contains=True
+                        ):
+                            iss_id = issue_map.get(art_issue_num)
+                            if iss_id is not None:
+                                downloads.append((art_link, vid, iss_id))
+                                queued_links.add(art_link)
+                                break
+
+        except Exception:
+            LOGGER.warning(
+                '%s Phase 2 (weekly packs) failed',
+                task.display_title,
+                exc_info=True
+            )
+
+    return downloads
+
+
+class SearchRecentFresh(Task):
+    """Search issues in the ±6-day/+7-day window. Runs hourly, no blocklist
+    clearing — stays fast. Blocklist is reset by SearchRecentWeek (daily)
+    so the run after that will be longer as previously-blocked issues retry."""
 
     stop = False
     message = ''
-    action = 'search_recent'
-    display_title = 'Search Recent'
+    action = 'search_recent_fresh'
+    display_title = 'Search Recent (Fresh)'
     description = (
-        'Searches for missing issues released in the past 2 weeks or'
-        ' releasing in the next week, using ComicVine store dates and'
-        ' GetComics weekly packs.'
+        'Searches for missing issues released in the past 6 days or due in'
+        ' the next 7 days. Runs hourly with no blocklist clearing to stay'
+        ' fast. Includes GetComics weekly-pack scraping.'
     )
     category = 'download'
     priority = 3
@@ -837,206 +1039,95 @@ class SearchRecent(Task):
 
     def run(self) -> List[Tuple[str, int, Union[int, None]]]:
         today = date.today()
-        window_start = (today - timedelta(days=14)).isoformat()
-        window_end = (today + timedelta(days=7)).isoformat()
+        self.message = 'Searching for recent releases (fresh)'
+        WebSocket().emit(TaskStatusEvent(self.message))
+        return _run_search_recent(
+            self,
+            search_start=(today - timedelta(days=6)).isoformat(),
+            search_end=(today + timedelta(days=7)).isoformat(),
+            clear_days_back=0,
+            run_packs=True,
+        )
 
-        # Use calendar data (keyed by store_date, the actual shelf date) so we
-        # find genuinely recent releases rather than relying on the local `date`
-        # column which may hold cover_date (printed 2-3 months after release).
-        # get_calendar() serves from the in-memory cache when available, so
-        # this is free if the calendar page was visited recently.
-        from backend.features.calendar import get_calendar
-        calendar_issues = get_calendar(window_start, window_end)
 
-        # Clear stale automatic blocklist reasons for in-scope issues so
-        # SearchRecent can retry links that may now be available.
-        in_scope_issue_ids = sorted({
-            i['issue_id_local']
-            for i in calendar_issues
-            if i.get('issue_id_local')
-            and i.get('in_library')
-            and not i.get('has_files')
-        })
-        if in_scope_issue_ids:
-            placeholders = ','.join('?' * len(in_scope_issue_ids))
-            with get_db() as cursor:
-                cursor.execute(
-                    "DELETE FROM blocklist "
-                    f"WHERE issue_id IN ({placeholders}) "
-                    "AND reason != ?",
-                    (*in_scope_issue_ids,
-                     BlocklistReasonID.ADDED_BY_USER.value)
-                )
-            LOGGER.debug(
-                'SearchRecent: cleared stale blocklist for %d in-scope issues',
-                len(in_scope_issue_ids)
-            )
+class SearchRecentWeek(Task):
+    """Search 7–13-day-old issues daily. Also clears the auto-blocklist for
+    the full 0–13-day window, so the next Fresh run retries blocked issues."""
 
-        downloads: List[Tuple[str, int, Union[int, None]]] = []
-        ws = WebSocket()
-        # Track volumes already searched at volume level so we don't
-        # repeat for every issue in the same volume.
-        searched_volumes: set = set()
+    stop = False
+    message = ''
+    action = 'search_recent_week'
+    display_title = 'Search Recent (Week-old)'
+    description = (
+        'Searches for missing issues released 7–13 days ago. Also clears the'
+        ' auto-blocklist for the past 13 days so the next Fresh run retries'
+        ' any previously-failed links.'
+    )
+    category = 'download'
+    priority = 3
 
-        for issue in calendar_issues:
-            if self.stop:
-                break
-            if not issue['in_library'] or not issue['volume_monitored']:
-                continue
+    @property
+    def volume_id(self) -> None:
+        return None
 
-            vol_id = issue['volume_id_local']
-            if vol_id is None:
-                continue
+    @property
+    def issue_id(self) -> None:
+        return None
 
-            iss_id = issue['issue_id_local']
+    def __init__(self) -> None:
+        return
 
-            if iss_id is not None:
-                # Issue exists in local DB — check it individually
-                if not issue['monitored'] or issue['has_files']:
-                    continue
-                self.message = (
-                    f'Searching for {issue["volume_name"]} '
-                    f'#{issue.get("issue_number", "?")}'
-                )
-                ws.emit(TaskStatusEvent(self.message))
-                results = auto_search(vol_id, iss_id)
-                if results:
-                    downloads += [
-                        (result['link'], vol_id, iss_id)
-                        for result in results
-                    ]
-            else:
-                # Issue not yet in local DB (CV knows about it but
-                # Kapowarr hasn't synced). Refresh the volume first
-                # so the issue gets added locally, then search by
-                # the specific issue — not the whole volume.
-                if vol_id in searched_volumes:
-                    continue
-                searched_volumes.add(vol_id)
-                self.message = (
-                    f'Syncing {issue["volume_name"]} '
-                    f'(new issue #{issue.get("issue_number", "?")})'
-                )
-                ws.emit(TaskStatusEvent(self.message))
-                try:
-                    from backend.implementations.volumes import \
-                        refresh_and_scan
-                    refresh_and_scan(vol_id)
-                except Exception:
-                    LOGGER.warning(
-                        'Failed to refresh volume %d '
-                        'during SearchRecent',
-                        vol_id
-                    )
-                    continue
+    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+        today = date.today()
+        self.message = 'Searching for week-old releases'
+        WebSocket().emit(TaskStatusEvent(self.message))
+        return _run_search_recent(
+            self,
+            search_start=(today - timedelta(days=13)).isoformat(),
+            search_end=(today - timedelta(days=7)).isoformat(),
+            clear_days_back=13,
+            run_packs=False,
+        )
 
-                # After refresh, look up the now-synced issue by
-                # its ComicVine ID so we search only this issue.
-                cv_issue_id = issue.get('comicvine_id')
-                local_iss_id = None
-                if cv_issue_id:
-                    row = get_db().execute(
-                        "SELECT id FROM issues "
-                        "WHERE comicvine_id = ?",
-                        (cv_issue_id,)
-                    ).fetchone()
-                    if row:
-                        local_iss_id = row[0]
 
-                self.message = (
-                    f'Searching for {issue["volume_name"]} '
-                    f'#{issue.get("issue_number", "?")}'
-                )
-                ws.emit(TaskStatusEvent(self.message))
-                results = auto_search(vol_id, local_iss_id)
-                if results:
-                    downloads += [
-                        (result['link'], vol_id, local_iss_id)
-                        for result in results
-                    ]
+class SearchRecentStale(Task):
+    """Search 14–20-day-old issues every 72 hours. No blocklist clearing —
+    links that old have already been retried enough by the Week task."""
 
-        # Phase 2: scan GetComics weekly packs for available issues.
-        # This catches issues that have been released this week but haven't yet
-        # been indexed by regular CV-based searches.
-        if not self.stop:
-            try:
-                from asyncio import run as _async_run
+    stop = False
+    message = ''
+    action = 'search_recent_stale'
+    display_title = 'Search Recent (Stale)'
+    description = (
+        'Searches for missing issues released 14–20 days ago, every 72 hours.'
+        ' No blocklist clearing — issues that old have already had plenty of'
+        ' retry opportunities from the Week task.'
+    )
+    category = 'download'
+    priority = 3
 
-                from backend.base.helpers import AsyncSession
-                from backend.implementations.getcomics import \
-                    scrape_weekly_packs
-                from backend.implementations.matching import match_title
+    @property
+    def volume_id(self) -> None:
+        return None
 
-                self.message = 'Scanning GetComics weekly packs'
-                ws.emit(TaskStatusEvent(self.message))
+    @property
+    def issue_id(self) -> None:
+        return None
 
-                async def _fetch_packs():
-                    async with AsyncSession() as session:
-                        return await scrape_weekly_packs(
-                            session, pack_count=3)
+    def __init__(self) -> None:
+        return
 
-                pack_articles = _async_run(_fetch_packs())
-
-                if pack_articles:
-                    # Build lookup for monitored issues that have no files.
-                    open_rows = get_db().execute(
-                        """
-                        SELECT v.id AS volume_id, v.title,
-                               i.id AS issue_id,
-                               i.calculated_issue_number
-                        FROM volumes v
-                        INNER JOIN issues i ON i.volume_id = v.id
-                        LEFT JOIN issues_files if_
-                            ON if_.issue_id = i.id
-                        WHERE v.monitored = 1
-                          AND i.monitored = 1
-                          AND if_.issue_id IS NULL
-                        """
-                    ).fetchalldict()
-
-                    # Group by volume: {volume_id: (title, {iss_num: iss_id})}
-                    vol_data = {}
-                    for row in open_rows:
-                        vid = row['volume_id']
-                        if vid not in vol_data:
-                            vol_data[vid] = (row['title'], {})
-                        iss_num = row['calculated_issue_number']
-                        vol_data[vid][1][iss_num] = row['issue_id']
-
-                    # Set of links already queued (avoid duplicates)
-                    queued_links = {d[0] for d in downloads}
-
-                    for article in pack_articles:
-                        if self.stop:
-                            break
-                        art_link = article.get('link', '')
-                        art_series = (article.get('series') or '').strip()
-                        art_issue_num = article.get('issue_number')
-                        if not art_link or not art_series:
-                            continue
-                        if art_link in queued_links:
-                            continue
-                        for vid, (vol_title, issue_map) in (
-                            vol_data.items()
-                        ):
-                            if match_title(
-                                vol_title, art_series,
-                                allow_contains=True
-                            ):
-                                iss_id = issue_map.get(art_issue_num)
-                                if iss_id is not None:
-                                    downloads.append(
-                                        (art_link, vid, iss_id))
-                                    queued_links.add(art_link)
-                                    break
-
-            except Exception:
-                LOGGER.warning(
-                    'SearchRecent Phase 2 (weekly packs) failed',
-                    exc_info=True
-                )
-
-        return downloads
+    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+        today = date.today()
+        self.message = 'Searching for stale releases'
+        WebSocket().emit(TaskStatusEvent(self.message))
+        return _run_search_recent(
+            self,
+            search_start=(today - timedelta(days=20)).isoformat(),
+            search_end=(today - timedelta(days=14)).isoformat(),
+            clear_days_back=0,
+            run_packs=False,
+        )
 
 
 class HealthCheck(Task):
@@ -1112,7 +1203,9 @@ INTERVAL_TASK_DEFAULTS: Dict[str, int] = {
     'special_version_refresh': 86400,
     'search_all': 604800,
     'refresh_calendar': 86400,
-    'search_recent': 86400,
+    'search_recent_fresh': 3600,    # 1 hour — no blocklist clearing, fast
+    'search_recent_week': 86400,    # 24 hours — clears blocklist 0–13 days
+    'search_recent_stale': 259200,  # 72 hours — last-chance for 14–20 day issues
     'health_check': 86400,
 }
 
@@ -1122,11 +1215,13 @@ def ensure_interval_task_rows() -> None:
     cursor = get_db()
     now = round(time())
 
-    removed = cursor.execute(
-        "DELETE FROM task_intervals WHERE task_name = 'update_all';"
-    ).rowcount
-    if removed:
-        LOGGER.info('Removed legacy task interval row: update_all')
+    for legacy in ('update_all', 'search_recent'):
+        removed = cursor.execute(
+            "DELETE FROM task_intervals WHERE task_name = ?;",
+            (legacy,)
+        ).rowcount
+        if removed:
+            LOGGER.info('Removed legacy task interval row: %s', legacy)
 
     cursor.executemany(
         "INSERT OR IGNORE INTO task_intervals (task_name, interval, next_run)"
@@ -1290,8 +1385,9 @@ class TaskHandler(metaclass=Singleton):
             t
             for t in TaskHandler.queue
             if (isinstance(t['task'], (SyncIssues, RefreshMetadata, ScanFiles,
-                                       SpecialVersionRefresh,
-                                       SearchAll, SearchRecent))
+                                       SpecialVersionRefresh, SearchAll,
+                                       SearchRecentFresh, SearchRecentWeek,
+                                       SearchRecentStale))
                 or t['task'].volume_id == volume_id)
         )
 
