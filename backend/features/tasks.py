@@ -767,8 +767,11 @@ class RefreshCalendar(Task):
         ws.emit(TaskStatusEvent(self.message))
 
         # Superset fetch: seeds CVProxy and Kapowarr's in-memory cache
-        # for the full ±30-day window in one request.
-        get_calendar(window_start, window_end, force_refresh=True)
+        # for the full ±30-day window in one request. Capture the result so
+        # we can extract library volumes for the metadata update below.
+        calendar_issues = get_calendar(
+            window_start, window_end, force_refresh=True
+        )
 
         # Week-by-week seeding: populates Kapowarr's per-week cache entries
         # so individual week navigation is instant after this task runs.
@@ -783,27 +786,41 @@ class RefreshCalendar(Task):
         self.message = 'Calendar cache refreshed'
         ws.emit(TaskStatusEvent(self.message))
 
-        # Trigger a metadata refresh if none has run in the past 24 hours.
-        # RefreshCalendar runs daily and is the natural hook for keeping
-        # volume metadata current alongside the release calendar.
-        last_metadata = get_db().execute(
-            "SELECT MAX(run_at) FROM task_history WHERE task_name = 'refresh_metadata';"
-        ).fetchone()[0]
+        # Refresh metadata for every library volume that appears in the
+        # calendar window — these are the volumes most likely to have
+        # updated CV data (new issues, corrected descriptions, new covers).
+        local_vol_ids = {
+            i['volume_id_local']
+            for i in calendar_issues
+            if i.get('volume_id_local') and i.get('in_library')
+        }
 
-        if last_metadata is None or (time() - last_metadata) > 86400:
-            th = TaskHandler()
-            already_queued = any(
-                isinstance(e['task'], RefreshMetadata)
-                for e in th.queue
+        if local_vol_ids:
+            self.message = 'Refreshing metadata for calendar volumes'
+            ws.emit(TaskStatusEvent(self.message))
+            LOGGER.info(
+                'RefreshCalendar: refreshing metadata for %d calendar volumes',
+                len(local_vol_ids)
             )
-            if not already_queued:
-                LOGGER.info(
-                    'RefreshCalendar: triggering RefreshMetadata '
-                    '(last run %s)',
-                    'never' if last_metadata is None
-                    else f'{int((time() - last_metadata) / 3600)}h ago'
+
+            placeholders = ','.join('?' * len(local_vol_ids))
+            rows = get_db().execute(
+                f"SELECT comicvine_id, id, last_cv_fetch "
+                f"FROM volumes WHERE id IN ({placeholders});",
+                tuple(local_vol_ids)
+            ).fetchalldict()
+
+            if rows:
+                cv_to_id_fetch = {
+                    r['comicvine_id']: (r['id'], r['last_cv_fetch'])
+                    for r in rows
+                }
+                cv = ComicVine()
+                volume_datas = run(
+                    cv.fetch_volumes(tuple(cv_to_id_fetch.keys()))
                 )
-                th.add(RefreshMetadata())
+                if volume_datas:
+                    update_volume_metadata(cv_to_id_fetch, volume_datas)
 
         return []
 
