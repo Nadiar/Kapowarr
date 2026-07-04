@@ -831,6 +831,7 @@ def _run_search_recent(
     search_end: str,
     *,
     clear_days_back: int = 0,
+    sync_missing_issues: bool = False,
     run_packs: bool = False,
 ) -> List[Tuple[str, int, Union[int, None]]]:
     """Shared search logic for windowed SearchRecent tasks.
@@ -842,6 +843,10 @@ def _run_search_recent(
         clear_days_back: If > 0, clear auto-blocklist entries for all
             in-library missing issues in the past N days before searching,
             so the next Fresh run can retry previously-failed links.
+        sync_missing_issues: If True, batch-fetch and upsert issues for any
+            library volume that appears in the calendar but has entries with
+            no local issue ID, then re-enrich the calendar before searching.
+            Intended for SearchRecentFresh only.
         run_packs: Whether to run Phase 2 GetComics weekly-pack scraping.
     """
     from backend.features.calendar import get_calendar
@@ -880,6 +885,58 @@ def _run_search_recent(
             )
 
     calendar_issues = get_calendar(search_start, search_end)
+
+    # Pre-pass: for volumes that appear in the calendar but have issues with
+    # no local ID, batch-fetch and upsert their recent issues from CV so the
+    # main loop can search by specific issue rather than refreshing the whole
+    # volume one-at-a-time.
+    if sync_missing_issues:
+        vols_with_gaps = {
+            i['volume_id_local']
+            for i in calendar_issues
+            if i.get('volume_id_local')
+            and i.get('in_library')
+            and i.get('issue_id_local') is None
+        }
+        if vols_with_gaps:
+            placeholders = ','.join('?' * len(vols_with_gaps))
+            vol_rows = get_db().execute(
+                f"SELECT id, comicvine_id, last_cv_fetch FROM volumes "
+                f"WHERE id IN ({placeholders});",
+                tuple(vols_with_gaps)
+            ).fetchalldict()
+            if vol_rows:
+                cv_to_id_fetch = {
+                    r['comicvine_id']: (r['id'], r['last_cv_fetch'])
+                    for r in vol_rows
+                }
+                # 7-day window catches new issues and recent CV edits.
+                since = int(time()) - 7 * 86400
+                try:
+                    issue_datas = run(
+                        ComicVine().fetch_issues_since(
+                            tuple(cv_to_id_fetch.keys()), since
+                        )
+                    )
+                    if issue_datas:
+                        upsert_issues(cv_to_id_fetch, issue_datas)
+                        LOGGER.info(
+                            '%s: upserted issues for %d volume(s) '
+                            'with calendar gaps',
+                            task.display_title, len(vols_with_gaps)
+                        )
+                        # Re-enrich the calendar so issue_id_local now
+                        # reflects the newly-added issues.
+                        calendar_issues = get_calendar(
+                            search_start, search_end
+                        )
+                except Exception:
+                    LOGGER.warning(
+                        '%s: issue upsert pre-pass failed',
+                        task.display_title,
+                        exc_info=True
+                    )
+
     downloads: List[Tuple[str, int, Union[int, None]]] = []
     searched_volumes: set = set()
 
@@ -1063,6 +1120,7 @@ class SearchRecentFresh(Task):
             search_start=(today - timedelta(days=6)).isoformat(),
             search_end=(today + timedelta(days=7)).isoformat(),
             clear_days_back=0,
+            sync_missing_issues=True,
             run_packs=True,
         )
 
