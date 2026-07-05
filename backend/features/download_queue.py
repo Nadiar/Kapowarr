@@ -7,6 +7,8 @@ from os import listdir
 from os.path import basename, join
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Tuple, Type, Union
 
+from requests.exceptions import RetryError
+
 from typing_extensions import assert_never
 
 from backend.base.custom_exceptions import (ClientNotWorking,
@@ -80,6 +82,14 @@ class DownloadHandler(metaclass=Singleton):
             download.stop(DownloadState.FAILED_STATE)
             if e.source == DownloadSource.MEGA:
                 self._remove_mega(exclude_id=download.id)
+
+        except RetryError as e:
+            LOGGER.warning(
+                'Download %s failed after server-side retries (%s) — '
+                'not blocklisted, will retry on next search',
+                download.id, e.__cause__
+            )
+            download.stop(DownloadState.FAILED_STATE)
 
         except Exception:
             LOGGER.exception(
