@@ -11,7 +11,7 @@ from asyncio import run
 from time import time as _time
 from typing import Any, Dict, List
 
-from backend.base.custom_exceptions import InvalidComicVineApiKey
+from backend.base.custom_exceptions import CredentialInvalid
 from backend.base.logging import LOGGER
 from backend.features.calendar import CalendarIssue
 from backend.features.calendar_publishers import (normalize_publisher_name,
@@ -166,7 +166,7 @@ def _fetch_missing_volumes(
     # --- 2. Fetch gaps from CVProxy ---
     try:
         cv = ComicVine()
-    except InvalidComicVineApiKey:
+    except CredentialInvalid:
         LOGGER.warning(
             'No CV API key set; cannot enrich calendar with publishers'
         )
@@ -228,7 +228,7 @@ def fetch_calendar_issues(
     """
     try:
         cv = ComicVine()
-    except InvalidComicVineApiKey:
+    except CredentialInvalid:
         LOGGER.warning('No CV API key set; cannot fetch calendar issues')
         return []
 

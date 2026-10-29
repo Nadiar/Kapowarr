@@ -25,6 +25,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+backend/lib/*
+!backend/lib/rar_linux_64
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -158,6 +160,6 @@ temp_downloads/*
 
 # Project management files
 docs/
-project_management/
 requirements-dev.txt
 localcv.db
+release.sh

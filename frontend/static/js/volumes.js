@@ -14,8 +14,7 @@ const library_els = {
 		filter: document.querySelector('#filter-button')
 	},
 	task_buttons: {
-		update_all: document.querySelector('#updateall-button'),
-		search_all: document.querySelector('#searchall-button')
+		update_all: document.querySelector('#updateall-button')
 	},
 	search: {
 		clear: document.querySelector('#clear-search'),
@@ -316,7 +315,7 @@ function fetchStats(api_key) {
 		library_els.stats.file_count.innerText = json.result.files;
 		library_els.stats.total_file_size.innerText =
 			json.result.total_file_size > 0
-			? convertSize(json.result.total_file_size)
+			? convertSize(json.result.total_file_size, 2)
 			: '0 MB';
 	});
 };
@@ -349,11 +348,6 @@ library_els.view_options.sort.value = lib_options.lib_sorting;
 library_els.view_options.view.value = lib_options.lib_view;
 library_els.view_options.filter.value = lib_options.lib_filter;
 
-socket.on(
-	'mass_editor_status',
-	data => library_els.mass_edit.progress.innerText = `${data.current_item}/${data.total_items}`
-);
-
 usingApiKey()
 .then(api_key => {
 	fetchLibrary(api_key);
@@ -363,9 +357,10 @@ usingApiKey()
 		e => clearSearch(api_key);
 
 	library_els.task_buttons.update_all.onclick =
-		e => sendAPI('POST', '/system/tasks', api_key, {}, {'cmd': 'update_all'});
-	library_els.task_buttons.search_all.onclick =
-		e => sendAPI('POST', '/system/tasks', api_key, {}, {'cmd': 'search_all'});
+		e => sendAPI('POST', '/system/tasks', api_key, {}, {
+			'cmd': 'update_all',
+			'allow_skipping': false
+		});
 
 	library_els.view_options.sort.onchange = e => {
 		setLocalStorage({'lib_sorting': library_els.view_options.sort.value});
@@ -446,6 +441,11 @@ usingApiKey()
 							- data.not_downloaded_issues.length;
 			inst.setProgressBar(new_progress[0], new_progress[1])
 		}
+	);
+	// Socket is init after API key so wait for that like this
+	socket.on(
+		'mass_editor_status',
+		data => library_els.mass_edit.progress.innerText = `${data.current_item}/${data.total_items}`
 	);
 });
 library_els.search.container.action = 'javascript:searchLibrary();';

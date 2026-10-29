@@ -7,13 +7,16 @@ and abstract classes.
 
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from enum import Enum
 from threading import Event, Thread
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Mapping,
                     Sequence, Tuple, TypedDict, TypeVar, Union)
 
 if TYPE_CHECKING:
-    from backend.base.helpers import AsyncSession
+    from threading import Timer
+
+    from backend.base.helpers import CommaList, DateFormatter
 
 # region Types
 T = TypeVar("T")
@@ -47,10 +50,19 @@ class Constants:
     DB_NAME = "Kapowarr.db"
     "Name of database file itself"
 
+    DB_ORIGINAL_NAME = "Kapowarr_original.db"
+    "Name of database file when backed up because a new database is imported"
+
     DB_TIMEOUT = 30.0 # seconds
     "Seconds to wait on database command before timing out"
 
-    DB_MAX_CONCURRENT_CONNECTIONS = 4
+    DB_REVERT_TIME = 60.0 # seconds
+    """
+    After a new database is imported, how long the user has to access the web-UI
+    before the import is reverted
+    """
+
+    DB_MAX_CONCURRENT_CONNECTIONS = 32
     "Maximum allowed database connections to be open at the same time"
 
     LOGGER_NAME = "Kapowarr"
@@ -89,7 +101,10 @@ class Constants:
     BACKOFF_FACTOR_RETRIES = 1
     "Backoff factor for waiting in-between retries"
 
-    STATUS_FORCELIST_RETRIES = (500, 502, 503, 504)
+    STATUS_FORCELIST_RETRIES = (
+        500, 502, 503, 504,
+        522 # CloudFlare timed out connecting to host server
+    )
     "The HTTP status codes for which a retry should be done"
 
     GC_THROTTLE_DEFAULT_WAIT = 60
@@ -106,12 +121,6 @@ class Constants:
     CV_BRAKE_TIME = 1.0 # seconds
     "Average amount of seconds between requests to the CV API"
 
-    GC_SITE_URL = "https://getcomics.org"
-    "The base URL of GetComics"
-
-    GC_SOURCE_TERM = "GetComics"
-    "The name used for GetComics as a download source"
-
     MEGA_API_URL = "https://eu.api.mega.co.nz/cs"
     "The base URL of the Mega API"
 
@@ -121,16 +130,22 @@ class Constants:
     FS_API_BASE = "/v1"
     "The base endpoint of the FlareSolverr API"
 
+    FS_RESOLVE_TIMEOUT = 300 # seconds
+    "Timeout for FlareSolverr to solve the challenge"
+
+    MAX_CONCURRENT_FS_SESSIONS = 2
+    "The maximum amount of FlareSolverr browser sessions that can concurrently run"
+
     CF_CHALLENGE_HEADER = ("cf-mitigated", "challenge")
     """
     The key and value of the header supplied by CloudFlare
     when a challenge is presented
     """
 
-    TORRENT_UPDATE_INTERVAL = 5 # seconds
+    EXTERNAL_CLIENT_UPDATE_INTERVAL = 30 # seconds
     "The interval in seconds between status updates from external clients"
 
-    TORRENT_TAG = "kapowarr"
+    EXTERNAL_DOWNLOAD_TAG = "kapowarr"
     "The tag to give to downloads at external clients"
 
 
@@ -261,6 +276,21 @@ class WebSocketEventType(BaseEnum):
     DOWNLOADED_STATUS = "downloaded_status"
     "A change in what issues are marked as downloaded and which aren't"
 
+    STATUS_COUNT = "status_count"
+    "A change in the number of active status issues"
+
+
+class StatusType(BaseEnum):
+    "A type of status issue that can be reported"
+
+    CV_RATE_LIMIT = "cv_rate_limit"
+    DOWNLOAD_SERVICE_RATE_LIMIT = "download_service_rate_limit"
+
+    ROOT_FOLDER_ALMOST_FULL = "root_folder_almost_full"
+    ROOT_FOLDER_FULL = "root_folder_full"
+
+    CF_CHALLENGE_WITH_NO_FS = "cf_challenge_with_no_fs"
+
 
 class StartType(BaseEnum):
     "The reason for or cause of starting up"
@@ -271,6 +301,24 @@ class StartType(BaseEnum):
     "A normal restart"
     RESTART_HOSTING_CHANGES = 132
     "A restart because changes to the hosting settings were made"
+    RESTART_DB_CHANGES = 133
+    "A restart because a database import was done"
+
+
+class InvalidDatabaseReason(BaseEnum):
+    "The reason that a database file is invalid"
+
+    DOES_NOT_EXIST = "does_not_exist"
+    "Database file does not exist"
+
+    NOT_KAPOWARR_DB = "not_kapowarr_db"
+    "Uploaded database is not a Kapowarr database file"
+
+    VERSION_NOT_SUPPORTED = "version_not_supported"
+    """
+    Uploaded database is higher version than this Kapowarr installation can
+    support
+    """
 
 
 class ProxyType(BaseEnum):
@@ -420,9 +468,21 @@ class BlocklistReasonID(BaseEnum):
 class BlocklistReason(BaseEnum):
     "The reason for putting a link on the blocklist"
 
-    LINK_BROKEN = "Link broken"
-    NO_WORKING_LINKS = "No supported or working links"
-    ADDED_BY_USER = "Added by user"
+    LINK_BROKEN = "link_broken"
+    NO_WORKING_LINKS = "no_working_links"
+    ADDED_BY_USER = "added_by_user"
+
+
+class BrokenMetadataSourceReason(BaseEnum):
+    "The reason that contacting the metadata source went wrong"
+
+    CONNECTION_ERROR = "connection_error"
+    FAILED_PROCESSING_RESPONSE = "failed_processing_response"
+    ACCESS_DENIED = "access_denied"
+    """
+    Access denied not because credentials are invalid but because,
+    e.g., we're banned.
+    """
 
 
 class BrokenClientReason(BaseEnum):
@@ -431,11 +491,11 @@ class BrokenClientReason(BaseEnum):
     (aside from an invalid link)
     """
 
-    CONNECTION_ERROR = "Failed to connect"
-    NOT_CLIENT_INSTANCE = "What was connected to was not the expected client"
-    VERSION_NOT_SUPPORTED = "The version is not supported"
-    FAILED_PROCESSING_RESPONSE = "Got an unexpected response back"
-    ACCESS_DENIED = "Access denied by client but not because of invalid credentials"
+    CONNECTION_ERROR = "connection_error"
+    NOT_CLIENT_INSTANCE = "not_client_instance"
+    VERSION_NOT_SUPPORTED = "version_not_supported"
+    FAILED_PROCESSING_RESPONSE = "failed_processing_response"
+    ACCESS_DENIED = "access_denied"
     """
     Access denied not because credentials are invalid but because,
     e.g., Mega failed to log in anonymously or a webpage is blocked by CF
@@ -445,66 +505,131 @@ class BrokenClientReason(BaseEnum):
 class EnqueuingDownloadFailureReason(BaseEnum):
     "The reason a download failed to be added to the queue"
 
-    WEBPAGE_BROKEN = "Webpage unavailable"
-    NO_MATCHES = "No links found on webpage that match to volume and are not blocklisted"
-    NO_WORKING_LINKS = "All download links found on the webpage are broken"
-    ONLY_RATE_LIMITED_LINKS = "All working download links on the webpage are from rate limited services"
+    # Download link is webpage with links on it. E.g. GetComics.
+    WEBPAGE_BROKEN = "webpage_broken"
+    NO_MATCHES = "no_matches"
+    NO_WORKING_LINKS = "no_working_links"
+    ONLY_RATE_LIMITED_LINKS = "only_rate_limited_links"
 
-    LINK_BROKEN = "Download link broken"
+    # Any download link, whether webpage or direct link.
+    LINK_BROKEN = "link_broken"
+    LINK_RATE_LIMITED = "link_rate_limited"
 
 
 class DownloadType(BaseEnum):
     "The download protocol (download type)"
 
-    DIRECT = 1
+    DDL = 1
     TORRENT = 2
 
 
-class GCDownloadSource(BaseEnum):
-    "Download sources offered on a GetComics webpage"
+class IndexerClientField(BaseEnum):
+    "A field that the indexer client requires"
+
+    TITLE = "title"
+    ENABLED = "enabled"
+    URL = "url"
+
+    # GC
+    GC_SERVICE_PREFERENCE = "gc_service_preference"
+    """
+    Only applicable for the GC client. The preference order for download
+    services offered on a GC download page.
+    """
+
+    GC_AVOID_LARGE_DOWNLOADS = "gc_avoid_large_downloads"
+    """
+    Only applicable for the GC client. Whether to avoid downloads if they're
+    over 400MB.
+    """
+
+    # Torrent/Usenet
+    API_PATH = "api_path"
+    "Path to the api, usually /api"
+
+    API_KEY = "api_key"
+
+    CATEGORIES = "categories"
+
+
+class SearchAction(BaseEnum):
+    "The next course of action during a search with an indexer"
+
+    SEARCH_VOLUME = 1
+    SEARCH_ISSUE = 2
+    FETCH_NEXT_PAGE = 3
+    NEXT_QUERY_VARIATION = 4
+    NEXT_TITLE_ALIAS = 5
+    STOP = 6
+
+
+class ExternalClientField(BaseEnum):
+    "A field for which the external client possibly requires a value to work"
+
+    TITLE = "title"
+    ENABLED = "enabled"
+    BASE_URL = "base_url"
+    USERNAME = "username"
+    PASSWORD = "password"
+    API_TOKEN = "api_token"
+
+
+class GCDownloadService(BaseEnum):
+    "Download services/protocols offered on a GetComics webpage"
 
     MEGA = "Mega"
     MEDIAFIRE = "MediaFire"
     WETRANSFER = "WeTransfer"
     PIXELDRAIN = "Pixeldrain"
     GETCOMICS = "GetComics"
-    "A direct download link straight from their own servers"
+    "A DDL download link straight from their own servers"
     GETCOMICS_TORRENT = "GetComics (torrent)"
     "A torrent magnet link directly on the webpage"
 
 
 # autopep8: off
-GC_DOWNLOAD_SOURCE_TERMS = {
-    GCDownloadSource.MEGA: ("mega", "mega link"),
-    GCDownloadSource.MEDIAFIRE: ("mediafire", "mediafire link"),
-    GCDownloadSource.WETRANSFER: ("wetransfer", "we transfer", "wetransfer link", "we transfer link"),
-    GCDownloadSource.PIXELDRAIN: ("pixeldrain", "pixel drain", "pixeldrain link", "pixel drain link"),
-    GCDownloadSource.GETCOMICS: ("getcomics", "download now", "main download", "main server", "main link", "mirror download", "mirror server", "mirror link", "link 1", "link 2"),
-    GCDownloadSource.GETCOMICS_TORRENT: ("getcomics (torrent)", "torrent", "torrent link", "magnet", "magnet link")
+GC_DOWNLOAD_SERVICE_TERMS = {
+    GCDownloadService.MEGA: ("mega", "mega link"),
+    GCDownloadService.MEDIAFIRE: ("mediafire", "mediafire link"),
+    GCDownloadService.WETRANSFER: ("wetransfer", "we transfer", "wetransfer link", "we transfer link"),
+    GCDownloadService.PIXELDRAIN: ("pixeldrain", "pixel drain", "pixeldrain link", "pixel drain link"),
+    GCDownloadService.GETCOMICS: ("getcomics", "download now", "main download", "main server", "main link", "mirror download", "mirror server", "mirror link", "link 1", "link 2"),
+    GCDownloadService.GETCOMICS_TORRENT: ("getcomics (torrent)", "torrent", "torrent link", "magnet", "magnet link")
 }
 """
-GCDownloadSource to strings that can be found in the button text for the
+GCDownloadService to strings that can be found in the button text for the
 service on the GC page
 """
 # autopep8: on
 
 
-# Future proofing. In the future, there'll be sources like 'torrent' and
-# 'usenet'. In part of the code, we want access to all download sources,
-# and in the other part we only want the GC services. So in preparation
-# of the torrent and usenet sources coming, we're already making the
-# distinction here.
-class DownloadSource(BaseEnum):
-    "All possible download sources"
+class DownloadService(BaseEnum):
+    "All possible download services/protocols"
 
     MEGA = "Mega"
     MEDIAFIRE = "MediaFire"
     WETRANSFER = "WeTransfer"
     PIXELDRAIN = "Pixeldrain"
     GETCOMICS = "GetComics"
-    "A direct download link straight from their own servers"
+    "A DDL download link straight from their own servers"
     GETCOMICS_TORRENT = "GetComics (torrent)"
     "A torrent magnet link directly on the webpage"
+
+    TORRENT = "Torrent"
+
+
+class DownloadClientIdentifier(BaseEnum):
+    "The database identifiers for the download clients"
+
+    DDL = "direct"
+    MEDIAFIRE = "mf"
+    MEDIAFIRE_FOLDER = "mf_folder"
+    MEGA = "mega"
+    MEGA_FOLDER = "mega_folder"
+    PIXELDRAIN = "pd"
+    PIXELDRAIN_FOLDER = "pd_folder"
+    TORRENT = "torrent"
+    WETRANSFER = "wt"
 
 
 class DownloadState(BaseEnum):
@@ -520,36 +645,6 @@ class DownloadState(BaseEnum):
     "Download was removed from queue"
     SHUTDOWN_STATE = "shutting down"
     "Download was stopped because Kapowarr is shutting down"
-
-
-QUERY_FORMATS: Dict[str, Tuple[str, ...]] = {
-    "TPB": (
-        "{title} Vol. {volume_number} ({year}) TPB",
-        "{title} ({year}) TPB",
-        "{title} Vol. {volume_number} TPB",
-        "{title} Vol. {volume_number}",
-        "{title}"
-    ),
-    "VAI": (
-        "{title} ({year})",
-        "{title}"
-    ),
-    "Volume": (
-        "{title} Vol. {volume_number} ({year})",
-        "{title} ({year})",
-        "{title} Vol. {volume_number}",
-        "{title}"
-    ),
-    "Issue": (
-        "{title} #{issue_number} ({year})",
-        "{title} Vol. {volume_number} #{issue_number}",
-        "{title} #{issue_number}",
-        "{title}"
-    )
-}
-"""
-Volume SV to query formats used when searching
-"""
 
 
 RAR_EXECUTABLES = {
@@ -569,6 +664,24 @@ class ApiResponse(TypedDict):
     code: int
 
 
+class StatusData(TypedDict):
+    type: str
+    "The status type"
+
+    display_subtypes: List[str]
+    """
+    The subtypes, in a form that makes displaying easy
+    (e.g. the indexer title instead of ID)
+    """
+
+
+class DatabaseBackupEntry(TypedDict):
+    index: int
+    creation_date: int
+    filepath: str
+    filename: str
+
+
 class FilenameData(TypedDict):
     series: str
     year: Union[int, None]
@@ -585,10 +698,35 @@ class RemoteMappingData(TypedDict):
     local_path: str
 
 
+class IndexerClientData(TypedDict):
+    id: int
+    enabled: bool
+    download_type: int
+    client_type: str
+    required_tokens: List[str]
+    title: str
+    url: str
+    gc_service_preference: Union['CommaList', None]
+    gc_avoid_large_downloads: Union[bool, None]
+    api_path: Union[str, None]
+    api_key: Union[str, None]
+    categories: Union['CommaList', None]
+
+
+class SearchQuery(TypedDict):
+    query: str
+    page: int
+    total_available_variations: int
+
+
 class SearchResultData(FilenameData):
     link: str
     display_title: str
-    source: str
+    size: int
+    indexer_id: int
+    indexer_title: str
+    seeders: Union[int, None]
+    leechers: Union[int, None]
 
 
 class SearchResultMatchData(TypedDict):
@@ -628,7 +766,7 @@ class VolumeMetadata(TypedDict):
     issue_count: int
     translated: bool
     already_added: Union[int, None]
-    issues: Union[List['IssueMetadata'], None]
+    issues: Union[List[IssueMetadata], None]
 
 
 class CVFileMapping(TypedDict):
@@ -638,8 +776,22 @@ class CVFileMapping(TypedDict):
 
 class DownloadGroup(TypedDict):
     web_sub_title: str
+    size: int
     info: FilenameData
-    links: Dict[GCDownloadSource, List[str]]
+    links: Dict[GCDownloadService, List[str]]
+
+
+class ExternalDownloadClientData(TypedDict):
+    id: int
+    enabled: bool
+    download_type: int
+    client_type: str
+    required_tokens: List[str]
+    title: str
+    base_url: str
+    username: Union[str, None]
+    password: Union[str, None]
+    api_token: Union[str, None]
 
 
 class ClientTestResult(TypedDict):
@@ -670,6 +822,14 @@ class FileMatch(TypedDict):
     forced_match: bool
 
 
+class QueuedTaskData(TypedDict):
+    id: int
+    task: 'Task'
+    thread: Thread
+    status: str
+    "One of 'queued', 'running' or 'paused'"
+
+
 # region Dataclasses
 @dataclass
 class BlocklistEntry:
@@ -682,7 +842,7 @@ class BlocklistEntry:
     web_sub_title: Union[str, None]
 
     download_link: Union[str, None]
-    source: Union[str, None]
+    download_service: Union[str, None]
 
     reason: BlocklistReason
     added_at: int
@@ -712,6 +872,9 @@ class BaseNamingKeys:
     year: Union[int, None]
     publisher: Union[str, None]
 
+    def todict(self) -> Dict[str, Any]:
+        return asdict(self)
+
 
 @dataclass
 class VolumeNamingKeys(BaseNamingKeys):
@@ -721,8 +884,8 @@ class VolumeNamingKeys(BaseNamingKeys):
 @dataclass
 class TitlelessIssueNamingKeys(BaseNamingKeys):
     issue_comicvine_id: int
-    issue_number: Union[str, None]
-    issue_release_date: Union[str, None]
+    issue_number: str
+    issue_release_date: Union['DateFormatter', None]
     issue_release_year: Union[int, None]
 
 
@@ -740,7 +903,7 @@ class IssueData:
     calculated_issue_number: float
     title: Union[str, None]
     date: Union[str, None]
-    description: Union[str, None]
+    description: str
     monitored: bool
     files: List[FileData]
 
@@ -754,11 +917,11 @@ class VolumeData:
     comicvine_id: int
     title: str
     alt_title: Union[str, None]
-    year: int
-    publisher: str
+    year: Union[int, None]
     volume_number: int
     description: str
     site_url: str
+    publisher: Union[str, None]
     monitored: bool
     monitor_new_issues: bool
     root_folder: int
@@ -808,6 +971,32 @@ class CredentialData:
         return result
 
 
+@dataclass
+class QueryKeys:
+    titles: List[str]
+    year: Union[int, None]
+    volume_number: int
+    special_version: SpecialVersion
+    issue_number: Union[str, None]
+    issue_year: Union[int, None]
+
+
+@dataclass
+class QueryResult:
+    results: List[SearchResultData]
+    next_page_available: bool
+
+
+@dataclass
+class SearchIterationStats:
+    result_count: int
+    matched_count: int
+    new_match_count: int
+    next_page_available: bool
+    remaining_wanted_issues: List[int]
+    total_available_variations: int
+
+
 # region Abstract Classes
 class KapowarrException(Exception, ABC):
     "An exception specific to Kapowarr"
@@ -843,6 +1032,92 @@ class StartTypeHandler(ABC):
         ...
 
 
+class StatusHandler(ABC):
+    "A handler for a specific status type"
+
+    def __init__(self, status_type: StatusType) -> None:
+        self.status_type = status_type
+        self._subtypes: Dict[str, int] = {}
+        self._timers: Dict[str, Timer] = {}
+        return
+
+    @abstractmethod
+    def get_expiry(self, subtype: str, timestamp: int) -> Union[int, None]:
+        """Get the absolute expiry timestamp for this subtype. Override in
+        handlers that auto-expire. Defaults to None (no auto-expiry, persists
+        until manually cleared).
+
+        Args:
+            subtype (str): The subtype identifier.
+            timestamp (int): When the status was reported (epoch seconds).
+
+        Returns:
+            Union[int, None]: The absolute expiry timestamp, or None.
+        """
+        ...
+
+    @abstractmethod
+    def report(self, subtype: str, timestamp: int) -> None:
+        """Report a subtype of this status type.
+
+        Args:
+            subtype (str): The subtype identifier.
+            timestamp (int): When the status was reported (epoch seconds).
+        """
+        ...
+
+    @abstractmethod
+    def restore(
+        self,
+        subtype: str,
+        timestamp: int,
+        remaining: Union[int, None]
+    ) -> None:
+        """Restore a subtype from database on startup.
+
+        Args:
+            subtype (str): The subtype identifier.
+            timestamp (int): The stored timestamp.
+            remaining (Union[int, None]): Seconds until expiry, or None if the
+                status has no auto-expiry.
+        """
+        ...
+
+    @abstractmethod
+    def clear(self, subtype: Union[str, None] = None) -> None:
+        """Clear a subtype or all subtypes. Cancel associated timers.
+
+        Args:
+            subtype (Union[str, None], optional): The subtype to clear. If None,
+                clear all subtypes.
+                Defaults to None.
+        """
+        ...
+
+    @abstractmethod
+    def problem_reported(self, subtype: Union[str, None] = None) -> bool:
+        """Whether a problem is reported for this handler.
+
+        Args:
+            subtype (Union[str, None], optional): Check for a specific subtype.
+                If None, check if any subtype is active.
+                Defaults to None.
+
+        Returns:
+            bool: Whether the problem is reported.
+        """
+        ...
+
+    @abstractmethod
+    def get_display(self) -> StatusData:
+        """Get the data the represents the status report.
+
+        Returns:
+            Dict[str, Any]: The formatted data.
+        """
+        ...
+
+
 class WebSocketEvent(ABC):
     @abstractmethod
     def get_type(self) -> WebSocketEventType:
@@ -863,52 +1138,277 @@ class WebSocketEvent(ABC):
         ...
 
 
-class MassEditorAction(ABC):
-    identifier: str
-    "The string used in the API to refer to the action"
+class Task(ABC):
+    action: str
 
-    def __init__(self, volume_ids: List[int]) -> None:
-        """Prepare a mass editor action.
+    stop: bool
+    message: str
+    display_title: str
 
-        Args:
-            volume_ids (List[int]): The volume IDs to work on.
-        """
-        self.volume_ids = volume_ids
+    description: str = ''
+    "Explanation of what the task does, shown in the UI"
+
+    priority: int = 10
+    """Lower runs first. A newly added task with a lower value than the running
+    task preempts it at the running task's next `check_yield()` call."""
+
+    def _ensure_yield_event(self) -> Event:
+        "Lazily initialise the yield event"
+        if not hasattr(self, '_yield_event'):
+            self._yield_event = Event()
+            self._yield_event.set()
+        return self._yield_event
+
+    def check_yield(self) -> None:
+        """Call between units of work. Blocks while a higher-priority task is
+        running; resumes when it finishes."""
+        self._ensure_yield_event().wait()
         return
 
+    @property
     @abstractmethod
-    def run(self, **kwargs: Any) -> None:
-        "Run the mass editor action"
+    def volume_id(self) -> Union[int, None]:
         ...
 
-    def __repr__(self) -> str:
-        return f'<{self.__class__.__name__}(action={self.identifier}; ids={self.volume_ids}); {id(self)}>'
-
-
-class SearchSource(ABC):
-    def __init__(self, query: str) -> None:
-        """Prepare the search source.
-
-        Args:
-            query (str): The query to search for.
-        """
-        self.query = query
-        return
+    @property
+    @abstractmethod
+    def issue_id(self) -> Union[int, None]:
+        ...
 
     @abstractmethod
-    async def search(self, session: 'AsyncSession') -> List[SearchResultData]:
-        """Search for the query.
+    def __init__(self, **kwargs) -> None:
+        ...
+
+    @abstractmethod
+    def run(self) -> Union[None, List[Tuple[
+        str, int, FilenameData, int, Union[int, None]
+    ]]]:
+        """Run the task
+
+        Returns:
+            Union[None, List[Tuple[str, int, Union[int, None]]]]:
+                Either `None` if the task has no result or
+                `List[Tuple[str, int, FilenameData, int, Union[int, None]]]` if
+                the task returns search results.
+        """
+        ...
+
+
+class IndexerClient(ABC):
+    client_type: str
+    "The name of the indexer client (e.g. 'Torznab')"
+
+    download_type: DownloadType
+    "The protocol it supplies downloads for (e.g. torrents)"
+
+    required_tokens: Tuple[IndexerClientField, ...]
+    "The keys the client needs or could need for operation"
+
+    allow_multiple_instances: bool
+    """
+    Allow this client to be added multiple times. For something like Torznab,
+    you want that. For something like GC, you don't want to allow that.
+    """
+
+    @property
+    @abstractmethod
+    def id(self) -> int:
+        ...
+
+    @property
+    @abstractmethod
+    def title(self) -> str:
+        ...
+
+    @abstractmethod
+    def __init__(self, indexer_id: int) -> None:
+        """Start the indexer.
 
         Args:
-            session (AsyncSession): The session to use for the search.
+            indexer_id (int): The ID of the indexer.
+        """
+        ...
+
+    @abstractmethod
+    def get_indexer_data(self) -> IndexerClientData:
+        """Get info about the indexer.
+
+        Returns:
+            IndexerClientData: The info about the indexer.
+        """
+        ...
+
+    @abstractmethod
+    def update_indexer(self, data: Mapping[str, Any]) -> None:
+        """Edit the indexer.
+
+        Args:
+            data (Mapping[str, Any]): The keys and their new values for
+                the indexer settings.
+
+        Raises:
+            ClientNotWorking: Can't connect to client.
+            CredentialInvalid: Credentials are invalid.
+            KeyNotFound: A required key was not found.
+            InvalidKeyValue: One of the parameters has an invalid argument.
+        """
+        ...
+
+    @abstractmethod
+    def delete_indexer(self) -> None:
+        """Delete the indexer"""
+        ...
+
+    @abstractmethod
+    async def search(self, query: SearchQuery) -> QueryResult:
+        """Perform a search at the indexer.
+
+        Args:
+            query (SearchQuery): The query to use.
+
+        Returns:
+            QueryResult: The search results.
+        """
+        ...
+
+    @abstractmethod
+    async def discover(self, last_check: datetime) -> List[SearchResultData]:
+        """Get a list of all new releases at the indexer since a certain datetime.
+
+        Args:
+            last_check (datetime): Get the releases starting from, but not
+                including, this datetime.
 
         Returns:
             List[SearchResultData]: The search results.
         """
         ...
 
+    @abstractmethod
+    async def shutdown(self) -> None:
+        """Shutdown the connection to the indexer. Run after search is complete."""
+        ...
+
+    @classmethod
+    @abstractmethod
+    def test(cls, url: str, **extra_fields: Any) -> None:
+        """Check if an indexer is working.
+
+        Args:
+            url (str): The url on which the indexer is available.
+            extra_fields (kwargs, optional): Extra fields and their values,
+                possibly used by the indexer during testing.
+
+        Raises:
+            ClientNotWorking: Can't connect to client.
+            CredentialInvalid: Credentials are invalid.
+
+        Returns:
+            None: Test was successful
+        """
+        ...
+
     def __repr__(self) -> str:
-        return f'<{self.__class__.__name__}(query={self.query}); {id(self)}>'
+        return f'<{self.__class__.__name__}(id={self.id}; title={self.title}); {id(self)}>'
+
+
+class QueryBuilder(ABC):
+    download_type: DownloadType
+    "The protocol the indexers supply downloads for (e.g. torrents)"
+
+    def __init__(self) -> None:
+        self.page = 1
+        self.query_variation_index = 0
+        self.alias_index = 0
+        self.originally_volume_search = False
+        return
+
+    def _update_state(self, search_action: SearchAction) -> None:
+        """Update the core state of the builder, like the page number and
+        various indices.
+
+        Args:
+            search_action (SearchAction): The next action, to act on.
+        """
+        if search_action == SearchAction.SEARCH_VOLUME:
+            self.page = 1
+            self.query_variation_index = 0
+            self.originally_volume_search = True
+
+        elif search_action == SearchAction.SEARCH_ISSUE:
+            self.page = 1
+            self.query_variation_index = 0
+
+        elif search_action == SearchAction.FETCH_NEXT_PAGE:
+            self.page += 1
+
+        elif search_action == SearchAction.NEXT_QUERY_VARIATION:
+            self.page = 1
+            self.query_variation_index += 1
+
+        elif search_action == SearchAction.NEXT_TITLE_ALIAS:
+            self.page = 1
+            self.alias_index += 1
+            self.query_variation_index = 0
+
+        return
+
+    @abstractmethod
+    def _select_queries(self, query_keys: QueryKeys) -> Sequence[str]:
+        """Determine the set of possible queries that should be used for this
+        iteration. For example, different query formats can be used based on
+        whether a search for an issue or for a volume is done.
+
+        Args:
+            query_keys (QueryKeys): The query keys that are used this iteration.
+
+        Returns:
+            Sequence[str]: The set of query formats that can be used.
+        """
+        ...
+
+    def next_query(
+        self,
+        search_action: SearchAction,
+        query_keys: QueryKeys
+    ) -> SearchQuery:
+        """Based on the next action and accompanying metadata of what is being
+        searched of, build a query string for the indexer to use.
+
+        Args:
+            search_action (SearchAction): The next search action that will be
+                performed, based on which a query should be built.
+            query_keys (QueryKeys): The metadata values to fill the fields in
+                the query with.
+
+        Returns:
+            SearchQuery: The resulting query string and which page to fetch.
+        """
+        self._update_state(search_action)
+
+        queries = self._select_queries(query_keys)
+        query = queries[self.query_variation_index]
+
+        if query_keys.year is None:
+            query = query.replace('({year})', '').strip()
+
+        if query_keys.issue_number is None:
+            year = query_keys.year
+        else:
+            year = query_keys.issue_year or query_keys.year
+
+        result = query.format(
+            title=query_keys.titles[self.alias_index],
+            year=year,
+            volume_number=query_keys.volume_number,
+            issue_number=query_keys.issue_number
+        )
+
+        return {
+            "query": result,
+            "page": self.page,
+            "total_available_variations": len(queries)
+        }
 
 
 class ExternalDownloadClient(ABC):
@@ -918,7 +1418,7 @@ class ExternalDownloadClient(ABC):
     download_type: DownloadType
     "The protocol it uses to download (e.g. a torrent)"
 
-    required_tokens: Sequence[str]
+    required_tokens: Tuple[ExternalClientField, ...]
     """
     The keys the client needs or could need for operation
     (mostly whether it's username + password or api_token)
@@ -927,6 +1427,11 @@ class ExternalDownloadClient(ABC):
     @property
     @abstractmethod
     def id(self) -> int:
+        ...
+
+    @property
+    @abstractmethod
+    def enabled(self) -> bool:
         ...
 
     @property
@@ -964,11 +1469,11 @@ class ExternalDownloadClient(ABC):
         ...
 
     @abstractmethod
-    def get_client_data(self) -> Dict[str, Any]:
+    def get_client_data(self) -> ExternalDownloadClientData:
         """Get info about the client.
 
         Returns:
-            Dict[str, Any]: The info about the client.
+            ExternalDownloadClientData: The info about the client.
         """
         ...
 
@@ -1034,9 +1539,8 @@ class ExternalDownloadClient(ABC):
             CredentialInvalid: Credentials are invalid.
 
         Returns:
-            Union[Dict[str, Any], None]: The status of the download,
-                empty dict if download is not found
-                and `None` if client deleted the download.
+            Union[Dict[str, Any], None]: The status of the download or
+                `None` if client deleted the download.
         """
         ...
 
@@ -1054,9 +1558,15 @@ class ExternalDownloadClient(ABC):
         """
         ...
 
-    @staticmethod
+    @abstractmethod
+    def on_shutdown(self) -> None:
+        """Shut down the connection to the client"""
+        ...
+
+    @classmethod
     @abstractmethod
     def test(
+        cls,
         base_url: str,
         username: Union[str, None],
         password: Union[str, None],
@@ -1083,9 +1593,68 @@ class ExternalDownloadClient(ABC):
         return f'<{self.__class__.__name__}(id={self.id}; title={self.title}); {id(self)}>'
 
 
+class DownloadPrepper(ABC):
+    "Converts a download link to a download instance"
+
+    client_type: str
+    "The name of the external client (e.g. 'qBittorrent')"
+
+    download_type: DownloadType
+    "The protocol it uses to download (e.g. a torrent)"
+
+    @property
+    @abstractmethod
+    def web_title(self) -> Union[str, None]:
+        ...
+
+    @abstractmethod
+    def __init__(
+        self,
+        link: str,
+        indexer_id: int,
+        title_data: FilenameData,
+        volume_id: int,
+        issue_id: Union[int, None] = None,
+        force_match: bool = False
+    ) -> None:
+        """Set up the prepper.
+
+        Args:
+            link (str): A link to download from.
+
+            indexer_id (int): The ID of the indexer that the link came from.
+
+            title_data (FilenameData): The filename data of the title.
+
+            volume_id (int): The ID of the volume for which the download is
+                intended.
+
+            issue_id (Union[int, None], optional): The ID of the issue for which
+                the download is intended.
+                Defaults to None.
+
+            force_match (bool, optional): On sources where downloads are
+                filtered, don't and instead download everything.
+                Defaults to False.
+        """
+        ...
+
+    @abstractmethod
+    def get_downloads(self) -> List['Download']:
+        """Process the link and turn it into one or more downloads.
+
+        Raises:
+            EnqueuingDownloadFailure: Failed to process link.
+
+        Returns:
+            List[Download]: The list of downloads.
+        """
+        ...
+
+
 class Download(ABC):
-    identifier: str
-    "An identifier for the specific download implementation (e.g. 'mf_folder')"
+    identifier: DownloadClientIdentifier
+    "An identifier for the specific download implementation"
 
     @property
     @abstractmethod
@@ -1144,14 +1713,14 @@ class Download(ABC):
 
     @property
     @abstractmethod
-    def source_type(self) -> DownloadSource:
+    def download_service(self) -> DownloadService:
         ...
 
     @property
     @abstractmethod
     def source_name(self) -> str:
         """
-        The display name of the source. E.g. `source_type` is torrent,
+        The display name of the source. E.g. `download_service` is torrent,
         so `source_name` is indexer name.
         """
         ...
@@ -1234,7 +1803,7 @@ class Download(ABC):
         volume_id: int,
         covered_issues: Union[float, Tuple[float, float], None],
 
-        source_type: DownloadSource,
+        download_service: DownloadService,
         source_name: str,
 
         web_link: Union[str, None],
@@ -1247,7 +1816,7 @@ class Download(ABC):
 
         Args:
             download_link (str): The link to the download.
-                Could be direct download link, mega link, magnet link, etc.
+                Could be DDL link, mega link, magnet link, etc.
 
             volume_id (int): The ID of the volume that the download is for.
 
@@ -1255,7 +1824,7 @@ class Download(ABC):
                 The calculated issue number (range) that the download covers,
                 or None if download is for special version.
 
-            source_type (DownloadSource): The source type of the download.
+            download_service (DownloadService): The service type of the download.
 
             source_name (str): The display name of the source.
                 E.g. indexer name.
@@ -1279,9 +1848,9 @@ class Download(ABC):
 
             ClientNotWorking: Some problem occured in the client.
 
-            LinkBroken: The link doesn't work.
+            DownloadLinkBroken: The link doesn't work.
 
-            DownloadLimitReached: Can't download because the limit of the service
+            DownloadServiceRateLimitReached: Can't download because the limit of the service
                 is reached.
         """
         ...
@@ -1292,10 +1861,10 @@ class Download(ABC):
         Start the download.
 
         Raises:
-            LinkBroken: The link doesn't work.
+            DownloadLinkBroken: The link doesn't work.
 
-            DownloadLimitReached: At the source that is downloaded from,
-                we've reached a rate limit.
+            DownloadServiceRateLimitReached: Can't download because the limit of the service
+                is reached.
         """
         ...
 
@@ -1359,7 +1928,7 @@ class ExternalDownload(Download):
         volume_id: int,
         covered_issues: Union[float, Tuple[float, float], None],
 
-        source_type: DownloadSource,
+        download_service: DownloadService,
         source_name: str,
 
         web_link: Union[str, None],
@@ -1373,7 +1942,7 @@ class ExternalDownload(Download):
 
         Args:
             download_link (str): The link to the download.
-                Could be direct download link, mega link, magnet link, etc.
+                Could be DDL link, mega link, magnet link, etc.
 
             volume_id (int): The ID of the volume that the download is for.
 
@@ -1381,7 +1950,7 @@ class ExternalDownload(Download):
                 The calculated issue number (range) that the download covers,
                 or None if download is for special version.
 
-            source_type (DownloadSource): The source type of the download.
+            download_service (DownloadService): The service type of the download.
 
             source_name (str): The display name of the source.
                 E.g. indexer name.
@@ -1410,9 +1979,9 @@ class ExternalDownload(Download):
 
             ClientNotWorking: Some problem occured in the client.
 
-            LinkBroken: The link doesn't work.
+            DownloadLinkBroken: The link doesn't work.
 
-            DownloadLimitReached: Can't download because the limit of the service
+            DownloadServiceRateLimitReached: Can't download because the limit of the service
                 is reached.
         """
         ...
@@ -1427,10 +1996,10 @@ class ExternalDownload(Download):
 
             CredentialInvalid: Credentials are invalid.
 
-            LinkBroken: The link doesn't work.
+            DownloadLinkBroken: The link doesn't work.
 
-            DownloadLimitReached: At the source that is downloaded from,
-                we've reached a rate limit.
+            DownloadServiceRateLimitReached: Can't download because the limit of the service
+                is reached.
         """
         ...
 

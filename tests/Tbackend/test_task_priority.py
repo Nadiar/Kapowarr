@@ -20,8 +20,9 @@ from backend.features.tasks import (  # noqa: E402
     MassConvertIssue, MassConvertVolume,
     MassRenameIssue, MassRenameVolume,
     RefreshAndScanVolume, RefreshCalendar,
-    RefreshMetadata, ScanFiles, SearchAll, SearchRecent,
-    SpecialVersionRefresh, SyncIssues, Task)
+    RefreshMetadata, ScanFiles, SearchAll, SearchRecentFresh,
+    SearchRecentStale, SearchRecentWeek, SpecialVersionRefresh, SyncIssues,
+    Task, TaskHandler, UpdateAll)
 # isort: on
 
 
@@ -37,7 +38,8 @@ class TestTaskPriorityAttribute(unittest.TestCase):
 
     def test_search_all_lower_priority_than_search_recent(self):
         """SearchAll (slow batch) must have lower priority than SearchRecent."""
-        self.assertGreater(SearchAll.priority, SearchRecent.priority)
+        for cls in (SearchRecentFresh, SearchRecentWeek, SearchRecentStale):
+            self.assertGreater(SearchAll.priority, cls.priority)
 
     def test_search_all_lower_priority_than_health_check(self):
         """SearchAll must have lower priority than HealthCheck."""
@@ -67,7 +69,8 @@ class TestTaskPriorityAttribute(unittest.TestCase):
             MassRenameVolume, MassConvertVolume,
             RefreshAndScanVolume,
             SyncIssues, RefreshMetadata, ScanFiles, SpecialVersionRefresh,
-            SearchAll, SearchRecent, HealthCheck, RefreshCalendar,
+            SearchAll, SearchRecentFresh, SearchRecentWeek, SearchRecentStale,
+            HealthCheck, RefreshCalendar, UpdateAll,
         ]:
             self.assertIsInstance(
                 cls.priority, int,
@@ -155,6 +158,71 @@ class TestCheckYield(unittest.TestCase):
             did_resume,
             'check_yield should unblock after event.set()'
         )
+
+
+class TestHandlerPreemption(unittest.TestCase):
+    """TaskHandler queue ordering with priorities and pausing."""
+
+    def setUp(self):
+        from unittest.mock import patch
+        self._saved_queue = list(TaskHandler.queue)
+        TaskHandler.queue.clear()
+        self.handler = TaskHandler()
+        self.patches = [
+            patch('backend.features.tasks.Server'),
+            patch('backend.features.tasks.WebSocket'),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        TaskHandler.queue.clear()
+        TaskHandler.queue.extend(self._saved_queue)
+
+    def test_higher_priority_preempts_running_task(self):
+        slow = SearchAll()
+        self.handler.add(slow)
+        self.assertEqual(TaskHandler.queue[0]['status'], 'running')
+
+        urgent = AutoSearchVolume(1)
+        self.handler.add(urgent)
+
+        self.assertIs(TaskHandler.queue[0]['task'], urgent)
+        self.assertEqual(TaskHandler.queue[0]['status'], 'running')
+        self.assertIs(TaskHandler.queue[1]['task'], slow)
+        self.assertEqual(TaskHandler.queue[1]['status'], 'paused')
+        self.assertFalse(slow._ensure_yield_event().is_set())
+
+    def test_queued_tasks_drain_before_paused_task_resumes(self):
+        slow = SearchAll()
+        self.handler.add(slow)
+        self.handler.add(AutoSearchVolume(1))
+        follow_up = SyncIssues()
+        self.handler.add(follow_up)
+
+        self.assertEqual(
+            [e['task'] for e in TaskHandler.queue][1:],
+            [follow_up, slow]
+        )
+
+    def test_equal_priority_does_not_preempt(self):
+        first = SyncIssues()
+        second = ScanFiles()
+        self.handler.add(first)
+        self.handler.add(second)
+        self.assertIs(TaskHandler.queue[0]['task'], first)
+        self.assertEqual(TaskHandler.queue[1]['status'], 'queued')
+
+    def test_paused_task_resumes_at_front(self):
+        slow = SearchAll()
+        self.handler.add(slow)
+        self.handler.add(AutoSearchVolume(1))
+        TaskHandler.queue.pop(0)
+        self.handler._process_queue()
+        self.assertEqual(TaskHandler.queue[0]['status'], 'running')
+        self.assertTrue(slow._ensure_yield_event().is_set())
 
 
 if __name__ == '__main__':

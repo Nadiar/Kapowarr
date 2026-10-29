@@ -1,32 +1,44 @@
 # Contributing to Kapowarr
-## General steps
-Contributing to Kapowarr consists of 5 steps, listed hereunder. 
 
-1. Make a [contributing request](https://github.com/Casvt/Kapowarr/issues/new?template=contribute_request.md), where you describe what you plan on doing. _This request needs to get approved before you can start._ The contributing request has multiple uses:
-    1. Avoid multiple people working on the same thing.
-    2. Avoid you wasting your time on changes that we do not wish for.
-    3. If needed, have discussions about how something will be implemented.
-    4. A place for contact, be it questions, status updates or something else.
-2. When the request is accepted, start your local development (more info on this below).
-3. When done, create a pull request to the development branch, where you quickly mention what has changed and give a link to the original contributing request issue.
-4. The PR will be reviewed. Changes might need to be made in order for it to be merged. 
-5. When everything is okay, the PR will be accepted and you'll be done!
+This guide describes the contribution process and the expectations for anyone wishing to contribute to Kapowarr. Please read it before starting any work.
 
-## Local development
+## General Process
 
-Once your contribution request has been accepted, you can start your local development. 
+Contributing to Kapowarr normally follows these steps:
 
-### IDE
+1. Open a [contribution request](https://github.com/Casvt/Kapowarr/issues/new?template=3_contribute_request.yml) describing the change you want to make. This is mandatory and must be approved before you start working on the implementation.
+2. Once approved, implement the change locally and test it thoroughly.
+3. When the work is ready, open a pull request against the development branch. Include a short summary of the changes and a link to the original contribution request issue.
+4. The pull request will be reviewed. Changes may be requested before it is merged.
+5. Once the changes have been approved and merged, the contribution is complete.
 
-It's up to you how you make the changes, but we use Visual Studio Code as the IDE. A workspace settings file is included that takes care of some styling, testing and formatting of the backend code.
+The contribution request is important. It allows maintainers to assess whether a proposed change is wanted, discuss the intended behaviour and implementation, avoid duplicate work and it offers a place for questions to be asked during development. **Do not skip this step simply because you believe your proposed change would be useful or straightforward.**
 
-1. The vs code extension `ms-python.vscode-pylance` in combination with the settings file with enable type checking.
-2. The vs code extension `ms-python.mypy-type-checker` in combination with the settings file will enable mypy checking.
-3. The vs code extension `ms-python.autopep8` in combination with the settings file will format code on save.
-4. The vs code extension `ms-python.isort` in combination with the settings file will sort the import statements on save.
-5. The settings file sets up the testing suite in VS Code such that you can just click the test button to run all tests.
+### If you have already completed the work
 
-If you do not use VS Code with the mentioned extensions, then below are some commands that you can manually run in the base directory to achieve similar results.
+If you have already implemented a change without first opening and obtaining approval for a contribution request, do not open a contribution request retroactively. Open a pull request directly instead. At that point, the implementation already exists, so a separate request to approve work that has already been done serves little purpose. However, this does not mean that the contribution request is optional or that skipping it is an acceptable alternative to following the guidelines. You were expected to read and follow this guide before starting work.
+
+By starting development without an approved contribution request, you accept the risk that your work may be rejected instantly due to problems in the PR that could've been avoided by creating a contribution request.
+
+**If you have not started development yet, there is no exception: open a contribution request and wait for approval first.**
+
+## Local Development
+
+After a contribution request has been accepted, you can start working locally.
+
+There are Python requirements in the requirements.txt and requirements-dev.txt files that you should have installed. You can install them with the following command:
+
+```bash
+python3 -m pip install -r requirements.txt -r requirements-dev.txt
+```
+
+As for development tools, there are four:
+    1. Mypy for type checking, on top of Pylance
+    2. autopep8 for formatting
+    3. isort for management of import statements
+    4. unittest for running the unit tests
+
+You can run the tools with the following commands:
 
 1. **Mypy**:
 ```bash
@@ -45,25 +57,79 @@ isort .
 python3 -m unittest discover -s ./tests -p '*.py'
 ```
 
-### Strict rules
+Visual Studio Code is the editor used mostly for this project, but it is not a requirement to use it. A VSC Workspace settings file is included to help with setting up the usage of these tools with integration into VSC, assuming the accompanying extensions of these tools are installed. There is also a .pre-commit-config.yaml file that configures pre-commit hooks, if you have that installed and want to use it. It runs the four tools before a commit.
 
-There are a few conditions that should always be met:
+## Strict Rules
 
-1. Kapowarr should support Python version 3.8 and higher.
-2. Kapowarr should be compatible with Linux, MacOS, Windows and the Docker container.
-3. The tests should all pass.
+The following rules should always be respected:
 
-### Styling guide
+1. Kapowarr should support Python 3.8 and newer.
+2. The application should remain compatible with Linux, macOS, Windows, and the Docker container.
+3. The relevant tests should pass before a change is submitted.
+4. Changes should stay focused on the issue or feature being worked on and should not introduce unrelated behaviour changes.
 
-Following the styling guide for the backend code is not a strict rule, but effort should be put in to conform to it as much as possible. Running autopep8 and isort handles most of this.
+## Styling Guide
+
+The backend styling guide is not enforced as a hard rule in every case, but contributors should try to follow it as much as possible. Running autopep8 and isort usually covers most of the mechanical formatting concerns.
+
+The main conventions are:
 
 1. Indentation is done with 4 spaces. Not using tabs.
 2. Use type hints as much as possible. If you encounter an import loop because something needs to be imported for type hinting, utilise [`typing.TYPE_CHECKING`](https://docs.python.org/3/library/typing.html#typing.TYPE_CHECKING).
-3. A function in the backend needs a doc string describing the function, what the inputs are, what errors could be raised from within the function and what the output is.
-4. The imports need to be sorted.
-5. The code should, though not strictly enforced, reasonably comply with the rule of 80 characters per line.
+3. Give backend functions docstrings that describe what they do, what inputs they expect, which errors they may raise, and what they return.
+4. Keep imports sorted and grouped consistently.
+5. Keep lines reasonably short and readable, with the project’s existing style in mind.
 
-## A few miscellaneous notes
+## Backend Folder Structure
 
-1. Kapowarr does not have many tests. They're not really required if you checked your changes for bugs already. But you are free to add tests for your changes anyway.
-2. The function [`backend.base.file_extraction.extract_filename_data`](https://github.com/Casvt/Kapowarr/blob/eadc04d10b32c04d4bbc51d289d10cfa93bc44f6/backend/base/file_extraction.py#L186) and [the regexes defined at the top](https://github.com/Casvt/Kapowarr/blob/development/backend/base/file_extraction.py#L24-L55) that it uses have become a bit of a box of black magic. If the function does not work as expected, it might be best to just inform @Casvt in the contribution request issue and he'll try to fix it.
+A useful mental model for the backend is that the code is organized from generic utilities toward higher-level workflows:
+
+1. base: low-level shared utilities, definitions, helpers, file parsing, and exceptions.
+2. internals: database access, migrations, settings, server lifecycle, and other internal infrastructure.
+3. implementations: concrete integrations and managers such as indexer clients, download clients, naming logic, matching logic, and other domain-specific implementations.
+4. features: higher-level workflows that compose the lower-level pieces, such as searching, library import, post-processing, tasks, and mass editing.
+
+In other words, the general flow is base -> internals -> implementations -> features.
+
+## Abbreviations and Terminology
+
+Below is a table with abbreviations commonly used throughout the codebase and
+git commit messages:
+
+| Abbreviation | Meaning |
+|---|---|
+| SV | SpecialVersion |
+| VAI | Volume-as-Issue SpecialVersion ("VAS" was erroneously sometimes used) |
+| EF(D) | The `file_extraction.extract_filename_data()` function and the data it returns |
+| RF | Root folder |
+| PP / Post-Processing | Post-download processing |
+| LI | Library Import |
+| EC | External (download) client |
+| SAP | Search Action Planner |
+| CF | CloudFlare |
+| FS | FlareSolverr |
+| CV | ComicVine |
+| GC | GetComics |
+| PD | Pixeldrain |
+| WT | WeTransfer |
+| MF | MediaFire |
+
+## Explanations of Various Systems
+
+This section has high-level explanations of various systems in the codebase. 
+
+### Searching System
+
+This subsection covers the search pipeline, starting from a search for downloads for a specific volume or issue and ending at having a list of search results. The searching system consists of three parts:
+
+1. Search Coordinator: In general, the searching system will issue one query per indexer per "iteration". It will then process the search results from those queries and evaluate whether the search needs to continue. It does this based on whether there are any issues left for which there haven't been any search results. If it does need to continue, another iteration is performed where all indexers perform one query. This keeps going until there is a download for each issue, or the system gives up. Keeping track of what issues are covered, and triggering iterations is what the Search Coordinator does. It also holds the indexers, SAPs and query builders.
+2. Search Action Planner (SAP): Each iteration, a decision needs to be made on what query is performed. The SAP looks at what query it previously made, how that went (it gets statistics on how the query went from the Search Coordinator), what options for queries it has left and based on that information makes a decision on what the next query should be. It is effectively a state machine, handling volume-phase versus issue-phase searches, title aliases, retries, pagination, and query format variations.
+3. Query Builder: The SAP determines what the next query should be (e.g. "next query variation"), but this still needs to be turned into a query string. The Query Builder converts the current search state into a concrete query string for a given download type.
+
+The general flow is:
+
+1. The coordinator starts an iteration.
+2. The planner decides whether the next step is a volume search, an issue search, a pagination fetch, a variation change, etc.
+3. The query builder turns those decisions into a concrete query.
+4. The indexer client executes the query and returns results.
+5. The coordinator ranks and filters the results and decides whether to run another iteration.

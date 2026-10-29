@@ -74,6 +74,8 @@ noscript {
 	--accent-color: #ebc700;
 	--success-color: #54db68;
 	--error-color: #db5461;
+	--warning-color: #ffa500;
+	--info-color: #5d9cec;
 
 	--header-background-color: var(--accent-color);
 	--header-color: var(--dark-color);
@@ -294,6 +296,21 @@ nav svg {
 	font-size: .8rem;
 }
 
+#system-issues-badge {
+	display: inline-flex;
+	justify-content: center;
+	align-items: center;
+	min-width: 1.2rem;
+	height: 1.2rem;
+	padding: 0 .3rem;
+	margin-left: .3rem;
+	border-radius: 2px;
+	background-color: var(--accent-color);
+	color: var(--nav-background-color);
+	font-size: .7rem;
+	font-weight: 700;
+}
+
 /*  */
 /* Main window */
 /*  */
@@ -448,9 +465,10 @@ main > *:not(.tool-bar-container) {
 	align-items: center;
 	gap: 1rem;
 
+	padding: 1.5rem;
 	color: var(--text-color);
 
-	font-size: 1.5rem;
+	font-size: clamp(1rem, 2vw, 1.25rem);
 	text-align: center;
 }
 

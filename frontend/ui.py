@@ -4,16 +4,26 @@ from io import BytesIO
 from json import dumps
 from typing import Any
 
-from flask import Blueprint, redirect, render_template, send_file
+from flask import Blueprint, redirect, render_template, request, send_file
 
 from backend.internals.server import Server
 
 ui = Blueprint('ui', __name__)
 methods = ['GET']
+ALLOWED_THEMES = ["", "dark-mode"]
 
 
 def render(filename: str, **kwargs: Any) -> str:
-    return render_template(filename, url_base=Server.url_base, **kwargs)
+    theme = ''
+    if "theme" in request.cookies and request.cookies["theme"] in ALLOWED_THEMES:
+        theme = request.cookies["theme"]
+
+    return render_template(
+        filename,
+        url_base=Server.url_base,
+        theme=theme,
+        **kwargs
+    )
 
 
 @ui.route('/manifest.json', methods=methods)
@@ -101,6 +111,11 @@ def ui_tasks():
     return render('tasks.html')
 
 
+@ui.route('/system/backups', methods=methods)
+def ui_backup():
+    return render('backups.html')
+
+
 @ui.route('/settings', methods=methods)
 def ui_settings():
     return redirect(f'{Server.url_base}/settings/mediamanagement')
@@ -109,6 +124,11 @@ def ui_settings():
 @ui.route('/settings/mediamanagement', methods=methods)
 def ui_mediamanagement():
     return render('settings_mediamanagement.html')
+
+
+@ui.route('/settings/indexers', methods=methods)
+def ui_indexers():
+    return render('settings_indexers.html')
 
 
 @ui.route('/settings/download', methods=methods)

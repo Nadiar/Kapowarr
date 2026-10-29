@@ -69,12 +69,6 @@
 				"Update All"
 			) }}
 			{{ icon_button(
-				"searchall-button",
-				"Trigger a 'search monitored' for all volumes",
-				"search.svg",
-				"Search All"
-			) }}
-			{{ icon_button(
 				"massedit-button",
 				"Start mass-editing the volumes",
 				"edit.svg",
@@ -103,7 +97,7 @@
 		</div>
 	</section>
 	<div id="loading-library" class="loading-screen">
-		<h2>Loading...</h2>
+		<h2 data-loading-line>Loading...</h2>
 		<p id="massedit-progress"></p>
 		<noscript>
 			WARNING: This web-UI does not work without JavaScript.

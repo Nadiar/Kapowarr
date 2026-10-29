@@ -3,20 +3,25 @@
 from asyncio import run
 from datetime import datetime
 from io import BytesIO
-from typing import Any, Dict, List, Tuple, Type, Union
+from os import remove
+from os.path import basename, splitext
+from typing import Any, Dict, List, Tuple, Union
 
-from flask import Blueprint, request, send_file
+from flask import Blueprint, after_this_request, request, send_file
 
-from backend.base.custom_exceptions import (InvalidKeyValue,
+from backend.base.custom_exceptions import (InvalidDatabaseFile,
+                                            InvalidKeyValue,
                                             InvalidNotificationSettings,
-                                            KeyNotFound, NotificationNotFound,
-                                            TaskNotFound)
+                                            KeyNotFound, NotificationNotFound)
 from backend.base.definitions import (BlocklistReason, BlocklistReasonID,
                                       CredentialData, CredentialSource,
-                                      DownloadSource, FileMatch,
-                                      KapowarrException, LibraryFilter,
-                                      LibrarySorting, MonitorScheme,
-                                      SpecialVersion, StartType, VolumeData)
+                                      DownloadService, DownloadType, FileMatch,
+                                      IndexerClientField,
+                                      InvalidDatabaseReason, KapowarrException,
+                                      LibraryFilter, LibrarySorting,
+                                      MonitorScheme, SpecialVersion, StartType,
+                                      StatusType, VolumeData)
+from backend.base.files import folder_path
 from backend.base.helpers import hash_credential
 from backend.base.logging import LOGGER, get_log_file_contents
 from backend.features.calendar import get_calendar, get_publisher_presets
@@ -25,13 +30,12 @@ from backend.features.download_queue import (DownloadHandler,
                                              get_download_history)
 from backend.features.library_import import (import_library,
                                              propose_library_import)
-from backend.features.mass_edit import run_mass_editor_action
+from backend.features.mass_edit import MassEditorActionManager
 from backend.features.notifications import (NotificationService,
                                             provider_registry)
-from backend.features.search import manual_search
-from backend.features.tasks import (Task, TaskHandler,
-                                    delete_task_history, get_task_history,
-                                    get_task_planning, task_library)
+from backend.features.search_full import manual_search
+from backend.features.tasks import (TaskHandler, delete_task_history,
+                                    get_task_history)
 from backend.implementations.blocklist import (add_to_blocklist,
                                                delete_blocklist,
                                                delete_blocklist_entry,
@@ -41,18 +45,23 @@ from backend.implementations.comicvine import ComicVine
 from backend.implementations.conversion import preview_mass_convert
 from backend.implementations.converters import ConvertersManager
 from backend.implementations.credentials import Credentials
-from backend.implementations.external_clients import ExternalClients
+from backend.implementations.external_client_manager import ExternalClients
 from backend.implementations.file_matching import (get_file_matching,
                                                    set_file_matching)
+from backend.implementations.indexer_client_manager import IndexerClients
 from backend.implementations.naming import (generate_volume_folder_name,
                                             preview_mass_rename)
 from backend.implementations.remote_mapping import RemoteMappings
 from backend.implementations.root_folders import RootFolders
 from backend.implementations.volumes import Library, delete_issue_file
+from backend.internals.db_backup_import import (create_database_copy,
+                                                get_backup, get_backups,
+                                                import_db, import_db_backup)
 from backend.internals.db_models import FilesDB
 from backend.internals.db_models_notifications import NotificationConnection
 from backend.internals.server import Server, StartTypeHandlers
 from backend.internals.settings import Settings, get_about_data
+from backend.internals.status import StatusHandlers
 
 api = Blueprint('api', __name__)
 
@@ -110,12 +119,6 @@ def extract_key(request, key: str, check_existence: bool = True) -> Any:
                     Library.get_issue(value)
             except (ValueError, TypeError):
                 raise InvalidKeyValue(key, value)
-
-        elif key == 'cmd':
-            task = task_library.get(value)
-            if task is None:
-                raise TaskNotFound(value)
-            value = task
 
         elif key == 'api_key':
             if not value or value != Settings().sv.api_key:
@@ -189,11 +192,8 @@ def extract_key(request, key: str, check_existence: bool = True) -> Any:
 
     return value
 
-# =====================
-# Authentication function and endpoints
-# =====================
 
-
+# region Authentication
 def auth(method):
     """Used as decorator and, if applied to route, restricts the route to authorized users only
     """
@@ -212,6 +212,7 @@ def auth(method):
             return return_api({}, 'ApiKeyInvalid', 401)
 
         StartTypeHandlers.diffuse_timer(StartType.RESTART_HOSTING_CHANGES)
+        StartTypeHandlers.diffuse_timer(StartType.RESTART_DB_CHANGES)
 
         result = method(*args, **kwargs)
 
@@ -282,14 +283,30 @@ def api_public():
     return return_api(result)
 
 
-# =====================
-# Tasks
-# =====================
+# region System
 @api.route('/system/about', methods=['GET'])
 @error_handler
 @auth
 def api_about():
     return return_api(get_about_data())
+
+
+@api.route('/system/status', methods=['GET', 'DELETE'])
+@error_handler
+@auth
+def api_status_checks():
+    if request.method == 'GET':
+        return return_api(StatusHandlers().get_all())
+
+    elif request.method == 'DELETE':
+        status_type = extract_key(
+            request, 'type', check_existence=False
+        )
+        if status_type:
+            StatusHandlers().clear(StatusType(status_type))
+        else:
+            StatusHandlers().clear_all()
+        return return_api({})
 
 
 @api.route('/system/logs', methods=['GET'])
@@ -320,12 +337,10 @@ def api_tasks():
         if not isinstance(data, dict):
             raise InvalidKeyValue(value=data)
 
-        task: Union[Type[Task], None] = task_library.get(data.get('cmd', ''))
-        if not task:
-            raise TaskNotFound(data.get('cmd', ''))
+        TaskClass = TaskHandler.get_task_class(data.get('cmd', ''))
 
         kwargs = {}
-        if task.action in (
+        if TaskClass.action in (
             'refresh_and_scan',
             'auto_search', 'auto_search_issue',
             'mass_rename', 'mass_rename_issue',
@@ -336,7 +351,7 @@ def api_tasks():
                 raise InvalidKeyValue('volume_id', volume_id)
             kwargs['volume_id'] = volume_id
 
-        if task.action in (
+        if TaskClass.action in (
             'auto_search_issue',
             'mass_rename_issue',
             'mass_convert_issue'
@@ -346,7 +361,7 @@ def api_tasks():
                 raise InvalidKeyValue('issue_id', issue_id)
             kwargs['issue_id'] = issue_id
 
-        if task.action in (
+        if TaskClass.action in (
             'mass_rename', 'mass_rename_issue',
             'mass_convert', 'mass_convert_issue'
         ):
@@ -358,7 +373,13 @@ def api_tasks():
                 raise InvalidKeyValue('filepath_filter', filepath_filter)
             kwargs['filepath_filter'] = filepath_filter or []
 
-        task_instance = task(**kwargs)
+        if TaskClass.action == 'update_all':
+            allow_skipping = data.get('allow_skipping', True)
+            if not isinstance(allow_skipping, bool):
+                raise InvalidKeyValue('allow_skipping', allow_skipping)
+            kwargs['allow_skipping'] = allow_skipping
+
+        task_instance = TaskClass(**kwargs)
         result = task_handler.add(task_instance)
         return return_api({'id': result}, code=201)
 
@@ -377,12 +398,33 @@ def api_task_history():
         return return_api({})
 
 
-@api.route('/system/tasks/planning', methods=['GET'])
+@api.route('/system/tasks/planning', methods=['GET', 'PUT'])
 @error_handler
 @auth
 def api_task_planning():
-    result = get_task_planning()
-    return return_api(result)
+    th = TaskHandler()
+
+    if request.method == 'GET':
+        result = th.get_task_planning()
+        return return_api(result)
+
+    elif request.method == 'PUT':
+        data = request.get_json()
+        if not isinstance(data, dict):
+            raise InvalidKeyValue(value=data)
+        if 'task_name' not in data:
+            raise KeyNotFound('task_name')
+        if 'schedule' not in data:
+            raise KeyNotFound('schedule')
+        if not isinstance(data['task_name'], str):
+            raise InvalidKeyValue('task_name', data['task_name'])
+        if not isinstance(data['schedule'], str):
+            raise InvalidKeyValue('schedule', data['schedule'])
+
+        th.update_task_schedule(data["task_name"], data["schedule"])
+
+        result = th.get_task_planning()
+        return return_api(result)
 
 
 @api.route('/system/tasks/<int:task_id>', methods=['GET', 'DELETE'])
@@ -415,11 +457,94 @@ def api_restart():
     Server().restart()
     return return_api({})
 
-# =====================
-# Settings
-# =====================
+
+# region Database Backup
+@api.route('/system/database', methods=['GET', 'POST'])
+@error_handler
+@auth
+def api_database():
+    if request.method == "GET":
+        filepath = create_database_copy(folder_path('db'))
+
+        @after_this_request
+        def remove_file(response):
+            remove(filepath)
+            return response
+
+        return send_file(
+            filepath,
+            mimetype="application/x-sqlite3",
+            download_name=basename(filepath)
+        ), 200
+
+    elif request.method == "POST":
+        if "file" not in request.files:
+            raise KeyNotFound("file")
+
+        db_file = request.files["file"]
+        if not (db_file.filename and splitext(db_file.filename)[1] == ".db"):
+            raise InvalidDatabaseFile(
+                db_file.filename or '',
+                InvalidDatabaseReason.NOT_KAPOWARR_DB
+            )
+
+        if "copy_hosting_settings" not in request.form:
+            raise KeyNotFound("copy_hosting_settings")
+
+        if not request.form["copy_hosting_settings"] in ("true", "false"):
+            raise InvalidKeyValue(
+                "copy_hosting_settings",
+                request.form["copy_hosting_settings"]
+            )
+
+        copy_hosting_settings = request.form["copy_hosting_settings"] == "true"
+
+        save_path = folder_path("db", "Kapowarr_upload.db")
+        db_file.save(save_path)
+
+        import_db(save_path, copy_hosting_settings)
+        return return_api({})
 
 
+@api.route('/system/database/backups', methods=['GET'])
+@error_handler
+@auth
+def api_backups():
+    return return_api(get_backups())
+
+
+@api.route('/system/database/backups/<int:b_idx>', methods=['GET', 'POST'])
+@error_handler
+@auth
+def api_backup(b_idx: int):
+    if request.method == "GET":
+        filepath = get_backup(b_idx)['filepath']
+        return send_file(
+            filepath,
+            mimetype="application/x-sqlite3",
+            download_name=basename(filepath)
+        ), 200
+
+    elif request.method == "POST":
+        data = request.get_json()
+
+        if not isinstance(data, dict):
+            raise InvalidKeyValue(value=data)
+
+        if 'copy_hosting_settings' not in data:
+            raise KeyNotFound("copy_hosting_settings")
+
+        if not isinstance(data["copy_hosting_settings"], bool):
+            raise InvalidKeyValue(
+                "copy_hosting_settings",
+                data["copy_hosting_settings"]
+            )
+
+        import_db_backup(b_idx, data['copy_hosting_settings'])
+        return return_api({})
+
+
+# region Settings
 @api.route('/settings', methods=['GET', 'PUT', 'DELETE'])
 @error_handler
 @auth
@@ -659,9 +784,110 @@ def api_remote_mapping(id: int):
         return return_api({})
 
 
-# =====================
-# Library Import
-# =====================
+# region Indexers
+@api.route('/indexers', methods=['GET', 'POST'])
+@error_handler
+@auth
+def api_indexers():
+    if request.method == 'GET':
+        result = IndexerClients.get_all_data()
+        return return_api(result)
+
+    elif request.method == 'POST':
+        data: dict = request.get_json()
+        data = {
+            k: data.get(k)
+            for k in (
+                'download_type', 'client_type',
+                *IndexerClientField._value2member_map_
+            )
+        }
+
+        if not isinstance(data["download_type"], int):
+            raise InvalidKeyValue("download_type", data["download_type"])
+        try:
+            data["download_type"] = DownloadType(data["download_type"])
+        except ValueError:
+            raise InvalidKeyValue("download_type", data["download_type"])
+
+        result = IndexerClients.add(**data).get_indexer_data()
+        return return_api(result, code=201)
+
+
+@api.route('/indexers/options', methods=['GET'])
+@error_handler
+@auth
+def api_indexers_options():
+    result = {
+        dt.value: {
+            ct: {
+                "required_tokens": [rt.value for rt in client.required_tokens],
+                "allow_multiple_instances": client.allow_multiple_instances
+            }
+            for ct, client in v.items()
+        }
+        for dt, v in IndexerClients.clients.items()
+    }
+    return return_api(result)
+
+
+@api.route('/indexers/test', methods=['POST'])
+@error_handler
+@auth
+def api_indexers_test():
+    data: dict = request.get_json()
+    data = {
+        k: data[k]
+        for k in (
+            'download_type', 'client_type',
+            *IndexerClientField._value2member_map_
+        )
+        if k in data
+    }
+
+    if 'download_type' not in data:
+        raise KeyNotFound('download_type')
+    if 'client_type' not in data:
+        raise KeyNotFound('client_type')
+    if 'url' not in data:
+        raise KeyNotFound('url')
+
+    if not isinstance(data["download_type"], int):
+        raise InvalidKeyValue("download_type", data["download_type"])
+    try:
+        data["download_type"] = DownloadType(data["download_type"])
+    except ValueError:
+        raise InvalidKeyValue("download_type", data["download_type"])
+
+    result = IndexerClients.test(**data)
+    return return_api(result)
+
+
+@api.route('/indexers/<int:id>', methods=['GET', 'PUT', 'DELETE'])
+@error_handler
+@auth
+def api_indexer(id: int):
+    if request.method == 'GET':
+        client = IndexerClients.get_client(id)
+        result = client.get_indexer_data()
+        return return_api(result)
+
+    elif request.method == 'PUT':
+        client = IndexerClients.get_client(id)
+        data: dict = request.get_json()
+        data = {
+            k: data.get(k)
+            for k in IndexerClientField._value2member_map_
+        }
+        client.update_indexer(data)
+        return return_api(client.get_indexer_data())
+
+    elif request.method == 'DELETE':
+        IndexerClients.get_client(id).delete_indexer()
+        return return_api({})
+
+
+# region Library Import
 @api.route('/libraryimport', methods=['GET', 'POST'])
 @error_handler
 @auth
@@ -711,11 +937,8 @@ def api_library_import():
         import_library(data, rename_files)
         return return_api({}, code=201)
 
-# =====================
-# Library + Volumes
-# =====================
 
-
+# region Library + Volumes
 @api.route('/volumes/search', methods=['GET', 'POST'])
 @error_handler
 @auth
@@ -927,9 +1150,7 @@ def api_issues(id: int):
         return return_api(result)
 
 
-# =====================
-# Manual File Match
-# =====================
+# region Manual File Match
 @api.route('/volumes/<int:id>/manualmatch', methods=['GET', 'PUT'])
 @error_handler
 @auth
@@ -968,9 +1189,7 @@ def api_manual_match(id: int):
         return return_api({})
 
 
-# =====================
-# Renaming
-# =====================
+# region Renaming
 @api.route('/volumes/<int:id>/rename', methods=['GET'])
 @error_handler
 @auth
@@ -998,11 +1217,8 @@ def api_rename_issue(id: int):
     }
     return return_api(only_renamings)
 
-# =====================
-# File Conversion
-# =====================
 
-
+# region File Conversion
 @api.route('/volumes/<int:id>/convert', methods=['GET'])
 @error_handler
 @auth
@@ -1020,11 +1236,8 @@ def api_convert_issue(id: int):
     result = preview_mass_convert(volume_id, id)
     return return_api(result)
 
-# =====================
-# Manual search + Download
-# =====================
 
-
+# region Search + Download
 @api.route('/volumes/<int:id>/manualsearch', methods=['GET'])
 @error_handler
 @auth
@@ -1039,16 +1252,43 @@ def api_volume_manual_search(id: int):
 @auth
 def api_volume_download(id: int):
     Library.get_volume(id)
-    link: str = extract_key(request, 'link')
-    force_match: bool = extract_key(request, 'force_match')
-    result = run(DownloadHandler().add(link, id, force_match=force_match))
-    return return_api(
-        {
-            'result': (result or (None,))[0],
-            'fail_reason': result[1].value if result[1] else result[1]
-        },
-        code=201
+    data = request.get_json()
+
+    if not isinstance(data, dict):
+        raise InvalidKeyValue("body", data)
+
+    if "link" not in data:
+        raise KeyNotFound("link")
+    if not isinstance(data["link"], str):
+        raise InvalidKeyValue("link", data["link"])
+
+    if "force_match" not in data:
+        raise KeyNotFound("force_match")
+    if not isinstance(data["force_match"], bool):
+        raise InvalidKeyValue("force_match", data["force_match"])
+
+    if "indexer_id" not in data:
+        raise KeyNotFound("indexer_id")
+    if not isinstance(data["indexer_id"], int):
+        raise InvalidKeyValue("indexer_id", data["indexer_id"])
+
+    if "title_data" not in data:
+        raise KeyNotFound("title_data")
+    if not isinstance(data["title_data"], dict):
+        raise InvalidKeyValue("title_data", data["title_data"])
+    title_data = data["title_data"]
+    if isinstance(title_data["issue_number"], list):
+        title_data["issue_number"] = tuple(title_data["issue_number"])
+
+    result = DownloadHandler().add(
+        data["link"],
+        indexer_id=data["indexer_id"],
+        title_data=title_data, # type: ignore
+        volume_id=id,
+        issue_id=None,
+        force_match=data["force_match"]
     )
+    return return_api(result, code=201)
 
 
 @api.route('/issues/<int:id>/manualsearch', methods=['GET'])
@@ -1068,18 +1308,43 @@ def api_issue_manual_search(id: int):
 @auth
 def api_issue_download(id: int):
     volume_id = Library.get_issue(id).get_data().volume_id
-    link = extract_key(request, 'link')
-    force_match: bool = extract_key(request, 'force_match')
-    result = run(DownloadHandler().add(
-        link, volume_id, id, force_match=force_match
-    ))
-    return return_api(
-        {
-            'result': result[0],
-            'fail_reason': result[1].value if result[1] else result[1]
-        },
-        code=201
+    data = request.get_json()
+
+    if not isinstance(data, dict):
+        raise InvalidKeyValue("body", data)
+
+    if "link" not in data:
+        raise KeyNotFound("link")
+    if not isinstance(data["link"], str):
+        raise InvalidKeyValue("link", data["link"])
+
+    if "force_match" not in data:
+        raise KeyNotFound("force_match")
+    if not isinstance(data["force_match"], bool):
+        raise InvalidKeyValue("force_match", data["force_match"])
+
+    if "indexer_id" not in data:
+        raise KeyNotFound("indexer_id")
+    if not isinstance(data["indexer_id"], int):
+        raise InvalidKeyValue("indexer_id", data["indexer_id"])
+
+    if "title_data" not in data:
+        raise KeyNotFound("title_data")
+    if not isinstance(data["title_data"], dict):
+        raise InvalidKeyValue("title_data", data["title_data"])
+    title_data = data["title_data"]
+    if isinstance(title_data["issue_number"], list):
+        title_data["issue_number"] = tuple(title_data["issue_number"])
+
+    result = DownloadHandler().add(
+        data["link"],
+        indexer_id=data["indexer_id"],
+        title_data=title_data, # type: ignore
+        volume_id=volume_id,
+        issue_id=id,
+        force_match=data["force_match"]
     )
+    return return_api(result, code=201)
 
 
 @api.route('/activity/queue', methods=['GET', 'DELETE'])
@@ -1151,11 +1416,8 @@ def api_empty_download_folder():
     DownloadHandler().empty_download_folder()
     return return_api({})
 
-# =====================
-# Blocklist
-# =====================
 
-
+# region Blocklist
 @api.route('/blocklist', methods=['GET', 'POST', 'DELETE'])
 @error_handler
 @auth
@@ -1203,21 +1465,23 @@ def api_blocklist():
         ):
             raise InvalidKeyValue('download_link', download_link)
 
-        source = data.get('source')
+        download_service = data.get('download_service')
         if not (
-            source is None
-            or source
-                and isinstance(source, str)
+            download_service is None
+            or download_service
+                and isinstance(download_service, str)
         ):
-            raise InvalidKeyValue('source', source)
+            raise InvalidKeyValue('download_service', download_service)
 
-        if not data.get('source'):
-            source = None
+        if not data.get('download_service'):
+            download_service = None
         else:
             try:
-                source = DownloadSource(data['source'])
+                download_service = DownloadService(data['download_service'])
             except ValueError:
-                raise InvalidKeyValue('source', data['source'])
+                raise InvalidKeyValue(
+                    'download_service', data['download_service']
+                )
 
         volume_id = data.get('volume_id')
         if not (volume_id and isinstance(volume_id, int)):
@@ -1244,7 +1508,7 @@ def api_blocklist():
             web_title=web_title,
             web_sub_title=web_sub_title,
             download_link=download_link,
-            source=source,
+            download_service=download_service,
             volume_id=volume_id,
             issue_id=issue_id,
             reason=reason
@@ -1269,9 +1533,7 @@ def api_blocklist_entry(id: int):
         return return_api({})
 
 
-# =====================
-# Credentials
-# =====================
+# region Credentials
 @api.route('/credentials', methods=['GET', 'POST'])
 @error_handler
 @auth
@@ -1326,9 +1588,7 @@ def api_credential(id: int):
         return return_api({})
 
 
-# =====================
-# Torrent Clients
-# =====================
+# region External Clients
 @api.route('/externalclients', methods=['GET', 'POST'])
 @error_handler
 @auth
@@ -1342,11 +1602,20 @@ def api_external_clients():
         data = {
             k: data.get(k)
             for k in (
-                'client_type',
-                'title', 'base_url',
+                'download_type', 'client_type',
+                'title', 'enabled',
+                'base_url',
                 'username', 'password', 'api_token'
             )
         }
+
+        if not isinstance(data["download_type"], int):
+            raise InvalidKeyValue("download_type", data["download_type"])
+        try:
+            data["download_type"] = DownloadType(data["download_type"])
+        except ValueError:
+            raise InvalidKeyValue("download_type", data["download_type"])
+
         result = ExternalClients.add(**data).get_client_data()
         return return_api(result, code=201)
 
@@ -1356,8 +1625,11 @@ def api_external_clients():
 @auth
 def api_external_clients_keys():
     result = {
-        k: v.required_tokens
-        for k, v in ExternalClients.get_client_types().items()
+        dt.value: {
+            ct: [rt.value for rt in client.required_tokens]
+            for ct, client in v.items()
+        }
+        for dt, v in ExternalClients.clients.items()
     }
     return return_api(result)
 
@@ -1370,10 +1642,18 @@ def api_external_clients_test():
     data = {
         k: data.get(k)
         for k in (
-            'client_type', 'base_url',
+            'download_type', 'client_type', 'base_url',
             'username', 'password', 'api_token'
         )
     }
+
+    if not isinstance(data["download_type"], int):
+        raise InvalidKeyValue("download_type", data["download_type"])
+    try:
+        data["download_type"] = DownloadType(data["download_type"])
+    except ValueError:
+        raise InvalidKeyValue("download_type", data["download_type"])
+
     result = ExternalClients.test(**data)
     return return_api(result)
 
@@ -1382,18 +1662,18 @@ def api_external_clients_test():
 @error_handler
 @auth
 def api_external_client(id: int):
-    client = ExternalClients.get_client(id)
-
     if request.method == 'GET':
+        client = ExternalClients.get_client(id)
         result = client.get_client_data()
         return return_api(result)
 
     elif request.method == 'PUT':
+        client = ExternalClients.get_client(id)
         data: dict = request.get_json()
         data = {
             k: data.get(k)
             for k in (
-                'title', 'base_url',
+                'title', 'enabled', 'base_url',
                 'username', 'password', 'api_token'
             )
         }
@@ -1401,13 +1681,11 @@ def api_external_client(id: int):
         return return_api(client.get_client_data())
 
     elif request.method == 'DELETE':
-        client.delete_client()
+        ExternalClients.delete_client(id)
         return return_api({})
 
 
-# =====================
-# Mass Editor
-# =====================
+# region Mass Editor
 @api.route('/masseditor', methods=['POST'])
 @error_handler
 @auth
@@ -1433,13 +1711,13 @@ def api_mass_editor():
     if not isinstance(args, dict):
         raise InvalidKeyValue('args', args)
 
-    run_mass_editor_action(action, volume_ids, **args)
+    MassEditorActionManager.run_action(
+        action, volume_ids, **args
+    )
     return return_api({})
 
 
-# =====================
-# Files
-# =====================
+# region Files
 @api.route('/files/<int:f_id>', methods=['GET', 'DELETE'])
 @error_handler
 @auth

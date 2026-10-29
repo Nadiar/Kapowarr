@@ -9,15 +9,16 @@ from json import JSONDecodeError
 from re import IGNORECASE, compile
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Sequence, Union
 
-from aiohttp import ContentTypeError
 from aiohttp.client_exceptions import ClientError
 from bs4 import BeautifulSoup, Tag
 
-from backend.base.custom_exceptions import (CVRateLimitReached,
-                                            InvalidComicVineApiKey,
-                                            VolumeNotMatched)
-from backend.base.definitions import (Constants, FilenameData,
-                                      IssueMetadata, T, VolumeMetadata)
+from backend.base.custom_exceptions import (CredentialInvalid,
+                                            MetadataSourceDataEntryNotFound,
+                                            MetadataSourceNotWorking,
+                                            MetadataSourceRateLimitReached)
+from backend.base.definitions import (BrokenMetadataSourceReason, Constants,
+                                      FilenameData, IssueMetadata,
+                                      StatusType, T, VolumeMetadata)
 from backend.base.file_extraction import (extract_issue_number,
                                           extract_volume_number, volume_regex)
 from backend.base.helpers import (AsyncSession, Session, batched,
@@ -28,7 +29,11 @@ from backend.base.logging import LOGGER
 from backend.implementations.matching import select_best_volume_result_for_file
 from backend.internals.db import get_db
 from backend.internals.settings import Settings
+from backend.internals.status import StatusHandlers
 
+# autopep8: off
+preceding_volume_regex = compile(r'preceded by (?:<a[^>]*>)?(.*?)' + volume_regex.pattern, IGNORECASE)
+continuing_volume_regex = compile(r'continued in (?:<a[^>]*>)?(.*?)' + volume_regex.pattern, IGNORECASE)
 translation_regex = compile(
     r'^<p>\s*\w+(?<!English) publication(\.?</p>$|,\s| \(in the \w+(?<!English) language\)|, translates )|' +
     r'^<p>\s*published by the \w+(?<!English) wing of|' +
@@ -44,6 +49,7 @@ translation_regex = compile(
     IGNORECASE)
 headers = {'h2', 'h3', 'h4', 'h5', 'h6'}
 lists = {'ul', 'ol'}
+# autopep8: on
 
 
 def _clean_description(description: str, short: bool = False) -> str:
@@ -177,7 +183,7 @@ class ComicVine:
                 Defaults to None.
 
         Raises:
-            InvalidComicVineApiKey: No ComicVine API key is set in the settings
+            CredentialInvalid: No ComicVine API key is set in the settings
                 and no key is given.
         """
         settings = Settings().get_settings()
@@ -185,7 +191,7 @@ class ComicVine:
         self.date_type = settings.date_type.value
         api_key = comicvine_api_key or settings.comicvine_api_key
         if not api_key:
-            raise InvalidComicVineApiKey
+            raise CredentialInvalid
 
         self.api_url = settings.comicvine_api_url or Constants.CV_API_URL
 
@@ -206,23 +212,23 @@ class ComicVine:
         Args:
             session (AsyncSession): The session to make the request with.
 
-            url_path (str): The API endpoint to make the call to.
-                For example: '/volumes'.
+            url_path (str): The API endpoint to make the call to. E.g. '/volumes'.
 
             params (Dict[str, Any], optional): The URL parameters that should go
                 with the request. The standard parameters (api_key and format)
                 are already included.
                 Defaults to {}.
 
-            default (Union[T, None], optional): Return given value in case of
-                exception, instead of raising exception.
+            default (Union[T, None], optional): Value to return if rate limit is
+                reached, instead of raising exception.
                 Defaults to None.
 
         Raises:
-            CVRateLimitReached: The rate limit for this endpoint has been
-                reached, and no `default` was supplied.
-            InvalidComicVineApiKey: The API key is not valid.
-            VolumeNotMatched: The ID doesn't map to any volume.
+            CredentialInvalid: The API key is not valid.
+            MetadataSourceRateLimitReached: The rate limit is reached, and no
+                `default` is supplied.
+            MetadataSourceDataEntryNotFound: The ID doesn't map to any volume.
+            MetadataSourceNotWorking: Something went wrong contacting CV.
 
         Returns:
             Union[Dict[str, Any], T]: The raw API response or the value of
@@ -235,21 +241,80 @@ class ComicVine:
                 self.api_url + url_path,
                 params={**self._params, **params}
             )
+
+        except ClientError:
+            raise MetadataSourceNotWorking(
+                BrokenMetadataSourceReason.CONNECTION_ERROR
+            )
+
+        try:
             result: Dict[str, Any] = await response.json()
 
-            if result['status_code'] == 107:
-                raise ClientError
-            elif result['status_code'] == 101:
-                raise VolumeNotMatched
-            elif result['status_code'] == 100:
-                raise InvalidComicVineApiKey
+        except JSONDecodeError:
+            if "API Key Blocked" in await response.text():
+                raise MetadataSourceNotWorking(
+                    BrokenMetadataSourceReason.ACCESS_DENIED
+                )
+            else:
+                raise MetadataSourceNotWorking(
+                    BrokenMetadataSourceReason.FAILED_PROCESSING_RESPONSE
+                )
 
-            return result
+        if result['status_code'] == 100:
+            raise CredentialInvalid
 
-        except (ClientError, ContentTypeError, JSONDecodeError):
+        elif result['status_code'] == 101:
+            raise MetadataSourceDataEntryNotFound
+
+        elif result['status_code'] == 107:
             if default is not None:
                 return default
-            raise CVRateLimitReached
+            raise MetadataSourceRateLimitReached
+
+        return result
+
+    def __determine_volume_number(self, volume_data: Dict[str, Any]) -> int:
+        title = normalise_string(volume_data['name'] or '')
+
+        volume_number = None
+        volume_result = volume_regex.search(volume_data['deck'] or '')
+        if volume_result:
+            volume_number = force_range(extract_volume_number(
+                volume_result.group(1)
+            ))[0]
+
+        if volume_number is None:
+            prec_volume_result = preceding_volume_regex.search(
+                volume_data['description'] or ''
+            )
+            if prec_volume_result and (
+                not prec_volume_result.group(1)
+                or normalise_string(prec_volume_result.group(1)) == title
+            ):
+                volume_number = force_range(extract_volume_number(
+                    prec_volume_result.group(2)
+                ))[0]
+                if volume_number is not None:
+                    volume_number += 1
+
+        if volume_number is None:
+            continuing_volume_result = continuing_volume_regex.search(
+                volume_data['description'] or ''
+            )
+            if continuing_volume_result and (
+                not continuing_volume_result.group(1)
+                or normalise_string(continuing_volume_result.group(1)) == title
+            ):
+                volume_number = force_range(extract_volume_number(
+                    continuing_volume_result.group(2)
+                ))[0]
+                if volume_number is not None:
+                    volume_number -= 1
+
+        if volume_number is None:
+            volume_number = 1
+
+        return volume_number
 
     def __format_volume_output(
         self,
@@ -263,18 +328,8 @@ class ComicVine:
         Returns:
             VolumeMetadata: The formatted data.
         """
-        # Determine volume number
-        volume_result = volume_regex.search(volume_data['deck'] or '')
-        if volume_result:
-            volume_number = force_range(extract_volume_number(
-                volume_result.group(1)
-            ))[0]
-            if volume_number is None:
-                volume_number = 1
-        else:
-            volume_number = 1
+        volume_number = self.__determine_volume_number(volume_data)
 
-        # Determine description
         description = _clean_description(volume_data['description'])
 
         # Determine translation value
@@ -411,29 +466,24 @@ class ComicVine:
             yield batch
         return
 
-    def test_key(self) -> bool:
+    def test_key(self) -> None:
         """Test if the API key works.
 
-        Returns:
-            bool: Whether the key works.
+        Raises:
+            CredentialInvalid: The API key is not valid.
+            MetadataSourceNotWorking: Something went wrong contacting CV.
         """
         async def _test_key():
-            try:
-                async with AsyncSession() as session:
-                    # Simply make a call to any endpoint to check. This endpoint
-                    # isn't used by Kapowarr so by using it now we don't
-                    # unnecessarily get closer to the rate limit of
-                    # important endpoints.
-                    await self.__call_api(
-                        session,
-                        '/publisher/4010-31',
-                        {'field_list': 'id'}
-                    )
-
-            except (CVRateLimitReached, InvalidComicVineApiKey):
-                return False
-
-            return True
+            async with AsyncSession() as session:
+                # Simply make a call to any endpoint to check. This endpoint
+                # isn't used by Kapowarr so by using it now we don't
+                # unnecessarily get closer to the rate limit of
+                # important endpoints.
+                await self.__call_api(
+                    session,
+                    '/publisher/4010-31',
+                    {'field_list': 'id'}
+                )
 
         return run(_test_key())
 
@@ -444,9 +494,12 @@ class ComicVine:
             cv_id (Union[str, int]): The CV ID of the volume.
 
         Raises:
-            VolumeNotMatched: The ID doesn't map to any volume.
-            CVRateLimitReached: The ComicVine rate limit is reached.
-            InvalidComicVineApiKey: The API key is not valid.
+            CredentialInvalid: The API key is not valid.
+            MetadataSourceRateLimitReached: The rate limit is reached.
+            MetadataSourceDataEntryNotFound: Couldn't convert string CV ID to
+                number.
+            MetadataSourceDataEntryNotFound: The ID doesn't map to any volume.
+            MetadataSourceNotWorking: Something went wrong contacting CV.
 
         Returns:
             VolumeMetadata: The metadata of the volume, including issues.
@@ -454,28 +507,34 @@ class ComicVine:
         try:
             cv_id = to_full_string_cv_id((cv_id,))[0]
         except ValueError:
-            raise VolumeNotMatched
+            raise MetadataSourceDataEntryNotFound
 
         LOGGER.debug(f'Fetching volume data for {cv_id}')
 
-        async with AsyncSession() as session:
-            result = await self.__call_api(
-                session,
-                f'/volume/{cv_id}',
-                {'field_list': self.volume_field_list}
-            )
+        try:
+            async with AsyncSession() as session:
+                result = await self.__call_api(
+                    session,
+                    f'/volume/{cv_id}',
+                    {'field_list': self.volume_field_list}
+                )
+                StatusHandlers().clear(StatusType.CV_RATE_LIMIT, "fetch_volume")
 
-            volume_info = self.__format_volume_output(result['results'])
-            volume_info['issues'] = await self.fetch_issues((cv_id,))
+                volume_info = self.__format_volume_output(result['results'])
+                volume_info['issues'] = await self.fetch_issues((cv_id,))
 
-            LOGGER.debug('Fetching volume data result: %s', volume_info)
+                LOGGER.debug('Fetching volume data result: %s', volume_info)
 
-            volume_info['cover'] = await session.get_content(
-                volume_info['cover_link'],
-                quiet_fail=True
-            ) or None
+                volume_info['cover'] = await session.get_content(
+                    volume_info['cover_link'],
+                    quiet_fail=True
+                ) or None
 
-            return volume_info
+                return volume_info
+
+        except MetadataSourceRateLimitReached:
+            StatusHandlers().report(StatusType.CV_RATE_LIMIT, "fetch_volume")
+            raise
 
     async def fetch_volumes(
         self,
@@ -487,18 +546,20 @@ class ComicVine:
             cv_ids (Sequence[Union[str, int]]): The CV IDs of the volumes.
 
         Raises:
-            VolumeNotMatched: An ID doesn't map to any volume.
-            InvalidComicVineApiKey: The API key is not valid.
+            CredentialInvalid: The API key is not valid.
+            MetadataSourceDataEntryNotFound: Couldn't convert string CV ID to
+                number.
+            MetadataSourceNotWorking: Something went wrong contacting CV.
 
         Returns:
             List[VolumeMetadata]: The metadata of the volumes, without issues.
                 The list of volumes could be incomplete if the rate limit was
-                reached.
+                reached or if an ID couldn't be found.
         """
         try:
             formatted_cv_ids = to_string_cv_id(cv_ids)
         except ValueError:
-            raise VolumeNotMatched
+            raise MetadataSourceDataEntryNotFound
 
         LOGGER.debug(f'Fetching volume data for {formatted_cv_ids}')
 
@@ -562,18 +623,20 @@ class ComicVine:
             cv_ids (Sequence[Union[str, int]]): The CV IDs of the volumes.
 
         Raises:
-            VolumeNotMatched: An ID doesn't map to any volume.
-            InvalidComicVineApiKey: The API key is not valid.
+            CredentialInvalid: The API key is not valid.
+            MetadataSourceDataEntryNotFound: Couldn't convert string CV ID to
+                number.
+            MetadataSourceNotWorking: Something went wrong contacting CV.
 
         Returns:
             List[IssueMetadata]: The metadata of all the issues inside the
                 volumes. The list of issues could be incomplete if the rate
-                limit was reached.
+                limit was reached or if an ID couldn't be found.
         """
         try:
             formatted_cv_ids = to_string_cv_id(cv_ids)
         except ValueError:
-            raise VolumeNotMatched
+            raise MetadataSourceDataEntryNotFound
 
         LOGGER.debug(f'Fetching issue data for volumes {formatted_cv_ids}')
 
@@ -590,8 +653,14 @@ class ComicVine:
                             'filter': f'volume:{batch_filter}'
                         }
                     )
+                    StatusHandlers().clear(
+                        StatusType.CV_RATE_LIMIT, "fetch_issues"
+                    )
 
-                except CVRateLimitReached:
+                except MetadataSourceRateLimitReached:
+                    StatusHandlers().report(
+                        StatusType.CV_RATE_LIMIT, "fetch_issues"
+                    )
                     break
 
                 issue_infos.extend((
@@ -754,8 +823,7 @@ class ComicVine:
                     'resources': 'volume',
                     'limit': 50,
                     'field_list': self.search_field_list
-                },
-                {'results': []}
+                }
             )
             return results['results']
 
@@ -769,12 +837,15 @@ class ComicVine:
         Args:
             query (str): The query to use when searching.
             allow_rate_limit_reached (bool, optional): Instead of a
-                CVRateLimitReached exception being thrown, return an empty list.
+                MetadataSourceRateLimitReached exception being thrown, return an
+                empty list.
                 Defaults to False.
 
         Raises:
-            CVRateLimitReached: The rate limit for this endpoint has been reached.
-            InvalidComicVineApiKey: The API key is not valid.
+            MetadataSourceRateLimitReached: The rate limit is reached, and
+                `allow_rate_limit_reached` is `False`.
+            CredentialInvalid: The API key is not valid.
+            MetadataSourceNotWorking: Something went wrong contacting CV.
 
         Returns:
             List[VolumeMetadata]: The search results.
@@ -786,11 +857,13 @@ class ComicVine:
                 results = await self.__search_volume(query)
             else:
                 results = await self.__search_query(query)
+            StatusHandlers().clear(StatusType.CV_RATE_LIMIT, "search_volumes")
 
-        except VolumeNotMatched:
+        except MetadataSourceDataEntryNotFound:
             return []
 
-        except CVRateLimitReached:
+        except MetadataSourceRateLimitReached:
+            StatusHandlers().report(StatusType.CV_RATE_LIMIT, "search_volumes")
             if allow_rate_limit_reached:
                 return []
             raise
@@ -812,6 +885,10 @@ class ComicVine:
                 Is a mapping from group number to a mapping of filename to
                 filename data for all files in that group.
             only_english (bool): Only match to english volumes.
+
+        Raises:
+            CredentialInvalid: The API key is not valid.
+            MetadataSourceNotWorking: Something went wrong contacting CV.
 
         Returns:
             Dict[int, Dict[str, Any]]: A mapping from the group number to its CV

@@ -31,9 +31,9 @@ WORKDIR /app
 # Install Runtime Dependencies
 RUN --mount=target=/var/lib/apt/lists,type=cache,sharing=private \
     --mount=target=/var/cache/apt,type=cache,sharing=private \
-    apt-get update \
-    && apt-get full-upgrade -y \
-    && apt-get autoremove -y
+    apt-get update && \
+    apt-get full-upgrade -y && \
+    apt-get autoremove -y
 COPY --from=tianon/gosu /gosu /usr/local/bin/
 
 # Install Compiled Wheels
@@ -42,9 +42,10 @@ RUN --mount=from=builder,source=/wheels,target=/wheels \
     pip3 install --no-index --find-links=/wheels -r /wheels/requirements.txt
 
 RUN groupadd -g 1000 kapowarr && \
-    useradd -u 1000 -g kapowarr -d /app -M -s /bin/bash kapowarr
-    
-COPY . .
+    useradd -u 1000 -g kapowarr -d /nonexistent -M -s /bin/bash kapowarr && \
+    mkdir -p /app/db /app/logs /app/temp_downloads
+
+COPY --chmod=755 . .
 
 ENV PUID=0 \
     PGID=0 \
@@ -53,4 +54,4 @@ ENV PUID=0 \
 EXPOSE 5656
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD [ "python3", "/app/Kapowarr.py" ]
+CMD ["python3", "/app/Kapowarr.py", "--LogFolder", "/app/logs"]

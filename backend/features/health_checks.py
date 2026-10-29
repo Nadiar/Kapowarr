@@ -29,12 +29,12 @@ def _check_comicvine_api() -> List[HealthCheckEvent]:
         # fetch_volumes with an empty query is the lightest CV call
         # that still validates the key. Use fetch_volume on a known-safe
         # resource instead — a simple /types call is not available, so
-        # we instantiate ComicVine (raises InvalidComicVineApiKey if key
+        # we instantiate ComicVine (raises CredentialInvalid if key
         # is blank) and then do a minimal network test.
-        ComicVine()  # raises InvalidComicVineApiKey if key is empty
+        ComicVine()  # raises CredentialInvalid if key is empty
     except Exception as exc:
-        from backend.base.custom_exceptions import InvalidComicVineApiKey
-        if isinstance(exc, InvalidComicVineApiKey):
+        from backend.base.custom_exceptions import CredentialInvalid
+        if isinstance(exc, CredentialInvalid):
             issues.append(HealthCheckEvent(
                 level='error',
                 message='ComicVine API key is not set or invalid.',

@@ -6,6 +6,7 @@ const StatEls = {
 	data_folder: document.querySelector('#data-folder'),
 	os: document.querySelector('#os'),
 	runs_64bit: document.querySelector('#runs-64bit'),
+	status: document.getElementById("status-body"),
 	buttons: {
 		copy: document.querySelector('#copy-about'),
 		restart: document.querySelector('#restart-button'),
@@ -26,11 +27,38 @@ const about_table = `
 
 `;
 
-// code run on load
+const statusDescs = {
+	cv_rate_limit: {
+		desc: 'ComicVine rate limit reached',
+		subTypeLabels: {
+			search_volumes: 'Searching volumes',
+			fetch_volume: 'Fetching volume metadata',
+			fetch_issues: 'Fetching issue metadata'
+		}
+	},
+	download_service_rate_limit: {
+		desc: 'Download service rate limit reached',
+		subTypeLabels: {
+			Mega: 'Mega',
+			Pixeldrain: 'Pixeldrain'
+		}
+	},
+	root_folder_almost_full: {
+		desc: 'Root folder is almost full',
+		subTypeLabels: {}
+	},
+	root_folder_full: {
+		desc: 'Root folder is full',
+		subTypeLabels: {}
+	},
+	cf_challenge_with_no_fs: {
+		desc: 'CloudFlare challenge encountered and FlareSolverr is not set up',
+		subTypeLabels: {}
+	}
+}
 
-usingApiKey()
-.then(api_key => {
-	fetchAPI('/system/about', api_key)
+function loadAbout(apiKey) {
+	fetchAPI('/system/about', apiKey)
 	.then(json => {
 		StatEls.version.innerText = json.result.version;
 		StatEls.python_version.innerText = json.result.python_version;
@@ -39,7 +67,7 @@ usingApiKey()
 		StatEls.data_folder.innerText = json.result.data_folder;
 		StatEls.os.innerText = json.result.os;
 		StatEls.runs_64bit.innerText = json.result.runs_64bit ? 'Yes' : 'No';
-		
+
 		StatEls.buttons.copy.onclick = e => {
 			copy(about_table
 				.replace('{k_version}', json.result.version)
@@ -52,6 +80,54 @@ usingApiKey()
 			);
 		};
 	});
+}
+
+function loadStatus(apiKey) {
+	fetchAPI('/system/status', apiKey)
+	.then(json => {
+		StatEls.status.querySelectorAll("tr:not(#status-clear-row)").forEach(
+			r => r.remove()
+		)
+
+		json.result.forEach(entry => {
+			const row = document.createElement("tr")
+			
+			const desc = document.createElement("td")
+			desc.innerText = statusDescs[entry.type].desc
+			if (entry.display_subtypes.length > 0) {
+				const subs = entry.display_subtypes
+					.map(s => statusDescs[entry.type].subTypeLabels[s] || s)
+					.join(', ')
+				desc.innerText += `: ${subs}`
+			}
+			row.appendChild(desc)
+			
+			const actions = document.createElement("td")
+			const clear = document.createElement("button")
+			clear.innerHTML = icons.clear
+			clear.title = "Clear"
+			clear.onclick = () => {
+				sendAPI("DELETE", "/system/status", apiKey, {
+					type: entry.type
+				})
+				.then(() => loadStatus(apiKey))
+			}
+			actions.appendChild(clear)
+			row.appendChild(actions)
+			
+			StatEls.status.appendChild(row)
+		})
+	})
+	.catch(e => console.log(e))
+}
+
+// code run on load
+
+usingApiKey()
+.then(api_key => {
+	loadStatus(api_key);
+	loadAbout(api_key);
+
 	StatEls.buttons.restart.onclick =
 		e => {
 			StatEls.buttons.restart.innerText = 'Restarting';

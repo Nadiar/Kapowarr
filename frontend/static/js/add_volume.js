@@ -11,6 +11,7 @@ const SearchEls = {
 	msgs: {
 		blocked: document.querySelector('#search-blocked'),
 		failed: document.querySelector('#search-failed'),
+		rate_limited: document.querySelector('#search-rate-limited'),
 		empty: document.querySelector('#search-empty'),
 		explain: document.querySelector('#search-explain'),
 		loading: document.querySelector('#search-loading')
@@ -214,6 +215,7 @@ function search(reset_url_params=true) {
 		SearchEls.msgs.empty,
 		SearchEls.msgs.explain,
 		SearchEls.msgs.failed,
+		SearchEls.msgs.rate_limited,
 		SearchEls.search_results
 	], [
 		SearchEls.msgs.loading
@@ -234,11 +236,19 @@ function search(reset_url_params=true) {
 			else
 				hide([SearchEls.msgs.loading], [SearchEls.search_results]);
 		})
-		.catch(e => {
-			if (e.status === 400)
+		.catch(async (e) => {
+			const j = await e.json();
+			if (
+				j.error === "CredentialInvalid"
+				|| j.error === "MetadataSourceNotWorking"
+			)
 				hide([SearchEls.msgs.loading], [SearchEls.msgs.failed]);
+
+			else if (j.error === "MetadataSourceRateLimitReached")
+				hide([SearchEls.msgs.loading], [SearchEls.msgs.rate_limited]);
+
 			else
-				console.log(e);
+				console.log(j);
 		});
 	});
 };
@@ -247,7 +257,8 @@ function clearSearch(e) {
 	hide([
 		SearchEls.search_results,
 		SearchEls.msgs.empty,
-		SearchEls.msgs.failed
+		SearchEls.msgs.failed,
+		SearchEls.msgs.rate_limited
 	], [
 		SearchEls.msgs.explain
 	]);
@@ -376,6 +387,9 @@ function fillRootFolderInput(api_key) {
 };
 
 function showAddWindow(comicvine_id, api_key) {
+	SearchEls.window.submit.innerText = 'Add Volume';
+	SearchEls.window.submit.style.color = '';
+
 	const volume_data = document.querySelector(
 		`button[data-comicvine_id="${comicvine_id}"]`
 	).dataset;
@@ -449,14 +463,28 @@ function addVolume() {
 			addAlreadyAdded(entry, json.result.id);
 			closeWindow();
 		})
-		.catch(e => {
-			if (e.status === 509) {
-				SearchEls.window.submit.innerText = 'ComicVine API rate limit reached';
+		.catch(async (e) => {
+			const j = await e.json();
+
+			if (j.error === "MetadataSourceRateLimitReached") {
+				SearchEls.window.submit.innerText = 'Metadata source API rate limit reached';
+				SearchEls.window.submit.style.color = 'var(--error-color)';
 				showWindow("add-window");
-			} else if (e.status === 400) {
-				SearchEls.window.submit.innerText = 'Volume folder is parent or child of other volume folder';
+			}
+
+			else if (j.error === "CredentialInvalid") {
+				SearchEls.window.submit.innerText = 'The API key of the metadata source is invalid';
+				SearchEls.window.submit.style.color = 'var(--error-color)';
 				showWindow("add-window");
-			} else
+			}
+			
+			else if (j.error === "MetadataSourceNotWorking") {
+				SearchEls.window.submit.innerText = 'Failed to contact the metadata source';
+				SearchEls.window.submit.style.color = 'var(--error-color)';
+				showWindow("add-window");
+			}
+
+			else
 				console.log(e);
 		});
 	});

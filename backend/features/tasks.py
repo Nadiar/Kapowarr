@@ -1,102 +1,607 @@
 # -*- coding: utf-8 -*-
 
-"""
-Background tasks and their handling
-"""
-
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from asyncio import run
 from datetime import date, timedelta
-from threading import Event, Thread, Timer
 from time import sleep, time
-from typing import Dict, List, Tuple, Type, Union
+from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Set, Tuple,
+                    Type, TypeVar, Union)
 
-from flask import Flask
-
-from backend.base.custom_exceptions import (InvalidComicVineApiKey,
-                                            TaskNotDeletable, TaskNotFound)
-from backend.base.definitions import BlocklistReasonID
-from backend.base.helpers import Singleton, get_subclasses
+from backend.base.custom_exceptions import (CredentialInvalid, InvalidKeyValue,
+                                            MetadataSourceNotWorking,
+                                            TaskNotFound)
+from backend.base.definitions import (BlocklistReasonID, FilenameData,
+                                      QueuedTaskData, SearchResultData, Task)
+from backend.base.helpers import Singleton, get_schedules_next_run
 from backend.base.logging import LOGGER
 from backend.features.download_queue import DownloadHandler
-from backend.features.search import auto_search
+from backend.features.search_discover import discover_downloads
+from backend.features.search_full import auto_search
 from backend.implementations.comicvine import ComicVine
 from backend.implementations.conversion import mass_convert
 from backend.implementations.file_matching import scan_files
 from backend.implementations.naming import mass_rename
-from backend.implementations.volumes import (Volume, delete_orphaned_issues,
+from backend.implementations.volumes import (Volume,
                                              determine_special_version,
                                              refresh_and_scan,
-                                             refresh_special_versions,
                                              update_volume_metadata,
                                              upsert_issues)
-from backend.internals.db import close_db, commit, get_db
-from backend.internals.server import (TaskAddedEvent, TaskEndedEvent,
+from backend.internals.db import commit, get_db
+from backend.internals.db_backup_import import backup_database
+from backend.internals.server import (Server, TaskAddedEvent, TaskEndedEvent,
                                       TaskStatusEvent, WebSocket)
 
+if TYPE_CHECKING:
+    from threading import Timer
 
-class Task(ABC):
-    stop: bool
-    message: str
-    action: str
-    display_title: str
-    category: str
-    priority: int = 10
 
-    @property
-    @abstractmethod
-    def volume_id(self) -> Union[int, None]:
-        ...
+# region Task Handler
+TASK_INTERVALS = {
+    # Note: If there are tasks that should be run at the same time,
+    #   but per se after each other, put them in that order in the dict.
+    'update_all': '0 * * * *', # every hour at minute 0
+    'backup_db': '0 0 * * 1', # every Monday at 00:00
+    'rss_sync': '0,30 * * * *', # every half hour
 
-    @property
-    @abstractmethod
-    def issue_id(self) -> Union[int, None]:
-        ...
+    # Fork tasks
+    'search_recent_fresh': '15 * * * *', # every hour at minute 15
+    'refresh_calendar': '0 1 * * *', # daily at 01:00
+    'sync_issues': '15 2 * * *', # daily at 02:15
+    'scan_files': '45 2 * * *', # daily at 02:45
+    'special_version_refresh': '15 3 * * *', # daily at 03:15
+    'refresh_metadata': '30 3 * * 0', # Sundays at 03:30
+    'search_all': '0 4 * * 0', # Sundays at 04:00
+    'search_recent_week': '0 5 * * *', # daily at 05:00
+    'search_recent_stale': '0 6 */3 * *', # every 3rd day at 06:00
+    'health_check': '0 7 * * *' # daily at 07:00
+}
 
-    @abstractmethod
-    def __init__(self, **kwargs) -> None:
-        ...
+LEGACY_TASK_NAMES = ('search_recent',)
+"Task names that may still be in the database from older versions"
 
-    def _ensure_yield_event(self) -> Event:
-        """Lazily initialise the yield event."""
-        if not hasattr(self, '_yield_event'):
-            self._yield_event = Event()
-            self._yield_event.set()
-        return self._yield_event
 
-    def check_yield(self) -> None:
-        """Call between units of work. Blocks if a higher-priority
-        task is waiting; resumes when it finishes."""
-        evt = self._ensure_yield_event()
-        evt.wait()
+TaskType = TypeVar(
+    "TaskType",
+    bound=Task
+)
 
-    @abstractmethod
-    def run(self) -> Union[None, List[Tuple[str, int, Union[int, None]]]]:
-        """Run the task
+
+class TaskHandler(metaclass=Singleton):
+    tasks: Dict[str, Type[Task]] = {}
+
+    queue: List[QueuedTaskData] = []
+    task_interval_waiter: Union[Timer, None] = None
+
+    @classmethod
+    def register_task(cls, identifier: str):
+        """Register a task.
+
+        ```
+        @TaskHandler.register_task("my_task")
+        class MyTask(Task):
+            ...
+        ```
+
+        Args:
+            identifier (str): The string identifier for the task.
+
+        Raises:
+            RuntimeError: A task for the given identifier is already registered.
+        """
+        def wrapper(action: Type[TaskType]) -> Type[TaskType]:
+            if identifier in cls.tasks:
+                raise RuntimeError(
+                    f"Task with {identifier=} registered multiple times"
+                )
+            action.action = identifier
+            cls.tasks[identifier] = action
+            return action
+        return wrapper
+
+    @classmethod
+    def get_task_class(cls, identifier: str) -> Type[Task]:
+        """Get a task implementation based on its identifier.
+
+        Args:
+            identifier (str): The identifer of the class.
+
+        Raises:
+            TaskNotFound: No task implementation found with the given identifier.
 
         Returns:
-            Union[None, List[Tuple[str, int, Union[int, None]]]]:
-            Either `None` if the task has no result or
-            `List[Tuple[str, int, Union[int, None]]]` if the task returns
-            search results.
+            Type[Task]: The task implementation.
         """
+        try:
+            return cls.tasks[identifier]
+        except KeyError:
+            raise TaskNotFound(identifier)
+
+    def __run_task(self, task: Task) -> None:
+        """Run a task.
+
+        Args:
+            task (Task): The task to run.
+        """
+        LOGGER.debug(f'Running task {task.display_title}')
+
+        start_time = round(time())
+        socket = WebSocket()
+        try:
+            results = task.run()
+            cursor = get_db()
+
+            # Note in history
+            cursor.execute(
+                """
+                INSERT INTO task_history(
+                    task_name, display_title, run_at, duration_seconds
+                ) VALUES (?, ?, ?, ?);
+                """,
+                (
+                    task.action, task.display_title,
+                    round(time()), round(time()) - start_time
+                )
+            )
+
+            if not task.stop:
+                if isinstance(task, DownloadTask) and results:
+                    DownloadHandler().add_multiple(
+                        (*result, False) for result in results
+                    )
+
+                LOGGER.info(f'Finished task {task.display_title}')
+
+        except Exception:
+            LOGGER.exception(
+                'An error occured while trying to run a task: ')
+            task.message = 'AN ERROR OCCURED'
+            socket.emit(TaskStatusEvent(task.message))
+            sleep(1.5)
+
+        finally:
+            if not task.stop:
+                socket.emit(TaskEndedEvent(task))
+                # Remove our own entry (not necessarily the first one, as
+                # a preempting task may be in front of a paused one)
+                for entry in self.queue:
+                    if entry['task'] is task:
+                        self.queue.remove(entry)
+                        break
+                self._process_queue()
+
+        return
+
+    def _process_queue(self) -> None:
+        """
+        Handle the queue. In the case that there is something in the queue and
+        it isn't already running, start the task. This can safely be called
+        multiple times while a task is going or while there is nothing in the queue.
+        Also resumes a paused task when it reaches the front of the queue.
+        """
+        if not self.queue:
+            return
+
+        first_entry = self.queue[0]
+        if first_entry['status'] == 'paused':
+            first_entry['status'] = 'running'
+            first_entry['task']._ensure_yield_event().set()
+
+        elif first_entry['status'] == 'queued':
+            first_entry['status'] = 'running'
+            first_entry['thread'].start()
+
+        return
+
+    def add(self, task: Task) -> int:
+        """Add a task to the queue.
+
+        Args:
+            task (Task): The task to add to the queue.
+
+        Returns:
+            int: The ID of the entry in the queue.
+        """
+        LOGGER.debug(f'Adding task to queue: {task.display_title}')
+        id = max((e['id'] for e in self.queue), default=0) + 1
+        task_data: QueuedTaskData = {
+            'id': id,
+            'task': task,
+            'thread': Server().get_db_thread(
+                target=self.__run_task,
+                name=f"TaskThread-{id}",
+                args=(task,)
+            ),
+            'status': 'queued'
+        }
+
+        if (
+            self.queue
+            and self.queue[0]['status'] == 'running'
+            and task.priority < self.queue[0]['task'].priority
+        ):
+            # Preempt the running lower-priority task. It pauses at its next
+            # `check_yield()` and resumes once it's at the front again.
+            running_entry = self.queue[0]
+            LOGGER.info(
+                'Preempting %s (pri %d) for %s (pri %d)',
+                running_entry['task'].display_title,
+                running_entry['task'].priority,
+                task.display_title,
+                task.priority
+            )
+            running_entry['status'] = 'paused'
+            running_entry['task']._ensure_yield_event().clear()
+            self.queue.insert(0, task_data)
+
+        else:
+            # Insert before any paused task so queued tasks drain before the
+            # paused task resumes.
+            insert_idx = len(self.queue)
+            for i, entry in enumerate(self.queue):
+                if entry['status'] == 'paused':
+                    insert_idx = i
+                    break
+            self.queue.insert(insert_idx, task_data)
+
+        LOGGER.info(f'Added task: {task.display_title} ({id})')
+        WebSocket().emit(TaskAddedEvent(task))
+        self._process_queue()
+        return id
+
+    @staticmethod
+    def task_for_volume_running(volume_id: int) -> bool:
+        """Whether or not there is a task in the queue that targets the volume.
+
+        Args:
+            volume_id (int): The volume ID to check for.
+
+        Returns:
+            bool: Whether or not a task is in the queue targeting the volume.
+        """
+        return any(
+            t
+            for t in TaskHandler.queue
+            if (
+                isinstance(t['task'], LibraryTask)
+                or t['task'].volume_id == volume_id
+            )
+        )
+
+    def __check_intervals(self) -> None:
+        "Check if any interval task needs to be run and add to queue if so"
+        LOGGER.debug('Checking task intervals')
+        current_time = time()
+
+        cursor = get_db()
+        interval_tasks = cursor.execute(
+            "SELECT task_name, schedule, next_run FROM task_intervals;"
+        ).fetchall()
+        LOGGER.debug(f'Task intervals: {list(map(dict, interval_tasks))}')
+
+        # Prevent duplicate queueing of the same interval task
+        queued_actions = {t['task'].action for t in self.queue}
+
+        for task in interval_tasks:
+            if task['next_run'] <= current_time:
+                # Update next_run from cron schedule, regardless of whether
+                # the task gets queued (prevents piling up missed runs)
+                next_run = get_schedules_next_run(task["schedule"])
+                cursor.execute(
+                    "UPDATE task_intervals SET next_run = ? WHERE task_name = ?;",
+                    (next_run, task['task_name']))
+
+                if task['task_name'] in queued_actions:
+                    LOGGER.info(
+                        'Skipping %s, already in queue', task['task_name']
+                    )
+                    continue
+
+                TaskClass = self.tasks.get(task['task_name'])
+                if TaskClass is None:
+                    LOGGER.warning(
+                        'Skipping unknown interval task: %s',
+                        task['task_name']
+                    )
+                    continue
+
+                # Add task to queue
+                if TaskClass is UpdateAll:
+                    inst = TaskClass(allow_skipping=True)
+                else:
+                    inst = TaskClass()
+                self.add(inst)
+                queued_actions.add(task['task_name'])
+
+        self.handle_intervals()
+        return
+
+    def handle_intervals(self) -> None:
+        "Find next time an interval task needs to be run"
+        next_run: Union[int, None] = get_db().execute(
+            "SELECT MIN(next_run) FROM task_intervals"
+        ).fetchone()[0]
+        if next_run is None:
+            next_run = round(time()) + 60
+
+        wait_time = max(next_run - round(time()) + 1, 1)
+        LOGGER.debug(f'Next interval task is in {wait_time} seconds')
+
+        if self.task_interval_waiter:
+            self.task_interval_waiter.cancel()
+
+        self.task_interval_waiter = Server().get_db_timer_thread(
+            interval=wait_time,
+            target=self.__check_intervals,
+            name="TaskIntervalThread"
+        )
+        self.task_interval_waiter.start()
+        return
+
+    def update_task_schedule(self, task_identifier: str, schedule: str) -> None:
+        """Update the cron schedule for a background task.
+
+        Args:
+            task_identifier (str): The identifier of the task to change it for.
+            schedule (str): The cron schedule to set.
+
+        Raises:
+            TaskNotFound: No task found with the given identifier.
+            InvalidKeyValue: Invalid cron schedule.
+        """
+        # Validate task exists
+        self.get_task_class(task_identifier)
+
+        # Validate schedule string
+        try:
+            next_run = get_schedules_next_run(schedule)
+        except ValueError:
+            raise InvalidKeyValue('schedule', schedule)
+
+        get_db().execute(
+            """
+            UPDATE task_intervals
+            SET schedule = ?, next_run = ?
+            WHERE task_name = ?;
+            """,
+            (schedule, next_run, task_identifier)
+        )
+
+        self.handle_intervals()
+        return
+
+    def stop_handle(self) -> None:
+        "Stop the task handler"
+        LOGGER.debug('Stopping task thread')
+
+        if self.task_interval_waiter:
+            self.task_interval_waiter.cancel()
+
+        # Stop all tasks. Resume paused ones so they can observe the stop
+        # flag and exit cleanly.
+        for entry in self.queue:
+            entry['task'].stop = True
+            if entry['status'] == 'paused':
+                entry['task']._ensure_yield_event().set()
+
+        for entry in self.queue:
+            if entry['status'] in ('running', 'paused'):
+                entry['thread'].join()
+
+        return
+
+    def __format_entry(self, task: QueuedTaskData) -> Dict[str, Any]:
+        """Format a queue entry for API response.
+
+        Args:
+            task (QueuedTaskData): The queue entry.
+
+        Returns:
+            Dict[str, Any]: The formatted queue entry.
+        """
+        return {
+            'id': task['id'],
+            'action': task['task'].action,
+            'display_title': task['task'].display_title,
+            'running': task['status'] == 'running',
+            'status': task['status'],
+            'message': task['task'].message,
+            'volume_id': task['task'].volume_id,
+            'issue_id': task['task'].issue_id
+        }
+
+    def get_all(self) -> List[Dict[str, Any]]:
+        """Get all tasks in the queue.
+
+        Returns:
+            List[Dict[str, Any]]: A list with all tasks in the queue.
+        """
+        return [self.__format_entry(t) for t in self.queue]
+
+    def get_one(self, task_id: int) -> Dict[str, Any]:
+        """Get one task from the queue based on its ID.
+
+        Args:
+            task_id (int): The ID of the task to get from the queue.
+
+        Raises:
+            TaskNotFound: The ID doesn't match with any task in the queue.
+
+        Returns:
+            Dict[str, Any]: The info of the task in the queue.
+        """
+        return self.__format_entry(self.__get_raw_entry(task_id))
+
+    def __get_raw_entry(self, task_id: int) -> QueuedTaskData:
+        """Get the raw entry from the queue based on its ID.
+
+        Args:
+            task_id (int): The ID of the task to get from the queue.
+
+        Raises:
+            TaskNotFound: The ID doesn't match with any task in the queue.
+
+        Returns:
+            QueuedTaskData: The raw entry of the task in the queue.
+        """
+        for entry in self.queue:
+            if entry['id'] == task_id:
+                return entry
+        raise TaskNotFound(task_id)
+
+    def remove(self, task_id: int) -> None:
+        """Remove a task from the queue, including the currently running or a
+        paused task.
+
+        Args:
+            task_id (int): The ID of the task to delete from the queue.
+
+        Raises:
+            TaskNotFound: The id doesn't map to any task in the queue.
+        """
+        # Raises TaskNotFound if the id isn't found
+        task = self.__get_raw_entry(task_id)
+        was_active = task['status'] in ('running', 'paused')
+
+        # Signal the task to stop at the next safe checkpoint
+        task['task'].stop = True
+        if task['status'] == 'paused':
+            task['task']._ensure_yield_event().set()
+
+        if was_active:
+            # __run_task skips queue cleanup when task.stop is True,
+            # so it's handled here.
+            task['thread'].join()
+
+        try:
+            self.queue.remove(task)
+        except ValueError:
+            # Finished naturally in the meantime
+            return
+
+        LOGGER.info(f'Removed task: {task["task"].display_title} ({task_id})')
+        WebSocket().emit(TaskEndedEvent(task['task']))
+
+        if was_active:
+            self._process_queue()
+        return
+
+    def get_task_planning(self) -> List[Dict[str, Any]]:
+        """Get the planning of each interval task (schdule, next run and last run).
+
+        Returns:
+            List[Dict[str, Any]]: List of interval tasks and their planning.
+        """
+        tasks = get_db().execute(
+            """
+            SELECT
+                i.task_name, schedule, next_run, run_at AS last_run
+            FROM task_intervals i
+            LEFT JOIN (
+                SELECT
+                    task_name,
+                    MAX(run_at) AS run_at
+                FROM task_history
+                GROUP BY task_name
+            ) h
+            ON i.task_name = h.task_name
+            ORDER BY i.task_name;
+            """
+        ).fetchalldict()
+
+        for t in tasks:
+            TaskClass = self.tasks.get(t['task_name'])
+            if TaskClass is None:
+                t['display_name'] = t['task_name'].replace('_', ' ').title()
+                t['description'] = ''
+            else:
+                t['display_name'] = TaskClass.display_title
+                t['description'] = TaskClass.description
+
+        return tasks
+
+
+def insert_task_intervals() -> None:
+    """Fill the database table for task intervals, and remove rows of tasks
+    that no longer exist"""
+    cursor = get_db()
+    cursor.executemany(
+        "DELETE FROM task_intervals WHERE task_name = ?;",
+        ((n,) for n in LEGACY_TASK_NAMES)
+    )
+    cursor.executemany(
+        """
+        INSERT OR IGNORE INTO task_intervals
+        VALUES (?, ?, ?);
+        """,
+        (
+            (task_name, schedule, get_schedules_next_run(schedule))
+            for task_name, schedule in TASK_INTERVALS.items()
+        )
+    )
+    return
+
+
+# region History
+def get_task_history(offset: int = 0) -> List[dict]:
+    """Get the task history in blocks of 50.
+
+    Args:
+        offset (int, optional): The offset of the list. The higher the number,
+            the deeper into history you go.
+            Defaults to 0.
+
+    Returns:
+        List[dict]: The history entries.
+    """
+    result = get_db().execute(
+        """
+        SELECT
+            task_name, display_title, run_at, duration_seconds
+        FROM task_history
+        ORDER BY run_at DESC
+        LIMIT 50
+        OFFSET ?;
+        """,
+        (offset * 50,)
+    ).fetchalldict()
+    return result
+
+
+def delete_task_history() -> None:
+    "Delete the complete task history"
+    LOGGER.info(f'Deleting task history')
+    get_db().execute("DELETE FROM task_history;")
+    return
+
+
+# region Task types
+class LibraryTask(Task):
+    """
+    Tasks that inherit from this class signify that they don't work
+    on one specific volume or issue but on all of them
+    """
+
+
+class DownloadTask(Task):
+    """
+    Tasks that inherit from this class signify that they return downloads
+    """
+
+    @abstractmethod
+    def run(self) -> List[Tuple[str, int, FilenameData, int, Union[int, None]]]:
         ...
 
-# =====================
-# Issue tasks
-# =====================
 
-
-class AutoSearchIssue(Task):
+# region Issue tasks
+@TaskHandler.register_task('auto_search_issue')
+class AutoSearchIssue(DownloadTask):
     "Do an automatic search for an issue"
 
     stop = False
     message = ''
-    action = 'auto_search_issue'
     display_title = 'Auto Search'
-    category = 'download'
     priority = 1
 
     @property
@@ -111,14 +616,14 @@ class AutoSearchIssue(Task):
         """Create the task
 
         Args:
-            volume_id (int): The id of the volume in which the issue is
-            issue_id (int): The id of the issue to search for
+            volume_id (int): The ID of the volume in which the issue is.
+            issue_id (int): The ID of the issue to search for.
         """
         self._volume_id = volume_id
         self._issue_id = issue_id
         return
 
-    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+    def run(self):
         volume = Volume(self._volume_id)
         volume_title = volume.vd.title
         issue_number = volume.get_issue(self._issue_id).get_data().issue_number
@@ -127,22 +632,34 @@ class AutoSearchIssue(Task):
 
         # Get search results and download them
         results = auto_search(self._volume_id, self._issue_id)
-        if results:
-            return [
-                (result['link'], self._volume_id, self._issue_id)
-                for result in results
-            ]
-        return []
+        downloads: List[Tuple[
+            str, int, FilenameData, int, Union[int, None]
+        ]] = []
+        for result in results:
+            title_data: FilenameData = {
+                "series": result["series"],
+                "year": result["year"],
+                "volume_number": result["volume_number"],
+                "special_version": result["special_version"],
+                "issue_number": result["issue_number"],
+                "annual": result["annual"]
+            }
+            downloads.append((
+                result['link'], result["indexer_id"],
+                title_data,
+                self._volume_id, self._issue_id
+            ))
+
+        return downloads
 
 
+@TaskHandler.register_task('mass_rename_issue')
 class MassRenameIssue(Task):
     "Trigger a mass rename for an issue"
 
     stop = False
     message = ''
-    action = 'mass_rename_issue'
     display_title = 'Mass Rename'
-    category = ''
     priority = 1
 
     @property
@@ -159,13 +676,13 @@ class MassRenameIssue(Task):
         issue_id: int,
         filepath_filter: List[str] = []
     ) -> None:
-        """Create the task
+        """Create the task.
 
         Args:
             volume_id (int): The ID of the volume for which to perform the task.
             issue_id (int): The ID of the issue for which to perform the task.
             filepath_filter (List[str], optional): Only rename files in this
-            list.
+                list.
                 Defaults to [].
         """
         self._volume_id = volume_id
@@ -190,14 +707,13 @@ class MassRenameIssue(Task):
         return
 
 
+@TaskHandler.register_task('mass_convert_issue')
 class MassConvertIssue(Task):
     "Trigger a mass convert for an issue"
 
     stop = False
     message = ''
-    action = 'mass_convert_issue'
     display_title = 'Mass Convert'
-    category = ''
     priority = 1
 
     @property
@@ -220,7 +736,7 @@ class MassConvertIssue(Task):
             volume_id (int): The ID of the volume for which to perform the task.
             issue_id (int): The ID of the issue for which to perform the task.
             filepath_filter (List[str], optional): Only rename files in this
-            list.
+                list.
                 Defaults to [].
         """
         self._volume_id = volume_id
@@ -245,19 +761,15 @@ class MassConvertIssue(Task):
 
         return
 
-# =====================
-# Volume tasks
-# =====================
 
-
-class AutoSearchVolume(Task):
+# region Volume tasks
+@TaskHandler.register_task('auto_search')
+class AutoSearchVolume(DownloadTask):
     "Do an automatic search for a volume"
 
     stop = False
     message = ''
-    action = 'auto_search'
     display_title = 'Auto Search'
-    category = 'download'
     priority = 1
 
     @property
@@ -269,37 +781,49 @@ class AutoSearchVolume(Task):
         return None
 
     def __init__(self, volume_id: int) -> None:
-        """Create the task
+        """Create the task.
 
         Args:
-            volume_id (int): The id of the volume to search for
+            volume_id (int): The ID of the volume to search for.
         """
         self._volume_id = volume_id
         return
 
-    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+    def run(self):
         volume_title = Volume(self._volume_id).vd.title
         self.message = f'Searching for {volume_title}'
         WebSocket().emit(TaskStatusEvent(self.message))
 
         # Get search results and download them
         results = auto_search(self._volume_id)
-        if results:
-            return [
-                (result['link'], self._volume_id, None)
-                for result in results
-            ]
-        return []
+        downloads: List[Tuple[
+            str, int, FilenameData, int, Union[int, None]
+        ]] = []
+        for result in results:
+            title_data: FilenameData = {
+                "series": result["series"],
+                "year": result["year"],
+                "volume_number": result["volume_number"],
+                "special_version": result["special_version"],
+                "issue_number": result["issue_number"],
+                "annual": result["annual"]
+            }
+            downloads.append((
+                result['link'], result["indexer_id"],
+                title_data,
+                self._volume_id, None
+            ))
+
+        return downloads
 
 
+@TaskHandler.register_task('refresh_and_scan')
 class RefreshAndScanVolume(Task):
     "Trigger a refresh and scan for a volume"
 
     stop = False
     message = ''
-    action = 'refresh_and_scan'
     display_title = 'Refresh And Scan'
-    category = ''
     priority = 2
 
     @property
@@ -311,10 +835,10 @@ class RefreshAndScanVolume(Task):
         return None
 
     def __init__(self, volume_id: int) -> None:
-        """Create the task
+        """Create the task.
 
         Args:
-            volume_id (int): The id of the volume for which to perform the task
+            volume_id (int): The ID of the volume for which to refresh and scan.
         """
         self._volume_id = volume_id
         return
@@ -326,20 +850,19 @@ class RefreshAndScanVolume(Task):
 
         try:
             refresh_and_scan(self._volume_id, update_websocket=True)
-        except InvalidComicVineApiKey:
+        except (CredentialInvalid, MetadataSourceNotWorking):
             pass
 
         return
 
 
+@TaskHandler.register_task('mass_rename')
 class MassRenameVolume(Task):
     "Trigger a mass rename for a volume"
 
     stop = False
     message = ''
-    action = 'mass_rename'
     display_title = 'Mass Rename'
-    category = ''
     priority = 1
 
     @property
@@ -360,7 +883,7 @@ class MassRenameVolume(Task):
         Args:
             volume_id (int): The ID of the volume for which to perform the task.
             filepath_filter (List[str], optional): Only rename files in this
-            list.
+                list.
                 Defaults to [].
         """
         self._volume_id = volume_id
@@ -381,14 +904,13 @@ class MassRenameVolume(Task):
         return
 
 
+@TaskHandler.register_task('mass_convert')
 class MassConvertVolume(Task):
     "Trigger a mass convert for a volume"
 
     stop = False
     message = ''
-    action = 'mass_convert'
     display_title = 'Mass Convert'
-    category = ''
     priority = 1
 
     @property
@@ -409,7 +931,7 @@ class MassConvertVolume(Task):
         Args:
             volume_id (int): The ID of the volume for which to perform the task.
             filepath_filter (List[str], optional): Only convert files in this
-            list.
+                list.
                 Defaults to [].
         """
         self._volume_id = volume_id
@@ -430,24 +952,188 @@ class MassConvertVolume(Task):
 
         return
 
-# =====================
-# Library tasks
-# =====================
+
+# region Library tasks
+@TaskHandler.register_task('update_all')
+class UpdateAll(LibraryTask):
+    "Trigger a refresh and scan for each volume in the library"
+
+    stop = False
+    message = ''
+    display_title = 'Update All'
+    priority = 4
+    description = (
+        'Refreshes metadata and scans files for volumes that have not been'
+        ' updated in the last 24 hours or whose issue count changed.'
+    )
+
+    @property
+    def volume_id(self) -> None:
+        return None
+
+    @property
+    def issue_id(self) -> None:
+        return None
+
+    def __init__(self, allow_skipping: bool = False) -> None:
+        """Create the task.
+
+        Args:
+            allow_skipping (bool, optional): Skip volumes that have been updated
+                in the last 24 hours.
+                Defaults to False.
+        """
+        self.allow_skipping = allow_skipping
+        return
+
+    def run(self) -> None:
+        self.message = f'Updating info on all volumes'
+        WebSocket().emit(TaskStatusEvent(self.message))
+
+        try:
+            refresh_and_scan(
+                update_websocket=True,
+                allow_skipping=self.allow_skipping
+            )
+
+        except (CredentialInvalid, MetadataSourceNotWorking):
+            pass
+
+        return
 
 
-class SyncIssues(Task):
+# region System tasks
+@TaskHandler.register_task("backup_db")
+class BackupDatabase(Task):
+    "Create a backup of the database"
+
+    stop = False
+    message = ''
+    display_title = 'Database Backup'
+    priority = 3
+    description = (
+        'Creates a backup of the database.'
+    )
+
+    @property
+    def volume_id(self) -> None:
+        return None
+
+    @property
+    def issue_id(self) -> None:
+        return None
+
+    def __init__(self) -> None:
+        return
+
+    def run(self):
+        self.message = 'Creating database backup'
+        WebSocket().emit(TaskStatusEvent(self.message))
+
+        backup_database()
+        return
+
+
+@TaskHandler.register_task('rss_sync')
+class RssSync(DownloadTask):
+    "Do an RSS sync"
+
+    stop = False
+    message = ''
+    display_title = 'RSS Sync'
+    priority = 3
+    description = (
+        'Checks all indexers for new releases and downloads matches.'
+    )
+
+    @property
+    def volume_id(self) -> None:
+        return None
+
+    @property
+    def issue_id(self) -> None:
+        return None
+
+    def __init__(self) -> None:
+        return
+
+    def run(self):
+        self.message = 'Performing RSS Sync'
+        WebSocket().emit(TaskStatusEvent(self.message))
+
+        results_per_volume = discover_downloads()
+        downloads: List[Tuple[
+            str, int, FilenameData, int, Union[int, None]
+        ]] = []
+        for volume_id, results in results_per_volume.items():
+            for result in results:
+                title_data: FilenameData = {
+                    "series": result["series"],
+                    "year": result["year"],
+                    "volume_number": result["volume_number"],
+                    "special_version": result["special_version"],
+                    "issue_number": result["issue_number"],
+                    "annual": result["annual"]
+                }
+                downloads.append((
+                    result['link'], result["indexer_id"],
+                    title_data,
+                    volume_id, None
+                ))
+
+        return downloads
+
+
+# region Fork helpers
+def _results_to_downloads(
+    results: Iterable[SearchResultData],
+    volume_id: int,
+    issue_id: Union[int, None]
+) -> List[Tuple[str, int, FilenameData, int, Union[int, None]]]:
+    """Convert search results into the download tuples that `DownloadTask`s
+    return.
+
+    Args:
+        results (Iterable[SearchResultData]): The search results.
+        volume_id (int): The ID of the volume the downloads are for.
+        issue_id (Union[int, None]): The ID of the issue the downloads are for,
+            if any.
+
+    Returns:
+        List[Tuple[str, int, FilenameData, int, Union[int, None]]]: The
+            download tuples.
+    """
+    downloads: List[Tuple[str, int, FilenameData, int, Union[int, None]]] = []
+    for result in results:
+        title_data: FilenameData = {
+            "series": result["series"],
+            "year": result["year"],
+            "volume_number": result["volume_number"],
+            "special_version": result["special_version"],
+            "issue_number": result["issue_number"],
+            "annual": result["annual"]
+        }
+        downloads.append((
+            result["link"], result["indexer_id"],
+            title_data,
+            volume_id, issue_id
+        ))
+    return downloads
+
+
+# region Fork library tasks
+@TaskHandler.register_task('sync_issues')
+class SyncIssues(LibraryTask):
     "Fetch new/updated issues from ComicVine for all monitored volumes"
 
     stop = False
     message = ''
-    action = 'sync_issues'
     display_title = 'Sync Issues'
+    priority = 3
     description = (
         'Fetches new and updated issues from ComicVine for all monitored'
         ' volumes, using the timestamp of the last successful sync.'
     )
-    category = ''
-    priority = 3
 
     @property
     def volume_id(self) -> None:
@@ -482,35 +1168,38 @@ class SyncIssues(Task):
             v['comicvine_id']: (v['id'], v['last_cv_fetch'])
             for v in volumes
         }
-        volume_cv_ids = tuple(cv_to_id_fetch.keys())
 
-        cv = ComicVine()
-        issue_datas = run(cv.fetch_issues_since(volume_cv_ids, since))
+        try:
+            issue_datas = run(ComicVine().fetch_issues_since(
+                tuple(cv_to_id_fetch.keys()), since
+            ))
+        except (CredentialInvalid, MetadataSourceNotWorking):
+            return
 
         if issue_datas:
             upsert_issues(cv_to_id_fetch, issue_datas)
 
         cursor.execute(
-            "UPDATE config SET value=? WHERE key='last_issue_sync'",
+            "INSERT OR REPLACE INTO config(key, value) "
+            "VALUES ('last_issue_sync', ?);",
             (str(int(time())),)
         )
-        cursor.connection.commit()
+        commit()
         return
 
 
-class RefreshMetadata(Task):
+@TaskHandler.register_task('refresh_metadata')
+class RefreshMetadata(LibraryTask):
     "Refresh volume metadata from ComicVine for stale volumes"
 
     stop = False
     message = ''
-    action = 'refresh_metadata'
     display_title = 'Refresh Metadata'
+    priority = 3
     description = (
         'Refreshes volume metadata (cover images and descriptions) from'
         ' ComicVine for volumes not updated in over 30 days or missing data.'
     )
-    category = ''
-    priority = 3
 
     @property
     def volume_id(self) -> None:
@@ -526,10 +1215,9 @@ class RefreshMetadata(Task):
     def run(self) -> None:
         self.message = 'Refreshing volume metadata'
         WebSocket().emit(TaskStatusEvent(self.message))
-        cursor = get_db()
         thirty_days_ago = time() - (30 * 86400)
 
-        volumes = cursor.execute(
+        volumes = get_db().execute(
             """
             SELECT comicvine_id, id, last_cv_fetch
             FROM volumes
@@ -551,8 +1239,13 @@ class RefreshMetadata(Task):
             v['comicvine_id']: (v['id'], v['last_cv_fetch'])
             for v in volumes
         }
-        cv = ComicVine()
-        volume_datas = run(cv.fetch_volumes(tuple(cv_to_id_fetch.keys())))
+
+        try:
+            volume_datas = run(
+                ComicVine().fetch_volumes(tuple(cv_to_id_fetch.keys()))
+            )
+        except (CredentialInvalid, MetadataSourceNotWorking):
+            return
 
         if volume_datas:
             update_volume_metadata(cv_to_id_fetch, volume_datas)
@@ -561,19 +1254,18 @@ class RefreshMetadata(Task):
         return
 
 
-class ScanFiles(Task):
+@TaskHandler.register_task('scan_files')
+class ScanFiles(LibraryTask):
     "Scan files on disk for all monitored volumes"
 
     stop = False
     message = ''
-    action = 'scan_files'
     display_title = 'Scan Files'
+    priority = 3
     description = (
         'Scans files on disk for all monitored volumes and updates'
         ' which issues have local files.'
     )
-    category = ''
-    priority = 3
 
     @property
     def volume_id(self) -> None:
@@ -587,9 +1279,8 @@ class ScanFiles(Task):
         return
 
     def run(self) -> None:
-        cursor = get_db()
         volume_ids = [
-            row[0] for row in cursor.execute(
+            row[0] for row in get_db().execute(
                 "SELECT id FROM volumes WHERE monitored = 1;"
             )
         ]
@@ -605,19 +1296,18 @@ class ScanFiles(Task):
         return
 
 
-class SpecialVersionRefresh(Task):
+@TaskHandler.register_task('special_version_refresh')
+class SpecialVersionRefresh(LibraryTask):
     "Re-determine the special version type for all non-locked volumes"
 
     stop = False
     message = ''
-    action = 'special_version_refresh'
     display_title = 'Refresh Special Versions'
+    priority = 4
     description = (
         'Re-evaluates the special version type (TPB, Hardcover, One Shot,'
         ' etc.) for all volumes that have not been manually locked.'
     )
-    category = ''
-    priority = 4
 
     @property
     def volume_id(self) -> None:
@@ -634,39 +1324,35 @@ class SpecialVersionRefresh(Task):
         cursor = get_db()
         volume_ids = [
             row[0] for row in cursor.execute(
-                "SELECT id FROM volumes "
-                "WHERE special_version_locked = 0;"
+                "SELECT id FROM volumes WHERE special_version_locked = 0;"
             )
         ]
-        ws = WebSocket()
         for vid in volume_ids:
             self.check_yield()
             if self.stop:
                 break
-            result = determine_special_version(vid)
             cursor.execute(
                 "UPDATE volumes "
                 "SET special_version = ? "
                 "WHERE id = ? AND special_version_locked = 0",
-                (result, vid)
+                (determine_special_version(vid), vid)
             )
         commit()
         return
 
 
-class SearchAll(Task):
+@TaskHandler.register_task('search_all')
+class SearchAll(LibraryTask, DownloadTask):
     "Trigger an automatic search for each volume in the library"
 
     stop = False
     message = ''
-    action = 'search_all'
     display_title = 'Search All'
+    priority = 5
     description = (
         'Searches for missing issues across every monitored volume in the'
         ' library. Volumes with recent consecutive misses are deprioritised.'
     )
-    category = 'download'
-    priority = 5
 
     @property
     def volume_id(self) -> None:
@@ -679,19 +1365,17 @@ class SearchAll(Task):
     def __init__(self) -> None:
         return
 
-    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+    def run(self) -> List[Tuple[str, int, FilenameData, int, Union[int, None]]]:
         from backend.internals.db_models_search_stats import (
             get_total_volume_count, record_search_hit, record_search_miss)
 
-        cursor = get_db(force_new=True)
-        # Only search volumes that have at least one open issue
-        # (monitored issue with no file) — skip fully downloaded volumes.
-        # Priority scoring: volumes with fewer consecutive misses are searched
-        # first. Within the same miss count, newer volumes (higher ID) come
-        # first. vol_count is used to scale the penalty so one miss pushes a
-        # volume behind all untested ones.
+        # Only search volumes that have at least one open issue (monitored
+        # issue with no file). Volumes with fewer consecutive misses are
+        # searched first; within the same miss count, newer volumes (higher
+        # ID) first. vol_count scales the penalty so one miss pushes a volume
+        # behind all untested ones.
         vol_count = get_total_volume_count()
-        volumes = cursor.execute(
+        volumes = get_db(force_new=True).execute(
             """
             SELECT DISTINCT v.id, v.title,
                 (v.id - COALESCE(vss.consecutive_misses, 0) * :vol_count)
@@ -707,43 +1391,41 @@ class SearchAll(Task):
             """,
             {'vol_count': vol_count}
         ).fetchall()
-        downloads: List[Tuple[str, int, Union[int, None]]] = []
+
+        downloads: List[
+            Tuple[str, int, FilenameData, int, Union[int, None]]
+        ] = []
         ws = WebSocket()
         for volume_id, volume_title, _priority in volumes:
-            if self.stop:
-                break
             self.check_yield()
             if self.stop:
                 break
             self.message = f'Searching for {volume_title}'
             ws.emit(TaskStatusEvent(self.message))
-            # Get search results and download them
+
             results = auto_search(volume_id)
             if results:
                 record_search_hit(volume_id)
-                downloads += [
-                    (result['link'], volume_id, None)
-                    for result in results
-                ]
+                downloads += _results_to_downloads(results, volume_id, None)
             else:
                 record_search_miss(volume_id)
+
         return downloads
 
 
+# region Fork calendar tasks
+@TaskHandler.register_task('refresh_calendar')
 class RefreshCalendar(Task):
-    """Pre-warm the calendar cache with +/- 30 days from today."""
+    "Pre-warm the calendar cache with +/- 30 days from today"
 
     stop = False
     message = ''
-    action = 'refresh_calendar'
     display_title = 'Refresh Calendar'
+    priority = 3
     description = (
         'Pre-warms the calendar cache with releases in the \u00b130-day window'
         ' around today so that calendar page loads are instant.'
     )
-    category = 'maintenance'
-    interval = 86400  # 24 hours
-    priority = 3
 
     @property
     def volume_id(self) -> None:
@@ -756,7 +1438,7 @@ class RefreshCalendar(Task):
     def __init__(self) -> None:
         return
 
-    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+    def run(self) -> None:
         from backend.features.calendar import get_calendar
         today = date.today()
         window_start = (today - timedelta(days=30)).isoformat()
@@ -766,17 +1448,14 @@ class RefreshCalendar(Task):
         ws = WebSocket()
         ws.emit(TaskStatusEvent(self.message))
 
-        # Superset fetch: seeds CVProxy and Kapowarr's in-memory cache
-        # for the full ±30-day window in one request. Capture the result so
-        # we can extract library volumes for the metadata update below.
+        # Superset fetch: seeds CVProxy and Kapowarr's in-memory cache for the
+        # full window in one request.
         calendar_issues = get_calendar(
             window_start, window_end, force_refresh=True
         )
 
-        # Week-by-week seeding: populates Kapowarr's per-week cache entries
-        # so individual week navigation is instant after this task runs.
-        # force_refresh=False means these hit the superset cache above —
-        # no extra CVProxy calls are made.
+        # Week-by-week seeding so individual week navigation is instant. These
+        # hit the superset cache above, so no extra CVProxy calls are made.
         current = today - timedelta(days=30)
         while current <= today + timedelta(days=30):
             week_end = current + timedelta(days=6)
@@ -786,43 +1465,138 @@ class RefreshCalendar(Task):
         self.message = 'Calendar cache refreshed'
         ws.emit(TaskStatusEvent(self.message))
 
-        # Refresh metadata for every library volume that appears in the
-        # calendar window — these are the volumes most likely to have
-        # updated CV data (new issues, corrected descriptions, new covers).
+        # Refresh metadata for every library volume in the calendar window;
+        # these are most likely to have updated CV data.
         local_vol_ids = {
             i['volume_id_local']
             for i in calendar_issues
             if i.get('volume_id_local') and i.get('in_library')
         }
+        if not local_vol_ids:
+            return
 
-        if local_vol_ids:
-            self.message = 'Refreshing metadata for calendar volumes'
-            ws.emit(TaskStatusEvent(self.message))
-            LOGGER.info(
-                'RefreshCalendar: refreshing metadata for %d calendar volumes',
-                len(local_vol_ids)
+        self.message = 'Refreshing metadata for calendar volumes'
+        ws.emit(TaskStatusEvent(self.message))
+        LOGGER.info(
+            'RefreshCalendar: refreshing metadata for %d calendar volumes',
+            len(local_vol_ids)
+        )
+
+        placeholders = ','.join('?' * len(local_vol_ids))
+        rows = get_db().execute(
+            f"SELECT comicvine_id, id, last_cv_fetch "
+            f"FROM volumes WHERE id IN ({placeholders});",
+            tuple(local_vol_ids)
+        ).fetchalldict()
+        if not rows:
+            return
+
+        cv_to_id_fetch = {
+            r['comicvine_id']: (r['id'], r['last_cv_fetch'])
+            for r in rows
+        }
+        try:
+            volume_datas = run(
+                ComicVine().fetch_volumes(tuple(cv_to_id_fetch.keys()))
             )
+        except (CredentialInvalid, MetadataSourceNotWorking):
+            return
 
-            placeholders = ','.join('?' * len(local_vol_ids))
-            rows = get_db().execute(
-                f"SELECT comicvine_id, id, last_cv_fetch "
-                f"FROM volumes WHERE id IN ({placeholders});",
-                tuple(local_vol_ids)
-            ).fetchalldict()
+        if volume_datas:
+            update_volume_metadata(cv_to_id_fetch, volume_datas)
 
-            if rows:
-                cv_to_id_fetch = {
-                    r['comicvine_id']: (r['id'], r['last_cv_fetch'])
-                    for r in rows
-                }
-                cv = ComicVine()
-                volume_datas = run(
-                    cv.fetch_volumes(tuple(cv_to_id_fetch.keys()))
+        return
+
+
+def _scrape_gc_weekly_packs(
+    task: Task,
+    downloads: List[Tuple[str, int, FilenameData, int, Union[int, None]]]
+) -> None:
+    """Scrape the most recent GetComics weekly packs and add downloads for any
+    open issue that matches an entry. Modifies `downloads` in place.
+
+    Args:
+        task (Task): The calling task.
+        downloads (List[Tuple[str, int, FilenameData, int, Union[int, None]]]):
+            The downloads found so far. Links already in here are skipped.
+    """
+    from backend.implementations.indexer_client_manager import IndexerClients
+    from backend.implementations.indexer_clients.ddl.GetComics import \
+        GetComicsIndexer
+    from backend.implementations.matching import match_title
+
+    gc_indexers = [
+        c
+        for c in IndexerClients.get_all_clients()
+        if isinstance(c, GetComicsIndexer)
+        and c.get_indexer_data()['enabled']
+    ]
+    if not gc_indexers:
+        return
+    gc = gc_indexers[0]
+
+    task.message = 'Scanning GetComics weekly packs'
+    WebSocket().emit(TaskStatusEvent(task.message))
+
+    async def _fetch_packs() -> List[SearchResultData]:
+        try:
+            return await gc.scrape_weekly_packs(pack_count=3)
+        finally:
+            await gc.shutdown()
+
+    pack_articles = run(_fetch_packs())
+    if not pack_articles:
+        return
+
+    open_rows = get_db().execute(
+        """
+        SELECT v.id AS volume_id, v.title,
+               i.id AS issue_id,
+               i.calculated_issue_number
+        FROM volumes v
+        INNER JOIN issues i ON i.volume_id = v.id
+        LEFT JOIN issues_files if_ ON if_.issue_id = i.id
+        WHERE v.monitored = 1
+          AND i.monitored = 1
+          AND if_.issue_id IS NULL;
+        """
+    ).fetchalldict()
+
+    vol_data: Dict[int, Tuple[str, Dict[float, int]]] = {}
+    for row in open_rows:
+        vid = row['volume_id']
+        if vid not in vol_data:
+            vol_data[vid] = (row['title'], {})
+        vol_data[vid][1][row['calculated_issue_number']] = row['issue_id']
+
+    queued_links: Set[str] = {d[0] for d in downloads}
+
+    for article in pack_articles:
+        if task.stop:
+            break
+
+        art_series = (article.get('series') or '').strip()
+        art_issue_num = article.get('issue_number')
+        if (
+            not article['link']
+            or not art_series
+            or article['link'] in queued_links
+        ):
+            continue
+
+        for vid, (vol_title, issue_map) in vol_data.items():
+            if not match_title(vol_title, art_series, allow_contains=True):
+                continue
+
+            iss_id = issue_map.get(art_issue_num) # type: ignore
+            if iss_id is not None:
+                downloads.extend(
+                    _results_to_downloads((article,), vid, iss_id)
                 )
-                if volume_datas:
-                    update_volume_metadata(cv_to_id_fetch, volume_datas)
+                queued_links.add(article['link'])
+                break
 
-        return []
+    return
 
 
 def _run_search_recent(
@@ -833,29 +1607,35 @@ def _run_search_recent(
     clear_days_back: int = 0,
     sync_missing_issues: bool = False,
     run_packs: bool = False,
-) -> List[Tuple[str, int, Union[int, None]]]:
+) -> List[Tuple[str, int, FilenameData, int, Union[int, None]]]:
     """Shared search logic for windowed SearchRecent tasks.
 
     Args:
-        task: Calling Task instance — provides stop flag and message field.
-        search_start: ISO date for the start of the search window.
-        search_end: ISO date for the end of the search window.
-        clear_days_back: If > 0, clear auto-blocklist entries for all
-            in-library missing issues in the past N days before searching,
-            so the next Fresh run can retry previously-failed links.
-        sync_missing_issues: If True, batch-fetch and upsert issues for any
-            library volume that appears in the calendar but has entries with
-            no local issue ID, then re-enrich the calendar before searching.
-            Intended for SearchRecentFresh only.
-        run_packs: Whether to run Phase 2 GetComics weekly-pack scraping.
+        task (Task): Calling task instance. Provides stop flag and message.
+        search_start (str): ISO date for the start of the search window.
+        search_end (str): ISO date for the end of the search window.
+        clear_days_back (int, optional): If > 0, clear auto-blocklist entries
+            for all in-library missing issues in the past N days before
+            searching, so the next Fresh run can retry previously-failed links.
+            Defaults to 0.
+        sync_missing_issues (bool, optional): If True, batch-fetch and upsert
+            issues for any library volume that appears in the calendar but has
+            entries with no local issue ID, then re-enrich the calendar before
+            searching.
+            Defaults to False.
+        run_packs (bool, optional): Whether to scrape GetComics weekly packs.
+            Defaults to False.
+
+    Returns:
+        List[Tuple[str, int, FilenameData, int, Union[int, None]]]: Downloads.
     """
     from backend.features.calendar import get_calendar
 
     ws = WebSocket()
 
-    # Blocklist clearing (Week task only). Fetches a wider range than the
-    # search window so it also un-blocks issues in the Fresh window, causing
-    # the next Fresh run to retry them.
+    # Blocklist clearing. Fetches a wider range than the search window so it
+    # also un-blocks issues in the Fresh window, causing the next Fresh run to
+    # retry them.
     if clear_days_back:
         today_iso = date.today().isoformat()
         clear_start = (
@@ -871,13 +1651,13 @@ def _run_search_recent(
         })
         if in_scope_ids:
             placeholders = ','.join('?' * len(in_scope_ids))
-            with get_db() as cursor:
-                cursor.execute(
-                    "DELETE FROM blocklist "
-                    f"WHERE issue_id IN ({placeholders}) "
-                    "AND reason != ?",
-                    (*in_scope_ids, BlocklistReasonID.ADDED_BY_USER.value)
-                )
+            get_db().execute(
+                "DELETE FROM blocklist "
+                f"WHERE issue_id IN ({placeholders}) "
+                "AND reason != ?",
+                (*in_scope_ids, BlocklistReasonID.ADDED_BY_USER.value)
+            )
+            commit()
             LOGGER.debug(
                 '%s: cleared stale blocklist for %d issue(s) '
                 'across the past %d days',
@@ -888,8 +1668,8 @@ def _run_search_recent(
 
     # Pre-pass: for volumes that appear in the calendar but have issues with
     # no local ID, batch-fetch and upsert their recent issues from CV so the
-    # main loop can search by specific issue rather than refreshing the whole
-    # volume one-at-a-time.
+    # main loop can search by specific issue instead of refreshing the whole
+    # volume one at a time.
     if sync_missing_issues:
         vols_with_gaps = {
             i['volume_id_local']
@@ -913,11 +1693,9 @@ def _run_search_recent(
                 # 7-day window catches new issues and recent CV edits.
                 since = int(time()) - 7 * 86400
                 try:
-                    issue_datas = run(
-                        ComicVine().fetch_issues_since(
-                            tuple(cv_to_id_fetch.keys()), since
-                        )
-                    )
+                    issue_datas = run(ComicVine().fetch_issues_since(
+                        tuple(cv_to_id_fetch.keys()), since
+                    ))
                     if issue_datas:
                         upsert_issues(cv_to_id_fetch, issue_datas)
                         LOGGER.info(
@@ -925,8 +1703,7 @@ def _run_search_recent(
                             'with calendar gaps',
                             task.display_title, len(vols_with_gaps)
                         )
-                        # Re-enrich the calendar so issue_id_local now
-                        # reflects the newly-added issues.
+                        # Re-enrich so issue_id_local reflects new issues.
                         calendar_issues = get_calendar(
                             search_start, search_end
                         )
@@ -937,10 +1714,11 @@ def _run_search_recent(
                         exc_info=True
                     )
 
-    downloads: List[Tuple[str, int, Union[int, None]]] = []
-    searched_volumes: set = set()
+    downloads: List[Tuple[str, int, FilenameData, int, Union[int, None]]] = []
+    searched_volumes: Set[int] = set()
 
     for issue in calendar_issues:
+        task.check_yield()
         if task.stop:
             break
         if not issue['in_library'] or not issue['volume_monitored']:
@@ -960,122 +1738,55 @@ def _run_search_recent(
                 f'#{issue.get("issue_number", "?")}'
             )
             ws.emit(TaskStatusEvent(task.message))
-            results = auto_search(vol_id, iss_id)
-            if results:
-                downloads += [
-                    (result['link'], vol_id, iss_id)
-                    for result in results
-                ]
-        else:
-            # Issue not yet in local DB — refresh the volume first so the
-            # issue gets added, then search for the specific issue only.
-            if vol_id in searched_volumes:
-                continue
-            searched_volumes.add(vol_id)
-            task.message = (
-                f'Syncing {issue["volume_name"]} '
-                f'(new issue #{issue.get("issue_number", "?")})'
+            downloads += _results_to_downloads(
+                auto_search(vol_id, iss_id), vol_id, iss_id
             )
-            ws.emit(TaskStatusEvent(task.message))
-            try:
-                from backend.implementations.volumes import refresh_and_scan
-                refresh_and_scan(vol_id)
-            except Exception:
-                LOGGER.warning(
-                    'Failed to refresh volume %d during %s',
-                    vol_id, task.display_title
-                )
-                continue
+            continue
 
-            cv_issue_id = issue.get('comicvine_id')
-            local_iss_id = None
-            if cv_issue_id:
-                row = get_db().execute(
-                    "SELECT id FROM issues WHERE comicvine_id = ?",
-                    (cv_issue_id,)
-                ).fetchone()
-                if row:
-                    local_iss_id = row[0]
-
-            task.message = (
-                f'Searching for {issue["volume_name"]} '
-                f'#{issue.get("issue_number", "?")}'
-            )
-            ws.emit(TaskStatusEvent(task.message))
-            results = auto_search(vol_id, local_iss_id)
-            if results:
-                downloads += [
-                    (result['link'], vol_id, local_iss_id)
-                    for result in results
-                ]
-
-    # Phase 2: GetComics weekly packs (Fresh window only — packs are current).
-    if run_packs and not task.stop:
+        # Issue not yet in local DB. Refresh the volume first so the issue
+        # gets added, then search for the specific issue only.
+        if vol_id in searched_volumes:
+            continue
+        searched_volumes.add(vol_id)
+        task.message = (
+            f'Syncing {issue["volume_name"]} '
+            f'(new issue #{issue.get("issue_number", "?")})'
+        )
+        ws.emit(TaskStatusEvent(task.message))
         try:
-            from asyncio import run as _async_run
-
-            from backend.base.helpers import AsyncSession
-            from backend.implementations.getcomics import scrape_weekly_packs
-            from backend.implementations.matching import match_title
-
-            task.message = 'Scanning GetComics weekly packs'
-            ws.emit(TaskStatusEvent(task.message))
-
-            async def _fetch_packs():
-                async with AsyncSession() as session:
-                    return await scrape_weekly_packs(session, pack_count=3)
-
-            pack_articles = _async_run(_fetch_packs())
-
-            if pack_articles:
-                open_rows = get_db().execute(
-                    """
-                    SELECT v.id AS volume_id, v.title,
-                           i.id AS issue_id,
-                           i.calculated_issue_number
-                    FROM volumes v
-                    INNER JOIN issues i ON i.volume_id = v.id
-                    LEFT JOIN issues_files if_ ON if_.issue_id = i.id
-                    WHERE v.monitored = 1
-                      AND i.monitored = 1
-                      AND if_.issue_id IS NULL
-                    """
-                ).fetchalldict()
-
-                vol_data: Dict[int, tuple] = {}
-                for row in open_rows:
-                    vid = row['volume_id']
-                    if vid not in vol_data:
-                        vol_data[vid] = (row['title'], {})
-                    vol_data[vid][1][
-                        row['calculated_issue_number']
-                    ] = row['issue_id']
-
-                queued_links = {d[0] for d in downloads}
-
-                for article in pack_articles:
-                    if task.stop:
-                        break
-                    art_link = article.get('link', '')
-                    art_series = (article.get('series') or '').strip()
-                    art_issue_num = article.get('issue_number')
-                    if not art_link or not art_series:
-                        continue
-                    if art_link in queued_links:
-                        continue
-                    for vid, (vol_title, issue_map) in vol_data.items():
-                        if match_title(
-                            vol_title, art_series, allow_contains=True
-                        ):
-                            iss_id = issue_map.get(art_issue_num)
-                            if iss_id is not None:
-                                downloads.append((art_link, vid, iss_id))
-                                queued_links.add(art_link)
-                                break
-
+            refresh_and_scan(vol_id)
         except Exception:
             LOGGER.warning(
-                '%s Phase 2 (weekly packs) failed',
+                'Failed to refresh volume %d during %s',
+                vol_id, task.display_title
+            )
+            continue
+
+        local_iss_id = None
+        cv_issue_id = issue.get('comicvine_id')
+        if cv_issue_id:
+            row = get_db().execute(
+                "SELECT id FROM issues WHERE comicvine_id = ?",
+                (cv_issue_id,)
+            ).fetchone()
+            if row:
+                local_iss_id = row[0]
+
+        task.message = (
+            f'Searching for {issue["volume_name"]} '
+            f'#{issue.get("issue_number", "?")}'
+        )
+        ws.emit(TaskStatusEvent(task.message))
+        downloads += _results_to_downloads(
+            auto_search(vol_id, local_iss_id), vol_id, local_iss_id
+        )
+
+    if run_packs and not task.stop:
+        try:
+            _scrape_gc_weekly_packs(task, downloads)
+        except Exception:
+            LOGGER.warning(
+                '%s: weekly pack scraping failed',
                 task.display_title,
                 exc_info=True
             )
@@ -1083,22 +1794,22 @@ def _run_search_recent(
     return downloads
 
 
-class SearchRecentFresh(Task):
-    """Search issues in the ±6-day/+7-day window. Runs hourly, no blocklist
-    clearing — stays fast. Blocklist is reset by SearchRecentWeek (daily)
-    so the run after that will be longer as previously-blocked issues retry."""
+@TaskHandler.register_task('search_recent_fresh')
+class SearchRecentFresh(LibraryTask, DownloadTask):
+    """Search issues in the -6/+7-day window. Runs hourly, no blocklist
+    clearing, so it stays fast. The blocklist is reset by SearchRecentWeek
+    (daily) so the run after that is longer as previously-blocked issues
+    retry."""
 
     stop = False
     message = ''
-    action = 'search_recent_fresh'
     display_title = 'Search Recent (Fresh)'
+    priority = 3
     description = (
         'Searches for missing issues released in the past 6 days or due in'
         ' the next 7 days. Runs hourly with no blocklist clearing to stay'
         ' fast. Includes GetComics weekly-pack scraping.'
     )
-    category = 'download'
-    priority = 3
 
     @property
     def volume_id(self) -> None:
@@ -1111,7 +1822,7 @@ class SearchRecentFresh(Task):
     def __init__(self) -> None:
         return
 
-    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+    def run(self) -> List[Tuple[str, int, FilenameData, int, Union[int, None]]]:
         today = date.today()
         self.message = 'Searching for recent releases (fresh)'
         WebSocket().emit(TaskStatusEvent(self.message))
@@ -1119,27 +1830,25 @@ class SearchRecentFresh(Task):
             self,
             search_start=(today - timedelta(days=6)).isoformat(),
             search_end=(today + timedelta(days=7)).isoformat(),
-            clear_days_back=0,
             sync_missing_issues=True,
             run_packs=True,
         )
 
 
-class SearchRecentWeek(Task):
-    """Search 7–13-day-old issues daily. Also clears the auto-blocklist for
-    the full 0–13-day window, so the next Fresh run retries blocked issues."""
+@TaskHandler.register_task('search_recent_week')
+class SearchRecentWeek(LibraryTask, DownloadTask):
+    """Search 7-13-day-old issues daily. Also clears the auto-blocklist for the
+    full 0-13-day window, so the next Fresh run retries blocked issues."""
 
     stop = False
     message = ''
-    action = 'search_recent_week'
     display_title = 'Search Recent (Week-old)'
+    priority = 3
     description = (
-        'Searches for missing issues released 7–13 days ago. Also clears the'
+        'Searches for missing issues released 7-13 days ago. Also clears the'
         ' auto-blocklist for the past 13 days so the next Fresh run retries'
         ' any previously-failed links.'
     )
-    category = 'download'
-    priority = 3
 
     @property
     def volume_id(self) -> None:
@@ -1152,7 +1861,7 @@ class SearchRecentWeek(Task):
     def __init__(self) -> None:
         return
 
-    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+    def run(self) -> List[Tuple[str, int, FilenameData, int, Union[int, None]]]:
         today = date.today()
         self.message = 'Searching for week-old releases'
         WebSocket().emit(TaskStatusEvent(self.message))
@@ -1161,25 +1870,23 @@ class SearchRecentWeek(Task):
             search_start=(today - timedelta(days=13)).isoformat(),
             search_end=(today - timedelta(days=7)).isoformat(),
             clear_days_back=13,
-            run_packs=False,
         )
 
 
-class SearchRecentStale(Task):
-    """Search 14–20-day-old issues every 72 hours. No blocklist clearing —
+@TaskHandler.register_task('search_recent_stale')
+class SearchRecentStale(LibraryTask, DownloadTask):
+    """Search 14-20-day-old issues every 72 hours. No blocklist clearing, as
     links that old have already been retried enough by the Week task."""
 
     stop = False
     message = ''
-    action = 'search_recent_stale'
     display_title = 'Search Recent (Stale)'
+    priority = 3
     description = (
-        'Searches for missing issues released 14–20 days ago, every 72 hours.'
-        ' No blocklist clearing — issues that old have already had plenty of'
+        'Searches for missing issues released 14-20 days ago, every 72 hours.'
+        ' No blocklist clearing, as issues that old have already had plenty of'
         ' retry opportunities from the Week task.'
     )
-    category = 'download'
-    priority = 3
 
     @property
     def volume_id(self) -> None:
@@ -1192,7 +1899,7 @@ class SearchRecentStale(Task):
     def __init__(self) -> None:
         return
 
-    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+    def run(self) -> List[Tuple[str, int, FilenameData, int, Union[int, None]]]:
         today = date.today()
         self.message = 'Searching for stale releases'
         WebSocket().emit(TaskStatusEvent(self.message))
@@ -1200,24 +1907,22 @@ class SearchRecentStale(Task):
             self,
             search_start=(today - timedelta(days=20)).isoformat(),
             search_end=(today - timedelta(days=14)).isoformat(),
-            clear_days_back=0,
-            run_packs=False,
         )
 
 
+# region Fork system tasks
+@TaskHandler.register_task('health_check')
 class HealthCheck(Task):
-    """Run health checks and dispatch notifications for any issues found."""
+    "Run health checks and dispatch notifications for any issues found"
 
     stop = False
     message = ''
-    action = 'health_check'
     display_title = 'Health Check'
+    priority = 3
     description = (
         'Runs library health checks (missing root folders, invalid API keys,'
         ' etc.) and dispatches any configured notifications for issues found.'
     )
-    category = 'maintenance'
-    priority = 3
 
     @property
     def volume_id(self) -> None:
@@ -1230,7 +1935,7 @@ class HealthCheck(Task):
     def __init__(self) -> None:
         return
 
-    def run(self) -> List[Tuple[str, int, Union[int, None]]]:
+    def run(self) -> None:
         from backend.features.health_checks import run_health_checks
         from backend.features.notifications import NotificationService
 
@@ -1256,473 +1961,4 @@ class HealthCheck(Task):
             if count else 'Health check complete: no issues found'
         )
         ws.emit(TaskStatusEvent(self.message))
-
-        return []
-
-
-# =====================
-# Task handling
-# =====================
-# Maps action attr to class for all tasks
-# Only works for classes that directly inherit from Task
-task_library: Dict[str, Type[Task]] = {
-    c.action: c
-    for c in get_subclasses(Task)
-}
-
-
-INTERVAL_TASK_DEFAULTS: Dict[str, int] = {
-    'sync_issues': 86400,
-    'refresh_metadata': 604800,
-    'scan_files': 86400,
-    'special_version_refresh': 86400,
-    'search_all': 604800,
-    'refresh_calendar': 86400,
-    'search_recent_fresh': 3600,    # 1 hour — no blocklist clearing, fast
-    'search_recent_week': 86400,    # 24 hours — clears blocklist 0–13 days
-    'search_recent_stale': 259200,  # 72 hours — last-chance for 14–20 day issues
-    'health_check': 86400,
-}
-
-
-def ensure_interval_task_rows() -> None:
-    """Repair task_intervals rows for legacy and missing interval tasks."""
-    cursor = get_db()
-    now = round(time())
-
-    for legacy in ('update_all', 'search_recent'):
-        removed = cursor.execute(
-            "DELETE FROM task_intervals WHERE task_name = ?;",
-            (legacy,)
-        ).rowcount
-        if removed:
-            LOGGER.info('Removed legacy task interval row: %s', legacy)
-
-    cursor.executemany(
-        "INSERT OR IGNORE INTO task_intervals (task_name, interval, next_run)"
-        " VALUES (?, ?, ?);",
-        [
-            (task_name, interval, now)
-            for task_name, interval in INTERVAL_TASK_DEFAULTS.items()
-            if task_name in task_library
-        ]
-    )
-
-    cursor.connection.commit()
-    return
-
-
-class TaskHandler(metaclass=Singleton):
-    "Note: Singleton"
-
-    queue: List[dict] = []
-    task_interval_waiter: Union[Timer, None] = None
-
-    def __init__(self) -> None:
-        """Setup the handler"""
-        handler_context = Flask('handler')
-        handler_context.teardown_appcontext(close_db)
-        self.context = handler_context.app_context
         return
-
-    def __run_task(self, task: Task) -> None:
-        """Run a task
-
-        Args:
-            task (Task): The task to run
-        """
-        LOGGER.debug(f'Running task {task.display_title}')
-        with self.context():
-            _start = round(time())
-            socket = WebSocket()
-            try:
-                result = task.run()
-                _duration = round(time()) - _start
-                cursor = get_db()
-
-                # Note in history
-                cursor.execute(
-                    "INSERT INTO task_history VALUES (?,?,?,?);",
-                    (task.action, task.display_title, round(time()), _duration)
-                )
-
-                if not task.stop:
-                    if task.category == 'download' and result:
-                        DownloadHandler().add_multiple(
-                            (link, volume_id, issue_id, False)
-                            for link, volume_id, issue_id in result
-                        )
-
-                    LOGGER.info(f'Finished task {task.display_title}')
-
-            except Exception:
-                LOGGER.exception(
-                    'An error occured while trying to run a task: ')
-                task.message = 'AN ERROR OCCURED'
-                socket.emit(TaskStatusEvent(task.message))
-                sleep(1.5)
-
-            finally:
-                if not task.stop:
-                    socket.emit(TaskEndedEvent(task))
-                    self.queue.pop(0)
-                    self._process_queue()
-
-        return
-
-    def _process_queue(self) -> None:
-        """
-        Handle the queue. In the case that there is something in the queue and
-        it isn't already running, start the task. This can safely be called
-        multiple times while a task is going or while there is nothing in the
-        queue. Also resumes paused tasks when they reach the front.
-        """
-        if not self.queue:
-            return
-
-        first_entry = self.queue[0]
-        if first_entry['status'] == 'paused':
-            first_entry['status'] = 'running'
-            first_entry['task']._ensure_yield_event().set()
-        elif first_entry['status'] != 'running':
-            first_entry['status'] = 'running'
-            first_entry['thread'].start()
-        return
-
-    def add(self, task: Task) -> int:
-        """Add a task to the queue
-
-        Args:
-            task (Task): The task to add to the queue
-
-        Returns:
-            int: The id of the entry in the queue
-        """
-        LOGGER.debug(f'Adding task to queue: {task.display_title}')
-        id = self.queue[-1]['id'] + 1 if self.queue else 1
-        task_data = {
-            'task': task,
-            'id': id,
-            'status': 'queued',
-            'thread': Thread(
-                target=self.__run_task,
-                args=(task,),
-                name=f"TaskThread-{id}"
-            )
-        }
-
-        # Check for priority preemption: if a lower-priority task
-        # is running and this task has higher priority, pause it.
-        if (
-            self.queue
-            and self.queue[0]['status'] == 'running'
-            and task.priority < self.queue[0]['task'].priority
-        ):
-            running_entry = self.queue[0]
-            running_task = running_entry['task']
-            LOGGER.info(
-                'Preempting %s (pri %d) for %s (pri %d)',
-                running_task.display_title,
-                running_task.priority,
-                task.display_title,
-                task.priority
-            )
-            running_entry['status'] = 'paused'
-            running_task._ensure_yield_event().clear()
-            # Insert at position 0 so it runs next
-            self.queue.insert(0, task_data)
-        else:
-            # Insert before any paused task so queued tasks
-            # drain before the paused task resumes.
-            insert_idx = len(self.queue)
-            for i, entry in enumerate(self.queue):
-                if entry['status'] == 'paused':
-                    insert_idx = i
-                    break
-            self.queue.insert(insert_idx, task_data)
-
-        LOGGER.info(f'Added task: {task.display_title} ({id})')
-        WebSocket().emit(TaskAddedEvent(task))
-        self._process_queue()
-        return id
-
-    @staticmethod
-    def task_for_volume_running(volume_id: int) -> bool:
-        """Whether or not there is a task in the queue that targets the volume.
-
-        Args:
-            volume_id (int): The volume ID to check for.
-
-        Returns:
-            bool: Whether or not a task is in the queue targeting the volume.
-        """
-        return any(
-            t
-            for t in TaskHandler.queue
-            if (isinstance(t['task'], (SyncIssues, RefreshMetadata, ScanFiles,
-                                       SpecialVersionRefresh, SearchAll,
-                                       SearchRecentFresh, SearchRecentWeek,
-                                       SearchRecentStale))
-                or t['task'].volume_id == volume_id)
-        )
-
-    def __check_intervals(self) -> None:
-        "Check if any interval task needs to be run and add to queue if so"
-        LOGGER.debug('Checking task intervals')
-        with self.context():
-            current_time = time()
-            ensure_interval_task_rows()
-
-            cursor = get_db()
-            interval_tasks = cursor.execute(
-                "SELECT task_name, interval, next_run FROM task_intervals;"
-            ).fetchall()
-            LOGGER.debug(f'Task intervals: {list(map(dict, interval_tasks))}')
-
-            # Collect task types already queued/running to prevent duplicates
-            queued_actions = {
-                t['task'].action for t in self.queue
-            }
-
-            for task in interval_tasks:
-                if task['next_run'] <= current_time:
-                    # Update next_run regardless of whether we queue
-                    # (prevents accumulating missed intervals)
-                    next_run = round(current_time + task['interval'])
-                    cursor.execute(
-                        "UPDATE task_intervals SET next_run = ? WHERE task_name = ?;",
-                        (next_run, task['task_name']))
-
-                    # Skip if this task type is already queued or running
-                    if task['task_name'] in queued_actions:
-                        LOGGER.info(
-                            'Skipping %s — already in queue',
-                            task['task_name']
-                        )
-                        continue
-
-                    # Add task to queue
-                    task_class = task_library.get(task['task_name'])
-                    if task_class is None:
-                        LOGGER.warning(
-                            'Skipping unknown interval task: %s',
-                            task['task_name']
-                        )
-                        continue
-
-                    inst = task_class()
-                    self.add(inst)
-
-        self.handle_intervals()
-        return
-
-    def handle_intervals(self) -> None:
-        "Find next time an interval task needs to be run"
-        with self.context():
-            ensure_interval_task_rows()
-            next_run = get_db().execute(
-                "SELECT MIN(next_run) FROM task_intervals"
-            ).fetchone()[0]
-
-        if next_run is None:
-            next_run = round(time()) + 60
-
-        timedelta = next_run - round(time()) + 1
-        LOGGER.debug(f'Next interval task is in {timedelta} seconds')
-
-        self.task_interval_waiter = Timer(timedelta, self.__check_intervals)
-        self.task_interval_waiter.name = "TaskIntervalThread"
-        self.task_interval_waiter.start()
-        return
-
-    def stop_handle(self) -> None:
-        "Stop the task handler"
-        LOGGER.debug('Stopping task thread')
-
-        if self.task_interval_waiter:
-            self.task_interval_waiter.cancel()
-
-        # Stop all tasks — resume paused ones first so they
-        # can observe the stop flag and exit cleanly.
-        for entry in self.queue:
-            entry['task'].stop = True
-            if entry['status'] == 'paused':
-                entry['task']._ensure_yield_event().set()
-
-        if self.queue and self.queue[0]['status'] in (
-            'running', 'paused'
-        ):
-            self.queue[0]['thread'].join()
-
-        return
-
-    def __format_entry(self, task: dict) -> dict:
-        """Format a queue entry for API response
-
-        Args:
-            t (dict): The queue entry
-
-        Returns:
-            dict: The formatted queue entry
-        """
-        return {
-            'id': task['id'],
-            'action': task['task'].action,
-            'display_title': task['task'].display_title,
-            'status': task['status'],
-            'message': task['task'].message,
-            'volume_id': task['task'].volume_id,
-            'issue_id': task['task'].issue_id
-        }
-
-    def get_all(self) -> List[dict]:
-        """Get all tasks in the queue
-
-        Returns:
-            List[dict]: A list with all tasks in the queue.
-                Formatted using `self.__format_entry()`.
-        """
-        return [self.__format_entry(t) for t in self.queue]
-
-    def get_one(self, task_id: int) -> dict:
-        """Get one task from the queue based on it's id
-
-        Args:
-            task_id (int): The id of the task to get from the queue
-
-        Raises:
-            TaskNotFound: The id doesn't match with any task in the queue
-
-        Returns:
-            dict: The info of the task in the queue.
-                Formatted using `self.__format_entry()`.
-        """
-        for entry in self.queue:
-            if entry['id'] == task_id:
-                return self.__format_entry(entry)
-        raise TaskNotFound(task_id)
-
-    def remove(self, task_id: int) -> None:
-        """Remove a task from the queue, including the currently running task.
-
-        Args:
-            task_id (int): The id of the task to delete from the queue
-
-        Raises:
-            TaskNotFound: The id doesn't map to any task in the queue
-        """
-        # Find the raw queue entry (get_one returns a formatted dict, not usable
-        # here)
-        raw_entry = None
-        for entry in self.queue:
-            if entry['id'] == task_id:
-                raw_entry = entry
-                break
-
-        if raw_entry is None:
-            raise TaskNotFound(task_id)
-
-        was_active = raw_entry['status'] in ('running', 'paused')
-
-        # Signal the task to stop at the next safe checkpoint
-        raw_entry['task'].stop = True
-
-        # Resume paused tasks so they can observe the stop flag
-        if raw_entry['status'] == 'paused':
-            raw_entry['task']._ensure_yield_event().set()
-
-        if was_active:
-            # Wait for the thread to honour the stop flag and exit.
-            # __run_task's finally block skips queue cleanup when task.stop is True,
-            # so we handle it here instead.
-            raw_entry['thread'].join()
-
-        try:
-            self.queue.remove(raw_entry)
-        except ValueError:
-            # Task finished naturally between our check and the join —
-            # __run_task already cleaned up the queue, nothing left to do.
-            return
-
-        LOGGER.info(
-            f'Removed task: {raw_entry["task"].display_title} ({task_id})')
-        WebSocket().emit(TaskEndedEvent(raw_entry['task']))
-
-        if was_active:
-            # Kick off the next queued task (normally done by __run_task)
-            self._process_queue()
-
-        return
-
-
-def get_task_history(offset: int = 0) -> List[dict]:
-    """Get the task history in blocks of 50.
-
-    Args:
-        offset (int, optional): The offset of the list.
-            The higher the number, the deeper into history you go.
-
-            Defaults to 0.
-
-    Returns:
-        List[dict]: The history entries.
-    """
-    result = get_db().execute(
-        """
-        SELECT
-            task_name, display_title, run_at, duration_seconds
-        FROM task_history
-        ORDER BY run_at DESC
-        LIMIT 50
-        OFFSET ?;
-        """,
-        (offset * 50,)
-    ).fetchalldict()
-    return result
-
-
-def delete_task_history() -> None:
-    "Delete the complete task history"
-    LOGGER.info(f'Deleting task history')
-    get_db().execute("DELETE FROM task_history;")
-    return
-
-
-def get_task_planning() -> List[dict]:
-    """Get the planning of each interval task (interval, next run and last run)
-
-    Returns:
-        List[dict]: List of interval tasks and their planning
-    """
-    ensure_interval_task_rows()
-
-    tasks = get_db().execute(
-        """
-        SELECT
-            i.task_name, interval, next_run, run_at AS last_run
-        FROM task_intervals i
-        LEFT JOIN (
-            SELECT
-                task_name,
-                MAX(run_at) AS run_at
-            FROM task_history
-            GROUP BY task_name
-        ) h
-        ON i.task_name = h.task_name;
-        """
-    ).fetchalldict()
-
-    for t in tasks:
-        task_class = task_library.get(t['task_name'])
-        if task_class is None:
-            LOGGER.warning(
-                'Unknown interval task in planning: %s',
-                t['task_name']
-            )
-            t['display_name'] = t['task_name'].replace('_', ' ').title()
-            t['description'] = ''
-        else:
-            t['display_name'] = task_class.display_title
-            t['description'] = getattr(task_class, 'description', '')
-
-    return tasks

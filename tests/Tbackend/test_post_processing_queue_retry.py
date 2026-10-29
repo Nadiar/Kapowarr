@@ -18,7 +18,11 @@ if 'pwd' not in sys.modules:
         getpwuid=lambda *_args, **_kwargs: None
     )
 
-from backend.features.post_processing import remove_from_queue
+from backend.features.post_processing import PostProcessingContext
+
+
+def remove_from_queue(download) -> None:
+    PostProcessingContext(download).remove_from_queue()
 
 
 class _RetryCursor:
@@ -37,7 +41,7 @@ class _RetryCursor:
 class TestRemoveFromQueueRetries(unittest.TestCase):
     def test_remove_from_queue_retries_on_db_lock(self):
         cursor = _RetryCursor(failures_before_success=2)
-        download = SimpleNamespace(id=42)
+        download = SimpleNamespace(id=42, files=[])
 
         with patch('backend.features.post_processing.get_db',
                    return_value=cursor):
@@ -45,10 +49,9 @@ class TestRemoveFromQueueRetries(unittest.TestCase):
                 remove_from_queue(download)
 
         self.assertEqual(cursor.execute_calls, 3)
-        cursor.connection.commit.assert_called_once()
 
     def test_remove_from_queue_raises_on_non_lock_operational_error(self):
-        download = SimpleNamespace(id=7)
+        download = SimpleNamespace(id=7, files=[])
 
         class _ErrorCursor:
             def execute(self, *_args, **_kwargs):

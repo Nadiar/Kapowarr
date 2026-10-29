@@ -10,16 +10,8 @@ from subprocess import Popen
 from sys import argv
 from typing import NoReturn, Union
 
-from backend.base.custom_exceptions import InvalidKeyValue
-from backend.base.definitions import Constants, ProxyType, StartType
-from backend.base.helpers import (apply_proxy, build_proxy_url,
-                                  check_min_python_version, get_python_exe)
-from backend.base.logging import LOGGER, setup_logging
-from backend.features.download_queue import DownloadHandler
-from backend.features.tasks import TaskHandler
-from backend.internals.db import set_db_location, setup_db
-from backend.internals.server import Server, StartTypeHandlers
-from backend.internals.settings import Settings
+from backend.base.definitions import Constants, StartType
+from backend.base.helpers import get_python_exe
 
 
 def _main(
@@ -70,6 +62,24 @@ def _main(
         NoReturn: Exit code 0 means to shutdown.
         Exit code 131 or higher means to restart with possibly special reasons.
     """
+    from backend.base.custom_exceptions import InvalidKeyValue
+    from backend.base.definitions import ProxyType
+    from backend.base.helpers import (apply_proxy, build_proxy_url,
+                                      check_min_python_version)
+    from backend.base.logging import LOGGER, setup_logging
+    from backend.features.download_queue import DownloadHandler
+    from backend.features.tasks import TaskHandler
+    from backend.implementations.download_client_manager import DownloadClients
+    from backend.implementations.download_prepper_manager import \
+        DownloadPreppers
+    from backend.implementations.external_client_manager import ExternalClients
+    from backend.implementations.indexer_client_manager import IndexerClients
+    from backend.implementations.query_builder_manager import QueryBuilders
+    from backend.internals.db import set_db_location, setup_db
+    from backend.internals.server import Server, StartTypeHandlers
+    from backend.internals.settings import Settings
+    from backend.internals.status import StatusHandlers
+
     set_start_method('spawn')
     setup_logging(log_folder, log_file)
     LOGGER.info('Starting up Kapowarr')
@@ -77,12 +87,19 @@ def _main(
     if not check_min_python_version(*Constants.MIN_PYTHON_VERSION):
         exit(1)
 
+    ExternalClients.trigger_client_registration()
+    DownloadPreppers.trigger_prepper_registration()
+    DownloadClients.trigger_client_registration()
+    IndexerClients.trigger_client_registration()
+    QueryBuilders.trigger_builder_registration()
+
     set_db_location(db_folder)
 
     SERVER = Server()
     with SERVER.app.app_context():
         StartTypeHandlers.start_timer(start_type)
         setup_db()
+        StatusHandlers().load_from_db()
 
         s = Settings()
 
@@ -139,6 +156,7 @@ def _main(
     finally:
         download_handler.stop_handle()
         task_handler.stop_handle()
+        ExternalClients.disconnect_clients()
 
         if restart_type is not None:
             LOGGER.info('Restarting Kapowarr')
@@ -311,6 +329,11 @@ if __name__ == "__main__":
             elif e.args[0] == 'Database location is not a folder':
                 parser.error(
                     'The value for -d/--DatabaseFolder is not a folder'
+                )
+
+            elif e.args[0] == 'Invalid temp downloads folder value':
+                parser.error(
+                    'The value for -t/--TempDownloadFolder is not a folder'
                 )
 
             elif e.args[0] == 'Logging folder is not a folder':

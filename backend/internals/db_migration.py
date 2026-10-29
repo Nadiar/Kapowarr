@@ -3,6 +3,8 @@
 from asyncio import run
 from typing import Callable, Dict, List
 
+from backend.base.definitions import DownloadType, GCDownloadService
+from backend.base.helpers import CommaList
 from backend.base.logging import LOGGER
 from backend.internals.db import get_db, iter_commit
 
@@ -49,6 +51,83 @@ class DatabaseMigrationHandler:
         return max(cls.handlers) + 1
 
     @classmethod
+    def is_first_startup(cls) -> bool:
+        """Whether this is the first startup ever. Specifically, whether the
+        config table is present in the database.
+
+        Returns:
+            bool: Whether this is the first startup ever.
+        """
+        result = get_db().execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='config';"
+        ).exists() is None
+        return result
+
+    @classmethod
+    def on_first_startup(cls) -> None:
+        """Handle the first startup ever"""
+        cursor = get_db()
+
+        # Insert GetComics indexer
+        cursor.execute("""
+            INSERT INTO indexer_clients(
+                enabled,
+                download_type, client_type,
+                title, url,
+                gc_service_preference,
+                gc_avoid_large_downloads
+            ) VALUES (
+                :enabled,
+                :download_type, :client_type,
+                :title, :url,
+                :gc_service_preference,
+                :gc_avoid_large_downloads
+            );
+            """,
+            {
+                "enabled": True,
+                "download_type": DownloadType.DDL,
+                "client_type": "GetComics",
+                "title": "GetComics",
+                "url": "https://getcomics.org",
+                "gc_service_preference": str(CommaList(
+                    (s.value for s in GCDownloadService._member_map_.values())
+                )),
+                "gc_avoid_large_downloads": False
+            }
+        )
+        return
+
+    @staticmethod
+    def _is_pre_merge_fork_db(current_db_version: int) -> bool:
+        """Whether the database was migrated with the fork's original
+        (colliding) migrations 45-50 instead of upstream's 45-51.
+
+        Upstream migration 45 adds `external_download_clients.enabled`, and the
+        fork's migration 46 created the `notifications` table. A database with
+        a version in 46..51 that has `notifications` but lacks `enabled` can
+        therefore only have come from the fork.
+        """
+        if not 45 < current_db_version <= 51:
+            return False
+
+        cursor = get_db()
+        has_notifications = cursor.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='notifications';"
+        ).exists() is not None
+        if not has_notifications:
+            return False
+
+        ec_columns = {
+            r["name"]
+            for r in cursor.execute(
+                "PRAGMA table_info(external_download_clients);"
+            ).fetchall()
+        }
+        return "enabled" not in ec_columns
+
+    @classmethod
     def migrate(cls) -> None:
         """
         Migrate a Kapowarr database from its current version to the newest
@@ -58,6 +137,21 @@ class DatabaseMigrationHandler:
 
         s = Settings()
         current_db_version = s.sv.database_version
+
+        if cls._is_pre_merge_fork_db(current_db_version):
+            # Databases created by the fork before merging upstream v1.3.2
+            # used versions 45-50 for fork-only migrations, which collide with
+            # upstream's 45-51. Rewind so upstream's migrations run; the fork
+            # migrations are re-registered as 52+ and are idempotent.
+            LOGGER.info(
+                "Detected pre-merge fork database (version %d), "
+                "rewinding to 45 to apply upstream migrations",
+                current_db_version
+            )
+            s.update({"database_version": 45})
+            s.clear_cache()
+            current_db_version = 45
+
         newest_version = cls.latest_db_version()
 
         if current_db_version > newest_version:
@@ -518,14 +612,9 @@ def _migrate_tpb_naming_to_special_version_naming():
 
 @DatabaseMigrationHandler.register_handler(19)
 def _migrate_add_we_transfer_to_preference():
-    from backend.internals.settings import Settings
-
-    service_preference = Settings().sv.service_preference
-    service_preference.append("wetransfer")
-    get_db().execute(
-        "UPDATE config SET value = ? WHERE key = 'service_preference';",
-        (service_preference,)
-    )
+    # This migration used to add WeTransfer to the service preference list.
+    # This setting doesn't exist anymore, as it was moved to the indexer
+    # setting.
     return
 
 
@@ -540,15 +629,9 @@ def _migrate_clear_unsupported_source_blocklist_entries():
 
 @DatabaseMigrationHandler.register_handler(21)
 def _migrate_add_pixel_drain_to_preference():
-    from backend.internals.settings import Settings
-
-    service_preference = Settings().sv.service_preference
-    service_preference.append("pixeldrain")
-    get_db().execute(
-        "UPDATE config SET value = ? WHERE key = 'service_preference';",
-        (service_preference,)
-    )
-
+    # This migration used to add WeTransfer to the service preference list.
+    # This setting doesn't exist anymore, as it was moved to the indexer
+    # setting.
     return
 
 
@@ -581,29 +664,9 @@ def _migrate_add_links_in_download_queue():
 
 @DatabaseMigrationHandler.register_handler(23)
 def _migrate_service_preference_to_enum_values():
-    from backend.base.definitions import GCDownloadSource
-    from backend.base.helpers import CommaList
-    from backend.internals.settings import Settings
-
-    source_string_to_enum = {
-        'mega': GCDownloadSource.MEGA.value,
-        'mediafire': GCDownloadSource.MEDIAFIRE.value,
-        'wetransfer': GCDownloadSource.WETRANSFER.value,
-        'pixeldrain': GCDownloadSource.PIXELDRAIN.value,
-        'getcomics': GCDownloadSource.GETCOMICS.value,
-        'getcomics (torrent)': GCDownloadSource.GETCOMICS_TORRENT.value
-    }
-
-    new_service_preference = CommaList((
-        source_string_to_enum[service.lower()]
-        for service in Settings().sv.service_preference
-    ))
-
-    get_db().execute(
-        "UPDATE config SET value = ? WHERE key = 'service_preference';",
-        (new_service_preference,)
-    )
-
+    # This migration used to add WeTransfer to the service preference list.
+    # This setting doesn't exist anymore, as it was moved to the indexer
+    # setting.
     return
 
 
@@ -1187,15 +1250,152 @@ def _migrate_add_forced_file_match_column():
 
 
 @DatabaseMigrationHandler.register_handler(45)
+def _migrate_add_enabled_option_to_ec():
+    get_db().execute("""
+        ALTER TABLE external_download_clients
+            ADD COLUMN enabled BOOL NOT NULL DEFAULT 1;
+    """)
+
+    return
+
+
+@DatabaseMigrationHandler.register_handler(46)
+def _migrate_blocklist_source_to_download_service():
+    get_db().execute("""
+        ALTER TABLE blocklist
+            RENAME COLUMN source TO download_service;
+    """)
+
+    return
+
+
+@DatabaseMigrationHandler.register_handler(47)
+def _migrate_add_gc_indexer() -> None:
+    cursor = get_db()
+
+    service_preference = cursor.execute(
+        "SELECT value FROM config WHERE key = 'service_preference';"
+    ).exists()
+
+    get_db().execute("""
+        INSERT INTO indexer_clients(
+            enabled,
+            download_type, client_type,
+            title, url,
+            gc_service_preference,
+            gc_avoid_large_downloads
+        ) VALUES (
+            :enabled,
+            :download_type, :client_type,
+            :title, :url,
+            :gc_service_preference,
+            :gc_avoid_large_downloads
+        );
+        """,
+        {
+            "enabled": True,
+            "download_type": DownloadType.DDL,
+            "client_type": "GetComics",
+            "title": "GetComics",
+            "url": "https://getcomics.org",
+            "gc_service_preference": service_preference,
+            "gc_avoid_large_downloads": False
+        }
+    )
+
+    cursor.execute(
+        "DELETE FROM config WHERE key = 'service_preference';"
+    )
+
+    return
+
+
+@DatabaseMigrationHandler.register_handler(48)
+def _migrate_fix_avoid_large_downloads() -> None:
+    get_db().execute(
+        "UPDATE indexer_clients SET gc_avoid_large_downloads=0;"
+    )
+
+    return
+
+
+@DatabaseMigrationHandler.register_handler(49)
+def _migrate_task_intervals_to_schedule() -> None:
+    from backend.base.helpers import get_schedules_next_run
+    from backend.features.tasks import TASK_INTERVALS
+
+    cursor = get_db()
+
+    cursor.execute("DROP TABLE task_intervals;")
+    cursor.execute("""
+        CREATE TABLE task_intervals(
+            task_name PRIMARY KEY,
+            schedule TEXT NOT NULL,
+            next_run INTEGER NOT NULL
+        );
+    """)
+
+    cursor.executemany(
+        """
+        INSERT INTO task_intervals(task_name, schedule, next_run)
+        VALUES (?, ?, ?);
+        """,
+        (
+            (task_name, schedule, get_schedules_next_run(schedule))
+            for task_name, schedule in TASK_INTERVALS.items()
+        )
+    )
+
+    return
+
+
+@DatabaseMigrationHandler.register_handler(50)
+def _migrate_remove_search_all_task() -> None:
+    get_db().execute(
+        "DELETE FROM task_intervals WHERE task_name='search_all';"
+    )
+
+    return
+
+
+@DatabaseMigrationHandler.register_handler(51)
+def _migrate_add_torrent_usenet_indexer_fields() -> None:
+    # The indexer_clients table is created by DB_SCHEMA before migrations run,
+    # so on databases coming from before migration 47 it already has these
+    # columns. Only add the ones that are missing.
+    cursor = get_db()
+    existing_columns = {
+        r["name"]
+        for r in cursor.execute(
+            "PRAGMA table_info(indexer_clients);"
+        ).fetchall()
+    }
+    for column in ("api_path", "api_key", "categories"):
+        if column not in existing_columns:
+            cursor.execute(
+                f"ALTER TABLE indexer_clients ADD COLUMN {column} VARCHAR(255);"
+            )
+
+    return
+
+
+# region Fork migrations
+# These were originally registered as 45-50 in the fork, colliding with
+# upstream. They're renumbered after upstream's and written to be idempotent,
+# since pre-merge fork databases already applied them (see
+# `DatabaseMigrationHandler._is_pre_merge_fork_db`). Task interval rows are
+# created by `insert_task_intervals()` on startup, so these don't insert them.
+
+@DatabaseMigrationHandler.register_handler(52)
 def _migrate_add_comicvine_api_url():
-    get_db().executescript("""
+    get_db().execute("""
         INSERT OR IGNORE INTO config(key, value)
         VALUES ('comicvine_api_url', 'https://comicvine.gamespot.com/api');
     """)
     return
 
 
-@DatabaseMigrationHandler.register_handler(46)
+@DatabaseMigrationHandler.register_handler(53)
 def _migrate_add_notifications():
     get_db().executescript("""
         CREATE TABLE IF NOT EXISTS notifications (
@@ -1209,14 +1409,11 @@ def _migrate_add_notifications():
             on_application_update BOOL NOT NULL DEFAULT 1,
             enabled BOOL NOT NULL DEFAULT 1
         );
-
-        INSERT OR IGNORE INTO task_intervals(task_name, interval, next_run)
-        VALUES ('health_check', 86400, 0);
     """)
     return
 
 
-@DatabaseMigrationHandler.register_handler(47)
+@DatabaseMigrationHandler.register_handler(54)
 def _migrate_add_volume_search_stats():
     get_db().executescript("""
         CREATE TABLE IF NOT EXISTS volume_search_stats (
@@ -1231,34 +1428,16 @@ def _migrate_add_volume_search_stats():
     return
 
 
-@DatabaseMigrationHandler.register_handler(48)
+@DatabaseMigrationHandler.register_handler(55)
 def _migrate_split_update_all():
-    from time import time as _time
-    now = int(_time())
-    cursor = get_db()
-    cursor.execute(
-        "DELETE FROM task_intervals WHERE task_name = 'update_all';"
+    get_db().execute(
+        "INSERT OR IGNORE INTO config(key, value) "
+        "VALUES ('last_issue_sync', '0');"
     )
-    cursor.executemany(
-        "INSERT OR IGNORE INTO task_intervals"
-        " (task_name, interval, next_run)"
-        " VALUES (?, ?, ?);",
-        [
-            ('sync_issues', 86400, now),
-            ('refresh_metadata', 604800, now),
-            ('scan_files', 86400, now),
-            ('special_version_refresh', 86400, now),
-        ]
-    )
-    cursor.execute(
-        "INSERT OR IGNORE INTO config (key, value)"
-        " VALUES ('last_issue_sync', '0');"
-    )
-    cursor.connection.commit()
     return
 
 
-@DatabaseMigrationHandler.register_handler(49)
+@DatabaseMigrationHandler.register_handler(56)
 def _migrate_task_history_duration():
     cursor = get_db()
     existing_columns = {
@@ -1269,15 +1448,13 @@ def _migrate_task_history_duration():
         return
 
     cursor.execute(
-        "ALTER TABLE task_history"
-        " ADD COLUMN duration_seconds INTEGER;"
+        "ALTER TABLE task_history ADD COLUMN duration_seconds INTEGER;"
     )
     return
 
 
-@DatabaseMigrationHandler.register_handler(50)
+@DatabaseMigrationHandler.register_handler(57)
 def _migrate_add_volume_publisher_cache():
-    """Migration 50->51: add volume_publisher_cache for calendar enrichment."""
     get_db().executescript("""
         CREATE TABLE IF NOT EXISTS volume_publisher_cache (
             comicvine_id   INTEGER PRIMARY KEY,
@@ -1287,3 +1464,4 @@ def _migrate_add_volume_publisher_cache():
             cached_at      REAL    NOT NULL
         );
     """)
+    return

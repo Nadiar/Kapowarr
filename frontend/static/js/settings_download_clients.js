@@ -1,3 +1,12 @@
+const brokenClientReasonMap = {
+    connection_error: "Failed to connect",
+    not_client_instance: "What was connected to was not the expected client",
+    version_not_supported: "The version is not supported",
+    failed_processing_response: "Got an unexpected response back",
+    access_denied: "Access denied by client but not because of invalid credentials",
+	invalid_credentials: "Failed to login with the given credentials"
+}
+
 function createUsernameInput(id) {
 	const username_row = document.createElement('tr');
 	const username_header = document.createElement('th');
@@ -53,7 +62,7 @@ function loadEditTorrent(api_key, id) {
 	const form = document.querySelector('#edit-torrent-form tbody');
 	form.dataset.id = id;
 	form.querySelectorAll(
-		'tr:not(:has(input#edit-title-input, input#edit-baseurl-input))'
+		'tr:not(:has(input#edit-title-input, input#edit-enabled-input, input#edit-baseurl-input))'
 	).forEach(el => el.remove());
 	document.querySelector('#test-torrent-edit').classList.remove(
 		'show-success', 'show-fail'
@@ -64,39 +73,39 @@ function loadEditTorrent(api_key, id) {
 	.then(client_data => {
 		const client_type = client_data.result.client_type;
 		form.dataset.type = client_type;
-		fetchAPI('/externalclients/options', api_key)
-		.then(options => {
-			const client_options = options.result[client_type];
+		const client_options = client_data.result.required_tokens;
 
-			form.querySelector('#edit-title-input').value =
-				client_data.result.title || '';
+		form.querySelector('#edit-title-input').value =
+			client_data.result.title || '';
 
-			form.querySelector('#edit-baseurl-input').value =
-				client_data.result.base_url;
+		form.querySelector('#edit-enabled-input').checked =
+			client_data.result.enabled;
 
-			if (client_options.includes('username')) {
-				const username_input = createUsernameInput('edit-username-input');
-				username_input.querySelector('input').value =
-					client_data.result.username || '';
-				form.appendChild(username_input);
-			};
+		form.querySelector('#edit-baseurl-input').value =
+			client_data.result.base_url;
 
-			if (client_options.includes('password')) {
-				const password_input = createPasswordInput('edit-password-input');
-				password_input.querySelector('input').value =
-					client_data.result.password || '';
-				form.appendChild(password_input);
-			};
+		if (client_options.includes('username')) {
+			const username_input = createUsernameInput('edit-username-input');
+			username_input.querySelector('input').value =
+				client_data.result.username || '';
+			form.appendChild(username_input);
+		};
 
-			if (client_options.includes('api_token')) {
-				const token_input = createApiTokenInput('edit-token-input');
-				token_input.querySelector('input').value =
-					client_data.result.api_token || '';
-				form.appendChild(token_input);
-			};
+		if (client_options.includes('password')) {
+			const password_input = createPasswordInput('edit-password-input');
+			password_input.querySelector('input').value =
+				client_data.result.password || '';
+			form.appendChild(password_input);
+		};
 
-			showWindow('edit-torrent-window');
-		});
+		if (client_options.includes('api_token')) {
+			const token_input = createApiTokenInput('edit-token-input');
+			token_input.querySelector('input').value =
+				client_data.result.api_token || '';
+			form.appendChild(token_input);
+		};
+
+		showWindow('edit-torrent-window');
 	});
 };
 
@@ -111,6 +120,7 @@ function saveEditTorrent() {
 			const id = form.dataset.id;
 			const data = {
 				title: form.querySelector('#edit-title-input').value,
+				enabled: form.querySelector('#edit-enabled-input').checked,
 				base_url: form.querySelector('#edit-baseurl-input').value,
 				username: form.querySelector('#edit-username-input')?.value || null,
 				password: form.querySelector('#edit-password-input')?.value || null,
@@ -149,6 +159,7 @@ async function testEditTorrent(api_key) {
 	const test_button = document.querySelector('#test-torrent-edit');
 	test_button.classList.remove('show-success', 'show-fail');
 	const data = {
+		download_type: 2,
 		client_type: form.dataset.type,
 		base_url: form.querySelector('#edit-baseurl-input').value,
 		username: form.querySelector('#edit-username-input')?.value || null,
@@ -164,7 +175,7 @@ async function testEditTorrent(api_key) {
 		else {
 			// Test failed
 			test_button.classList.add('show-fail');
-			error.innerText = json.result.description;
+			error.innerText = brokenClientReasonMap[json.result.description];
 			hide([], [error]);
 		};
 		return json.result.success;
@@ -195,7 +206,7 @@ function loadTorrentList(api_key) {
 
 	fetchAPI('/externalclients/options', api_key)
 	.then(json => {
-		Object.keys(json.result).forEach(c => {
+		Object.keys(json.result[2]).forEach(c => {
 			const entry = document.createElement('button');
 			entry.innerText = c;
 			entry.onclick = e => loadAddTorrent(api_key, c);
@@ -209,18 +220,18 @@ function loadAddTorrent(api_key, client_type) {
 	const form = document.querySelector('#add-torrent-form tbody');
 	form.dataset.type = client_type;
 	form.querySelectorAll(
-		'tr:not(:has(input#add-title-input, input#add-baseurl-input))'
+		'tr:not(:has(input#add-title-input, input#add-enabled-input, input#add-baseurl-input))'
 	).forEach(el => el.remove());
 	document.querySelector('#test-torrent-add').classList.remove(
 		'show-success', 'show-fail'
 	)
 	form.querySelectorAll(
-		'#add-title-input, #add-baseurl-input'
+		'#add-title-input, #add-enabled-input, #add-baseurl-input'
 	).forEach(el => el.value = '');
 
 	fetchAPI('/externalclients/options', api_key)
 	.then(json => {
-		const client_options = json.result[client_type];
+		const client_options = json.result[2][client_type];
 
 		if (client_options.includes('username'))
 			form.appendChild(createUsernameInput('add-username-input'));
@@ -244,8 +255,10 @@ function saveAddTorrent() {
 
 			const form = document.querySelector('#add-torrent-form tbody');
 			const data = {
+				download_type: 2,
 				client_type: form.dataset.type,
 				title: form.querySelector('#add-title-input').value,
+				enabled: form.querySelector('#add-enabled-input').checked,
 				base_url: form.querySelector('#add-baseurl-input').value,
 				username: form.querySelector('#add-username-input')?.value || null,
 				password: form.querySelector('#add-password-input')?.value || null,
@@ -279,6 +292,7 @@ async function testAddTorrent(api_key) {
 	const test_button = document.querySelector('#test-torrent-add');
 	test_button.classList.remove('show-success', 'show-fail');
 	const data = {
+		download_type: 2,
 		client_type: form.dataset.type,
 		base_url: form.querySelector('#add-baseurl-input').value,
 		username: form.querySelector('#add-username-input')?.value || null,
@@ -291,11 +305,12 @@ async function testAddTorrent(api_key) {
 		if (json.result.success)
 			// Test successful
 			test_button.classList.add('show-success');
-		else
+		else {
 			// Test failed
 			test_button.classList.add('show-fail');
-			error.innerText = json.result.description;
+			error.innerText = brokenClientReasonMap[json.result.description];
 			hide([], [error]);
+		}
 		return json.result.success;
 	});
 };
@@ -386,7 +401,7 @@ function addCredential() {
 					if (json.error === "CredentialInvalid") {
 						document.querySelector('#builtin-window p.error').innerText = "Invalid credentials";
 					} else {
-						document.querySelector('#builtin-window p.error').innerText = json.result.reason_text;
+						document.querySelector('#builtin-window p.error').innerText = brokenClientReasonMap[json.result.reason];
 					}
 					hide([], [document.querySelector('#builtin-window p.error')]);
 				});

@@ -197,6 +197,11 @@ tbody .issue-title:hover {
 	text-align: center;
 }
 
+#edit-window .window-content {
+	justify-content: flex-start;
+	overflow-x: auto;
+}
+
 #edit-window tbody {
 	vertical-align: text-top;
 }
@@ -214,7 +219,7 @@ tbody .issue-title:hover {
 }
 
 #search-result-table {
-	min-width: 500px;
+	min-width: 550px;
 }
 
 .search-entry {
@@ -237,12 +242,32 @@ tbody .issue-title:hover {
 	width: 18px;
 }
 
-.search-entry > td:nth-child(2) {
-	width: 100%;
+.source-column {
+	width: 8rem;
 }
 
-.source-column {
-	width: 6rem;
+.size-column {
+	text-wrap-mode: nowrap;
+}
+
+td.peers-column > div {
+	width: min-content;
+
+	padding: .125rem .25rem;
+	border-radius: 4px;
+	color: var(--nav-color);
+	background-color: var(--info-color);
+
+	text-wrap-mode: nowrap;
+	font-size: smaller;
+
+	&.no-seeders {
+		background-color: var(--error-color);
+	}
+
+	&.low-seeders {
+		background-color: var(--warning-color);
+	}
 }
 
 .search-action-column {

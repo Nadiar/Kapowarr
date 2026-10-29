@@ -17,6 +17,8 @@ function fillSettings(api_key) {
 		document.querySelector('#cv-url-input').value = json.result.comicvine_api_url;
 		document.querySelector('#flaresolverr-input').value = json.result.flaresolverr_base_url;
 		document.querySelector('#log-level-input').value = json.result.log_level;
+		document.querySelector('#db-backup-folder-input').value = json.result.db_backup_folder;
+		document.querySelector('#db-backup-count-input').value = json.result.db_backup_amount;
 		
 		if (json.result.auth_username && json.result.auth_password) {
 			document.querySelector('#auth-toggle').value = 'username-password';
@@ -35,6 +37,7 @@ function saveSettings(api_key) {
 	document.querySelector('#cv-input').classList.remove('error-input');
 	document.querySelector('#cv-url-input').classList.remove('error-input');
 	document.querySelector("#flaresolverr-input").classList.remove('error-input');
+	document.querySelector("#db-backup-folder-input").classList.remove("error-input");
 
 	let proxyIgnoredAddresses = document.querySelector('#proxy-ignored-addresses-input').value.split(',');
 	if (proxyIgnoredAddresses[0] === '') {
@@ -55,7 +58,9 @@ function saveSettings(api_key) {
 		'comicvine_api_key': document.querySelector('#cv-input').value,
 		'comicvine_api_url': document.querySelector('#cv-url-input').value,
 		'flaresolverr_base_url': document.querySelector('#flaresolverr-input').value,
-		'log_level': parseInt(document.querySelector('#log-level-input').value)
+		'log_level': parseInt(document.querySelector('#log-level-input').value),
+		'db_backup_folder': document.querySelector("#db-backup-folder-input").value,
+		'db_backup_amount': parseInt(document.querySelector("#db-backup-count-input").value)
 	};
 	
 	const auth_toggle = document.querySelector('#auth-toggle');
@@ -67,7 +72,7 @@ function saveSettings(api_key) {
 
 	sendAPI('PUT', '/settings', api_key, {}, data)
 	.then(response => response.json())
-	.then(json => {
+	.then(() => {
 		document.querySelector("#save-button p").innerText = 'Saved';
 	})
 	.catch(async e => {
@@ -75,7 +80,10 @@ function saveSettings(api_key) {
 		saveButtonText.innerText = 'Failed';
 		const json = await e.json();
 		console.error('Settings save failed:', json);
-		if (json.error === 'InvalidComicVineApiKey')
+		if (
+			json.error === "CredentialInvalid"
+			|| json.error === "MetadataSourceNotWorking"
+		)
 			document.querySelector('#cv-input').classList.add('error-input');
 
 		else if (
@@ -98,6 +106,10 @@ function saveSettings(api_key) {
 		)
 			document.querySelector("#flaresolverr-input").classList.add('error-input');
 
+		else if (
+			json.error === "FolderNotFound"
+		)
+			document.querySelector("#db-backup-folder-input").classList.add("error-input");
 		else if (json.error === "InvalidKeyValue" && json.result?.key)
 			saveButtonText.innerText = `Failed: ${json.result.key}`;
 
@@ -129,8 +141,5 @@ usingApiKey()
 document.querySelector('#theme-input').onchange = e => {
 	const value = document.querySelector('#theme-input').value;
 	setLocalStorage({'theme': value});
-	if (value === 'dark')
-		document.querySelector(':root').classList.add('dark-mode');
-	else if (value === 'light')
-		document.querySelector(':root').classList.remove('dark-mode');
+	setupTheme();
 };

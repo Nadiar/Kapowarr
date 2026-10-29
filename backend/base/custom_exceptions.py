@@ -7,9 +7,10 @@ Definitions of exceptions.
 from typing import Any, Union
 
 from backend.base.definitions import (ApiResponse, BrokenClientReason,
-                                      DownloadSource,
+                                      BrokenMetadataSourceReason,
+                                      DownloadService, DownloadType,
                                       EnqueuingDownloadFailureReason,
-                                      KapowarrException)
+                                      InvalidDatabaseReason, KapowarrException)
 from backend.base.logging import LOGGER
 
 
@@ -137,6 +138,52 @@ class FileNotFound(KapowarrException):
             "result": {
                 "file_id": self.file_id,
                 "filepath": self.filepath
+            }
+        }
+
+
+class InvalidDatabaseFile(KapowarrException):
+    "The uploaded database file is invalid or not supported"
+
+    def __init__(self, filepath_db: str, reason: InvalidDatabaseReason) -> None:
+        self.filepath_db = filepath_db
+        self.reason = reason
+        LOGGER.warning(
+            "The given database file is invalid: %s (reason=%s)",
+            filepath_db, reason
+        )
+        return
+
+    @property
+    def api_response(self) -> ApiResponse:
+        return {
+            'code': 400,
+            'error': self.__class__.__name__,
+            'result': {
+                'filepath_db': self.filepath_db,
+                'reason': self.reason.value
+            }
+        }
+
+
+class DatabaseFileNotFound(KapowarrException):
+    "The index of the database backup is invalid"
+
+    def __init__(self, backup_index: int) -> None:
+        self.backup_index = backup_index
+        LOGGER.warning(
+            "The given database backup index is invalid: %d",
+            backup_index
+        )
+        return
+
+    @property
+    def api_response(self) -> ApiResponse:
+        return {
+            'code': 400,
+            'error': self.__class__.__name__,
+            'result': {
+                'index': self.backup_index
             }
         }
 
@@ -278,24 +325,6 @@ class VolumeNotFound(KapowarrException):
             "result": {
                 "volume_id": self.volume_id
             }
-        }
-
-
-class VolumeNotMatched(KapowarrException):
-    "Volume not matched with ComicVine database"
-
-    def __init__(self) -> None:
-        LOGGER.warning(
-            "Volume not matched with ComicVine database"
-        )
-        return
-
-    @property
-    def api_response(self) -> ApiResponse:
-        return {
-            "code": 400,
-            "error": self.__class__.__name__,
-            "result": {}
         }
 
 
@@ -442,34 +471,13 @@ class TaskNotDeletable(KapowarrException):
 
 
 # region Downloads
-class DownloadNotFound(KapowarrException):
-    "Download with given ID not found"
-
-    def __init__(self, download_id: int) -> None:
-        self.download_id = download_id
-        LOGGER.warning(
-            f"Download with given ID not found: {download_id}"
-        )
-        return
-
-    @property
-    def api_response(self) -> ApiResponse:
-        return {
-            "code": 404,
-            "error": self.__class__.__name__,
-            "result": {
-                "download_id": self.download_id
-            }
-        }
-
-
-class LinkBroken(KapowarrException):
-    "The link is broken"
+class DownloadLinkBroken(KapowarrException):
+    "The download link of a download service is broken"
 
     def __init__(self, link: str) -> None:
         self.link = link
         LOGGER.warning(
-            f"Link is broken: {self.link}"
+            f"Download link is broken: {self.link}"
         )
         return
 
@@ -489,9 +497,8 @@ class EnqueuingDownloadFailure(KapowarrException):
 
     def __init__(self, reason: EnqueuingDownloadFailureReason) -> None:
         self.reason = reason
-        self.reason_text = reason.value
         LOGGER.warning(
-            f"Failed to enqueue download: {self.reason_text}"
+            f"Failed to enqueue download: {self.reason}"
         )
         return
 
@@ -501,19 +508,19 @@ class EnqueuingDownloadFailure(KapowarrException):
             "code": 400,
             "error": self.__class__.__name__,
             "result": {
-                "reason_text": self.reason.value
+                "reason": self.reason.value
             }
         }
 
 
-class DownloadLimitReached(KapowarrException):
-    "The download limit of the source is reached"
+class DownloadServiceRateLimitReached(KapowarrException):
+    "The rate limit of the download service is reached"
 
-    def __init__(self, source: DownloadSource) -> None:
-        self.source = source
-        self.source_text = source.value
+    def __init__(self, service: DownloadService) -> None:
+        self.service = service
+        self.service_text = service.value
         LOGGER.warning(
-            f"Download source {self.source_text} has reached its download limit"
+            f"Download service {self.service_text} has reached its download limit"
         )
         return
 
@@ -523,18 +530,39 @@ class DownloadLimitReached(KapowarrException):
             "code": 509,
             "error": self.__class__.__name__,
             "result": {
-                "source": self.source.value
+                "service": self.service.value
             }
         }
 
 
-class DownloadUnmovable(KapowarrException):
+class DownloadQueueEntryNotFound(KapowarrException):
+    "A download in the download queue with given ID not found"
+
+    def __init__(self, download_id: int) -> None:
+        self.download_id = download_id
+        LOGGER.warning(
+            f"Download in download queue with given ID not found: {download_id}"
+        )
+        return
+
+    @property
+    def api_response(self) -> ApiResponse:
+        return {
+            "code": 404,
+            "error": self.__class__.__name__,
+            "result": {
+                "download_id": self.download_id
+            }
+        }
+
+
+class DownloadQueueEntryUnmovable(KapowarrException):
     "The position of the download in the queue can not be changed"
 
     def __init__(self, download_id: int) -> None:
         self.download_id = download_id
         LOGGER.warning(
-            f"The position of the download in the queue can not be changed: {download_id}"
+            f"Position of download in download queue with given ID can't be changed: {download_id}"
         )
         return
 
@@ -587,15 +615,16 @@ class CredentialInvalid(KapowarrException):
         }
 
 
-# region Download Clients
-class ClientNotWorking(KapowarrException):
-    "The download client is not working"
+# region Indexers
+class AddingIndexerForbidden(KapowarrException):
+    "It's not allowed to add another instance of this indexer client"
 
-    def __init__(self, reason: BrokenClientReason) -> None:
-        self.reason = reason
-        self.reason_text = reason.value
+    def __init__(self, download_type: DownloadType, client_type: str) -> None:
+        self.download_type = download_type
+        self.client_type = client_type
+
         LOGGER.warning(
-            f"The download client isn't working: {self.reason_text}"
+            f"Not allowed to add another indexer of {download_type=} and {client_type=}"
         )
         return
 
@@ -605,7 +634,51 @@ class ClientNotWorking(KapowarrException):
             "code": 400,
             "error": self.__class__.__name__,
             "result": {
-                "reason_text": self.reason_text
+                "download_type": self.download_type.value,
+                "client_type": self.client_type
+            }
+        }
+
+
+class IndexerNotFound(KapowarrException):
+    "Indexer with given ID not found"
+
+    def __init__(self, indexer_id: int) -> None:
+        self.indexer_id = indexer_id
+        LOGGER.warning(
+            f"Indexer with given ID not found: {indexer_id}"
+        )
+        return
+
+    @property
+    def api_response(self) -> ApiResponse:
+        return {
+            "code": 404,
+            "error": self.__class__.__name__,
+            "result": {
+                "indexer_id": self.indexer_id
+            }
+        }
+
+
+# region Download Clients
+class ClientNotWorking(KapowarrException):
+    "The download client is not working"
+
+    def __init__(self, reason: BrokenClientReason) -> None:
+        self.reason = reason
+        LOGGER.warning(
+            f"The download client isn't working: {self.reason}"
+        )
+        return
+
+    @property
+    def api_response(self) -> ApiResponse:
+        return {
+            "code": 400,
+            "error": self.__class__.__name__,
+            "result": {
+                "reason": self.reason.value
             }
         }
 
@@ -653,13 +726,34 @@ class ExternalClientDownloading(KapowarrException):
         }
 
 
-# region ComicVine
-class CVRateLimitReached(KapowarrException):
-    "ComicVine API rate limit reached"
+# region Metadata Source
+class MetadataSourceNotWorking(KapowarrException):
+    "Something went wrong contacting the metadata source"
+
+    def __init__(self, reason: BrokenMetadataSourceReason) -> None:
+        self.reason = reason
+        LOGGER.warning(
+            f"The metadata source is not working: {reason}"
+        )
+        return
+
+    @property
+    def api_response(self) -> ApiResponse:
+        return {
+            "code": 400,
+            "error": self.__class__.__name__,
+            "result": {
+                "reason": self.reason.value
+            }
+        }
+
+
+class MetadataSourceRateLimitReached(KapowarrException):
+    "Rate limit reached of metadata source"
 
     def __init__(self) -> None:
         LOGGER.warning(
-            "Reached the rate limit of ComicVine"
+            "Reached the rate limit of metadata source"
         )
         return
 
@@ -672,12 +766,12 @@ class CVRateLimitReached(KapowarrException):
         }
 
 
-class InvalidComicVineApiKey(KapowarrException):
-    "No Comic Vine API key is set or it's invalid"
+class MetadataSourceDataEntryNotFound(KapowarrException):
+    "Entry not found at metadata source"
 
     def __init__(self) -> None:
         LOGGER.warning(
-            "No Comic Vine API key is set or it's invalid"
+            "Entry not found at metadata source"
         )
         return
 

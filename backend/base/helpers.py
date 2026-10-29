@@ -8,22 +8,25 @@ from __future__ import annotations
 
 from asyncio import sleep
 from base64 import urlsafe_b64encode
-from collections import deque
+from datetime import datetime
 from functools import lru_cache
 from hashlib import pbkdf2_hmac
 from multiprocessing.pool import Pool
 from os import cpu_count, environ, sep
 from os.path import basename, dirname, exists, isfile, join
+from re import compile
 from subprocess import run
 from sys import base_exec_prefix, executable, maxsize, platform, version_info
 from threading import current_thread
 from time import time as _time
 from typing import (TYPE_CHECKING, Any, Callable, Collection, Dict, Iterable,
                     Iterator, List, Mapping, Sequence, Tuple, Union)
-from urllib.parse import quote_plus, unquote
+from unicodedata import normalize
+from urllib.parse import quote_plus, unquote, urlencode
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
 from bencoding import bdecode
+from cron_converter import Cron
 from multidict import CIMultiDict, CIMultiDictProxy
 from requests import RequestException, Session as RSession
 from requests.adapters import HTTPAdapter, Retry
@@ -219,55 +222,6 @@ def run_rar(args: List[str]) -> CompletedProcess[str]:
 
 
 # region Helpers
-def get_subclasses(
-    *classes: type,
-    include_self: bool = False,
-    recursive: bool = True,
-    only_leafs: bool = False
-) -> List[type]:
-    """Get subclasses of the given classes.
-
-    Args:
-        *classes (type): The classes to get subclasses from.
-
-        include_self (bool, optional): Whether to include the classes themselves.
-            Defaults to False.
-
-        recursive (bool, optional): Whether to get all subclasses recursively.
-            Defaults to True.
-
-        only_leafs (bool, optional): Whether to only return leaf classes.
-            Defaults to False.
-
-    Returns:
-        List[type]: The subclasses.
-    """
-    result: List[type] = []
-    if include_self:
-        result.extend(classes)
-
-    if not recursive:
-        result.extend((
-            subclass
-            for current in classes
-            for subclass in current.__subclasses__()
-        ))
-        return result
-
-    to_do = deque(classes)
-    while to_do:
-        current = to_do.popleft()
-        subclasses = current.__subclasses__()
-        if subclasses:
-            to_do.extend(subclasses)
-            if not only_leafs and current not in classes:
-                result.append(current)
-        else:
-            result.append(current)
-
-    return result
-
-
 def check_filter(element: T, element_filter: Collection[T]) -> bool:
     """Check if `element` is in `element_filter`, but only if `element_filter`
     has content, otherwise return True. Useful for filtering where an empty
@@ -355,6 +309,59 @@ def get_torrent_info(torrent: bytes) -> Dict[bytes, Any]:
         Dict[bytes, Any]: The info.
     """
     return bdecode(torrent)[b"info"] # type: ignore
+
+
+def build_magnet_link(hash: str, name: Union[bytes, str]) -> str:
+    """Build a magnet link based on a hash and filename. Trackers are
+    automatically added.
+
+    Args:
+        hash (str): The hash of the torrent.
+        name (Union[bytes, str]): The filename of the torrent.
+
+    Returns:
+        str: The resulting magnet link.
+    """
+    if isinstance(name, bytes):
+        name = name.decode('utf-8')
+
+    params = [
+        ('xt', f'urn:btih:{hash}'),
+        ('dn', name),
+        ('tr', 'udp://tracker.cyberia.is:6969/announce'),
+        ('tr', 'udp://tracker.port443.xyz:6969/announce'),
+        ('tr', 'http://tracker3.itzmx.com:6961/announce'),
+        ('tr', 'udp://tracker.moeking.me:6969/announce'),
+        ('tr', 'http://vps02.net.orel.ru:80/announce'),
+        ('tr', 'http://tracker.openzim.org:80/announce'),
+        ('tr', 'udp://tracker.skynetcloud.tk:6969/announce'),
+        ('tr', 'https://1.tracker.eu.org:443/announce'),
+        ('tr', 'https://3.tracker.eu.org:443/announce'),
+        ('tr', 'http://re-tracker.uz:80/announce'),
+        ('tr', 'https://tracker.parrotsec.org:443/announce'),
+        ('tr', 'udp://explodie.org:6969/announce'),
+        ('tr', 'udp://tracker.filemail.com:6969/announce'),
+        ('tr', 'udp://tracker.nyaa.uk:6969/announce'),
+        ('tr', 'udp://retracker.netbynet.ru:2710/announce'),
+        ('tr', 'http://tracker.gbitt.info:80/announce'),
+        ('tr', 'http://tracker2.dler.org:80/announce')
+    ]
+
+    return "magnet:?" + urlencode(params)
+
+
+def get_schedules_next_run(cron_schedule: str) -> int:
+    """Return the next run timestamp from a cron schedule string.
+
+    Args:
+        cron_schedule (str): The cron schedule.
+
+    Returns:
+        int: The epoch timestamp of the next run.
+    """
+    return round(
+        Cron(cron_schedule).schedule(datetime.now()).next().timestamp()
+    )
 
 
 # region Sequences
@@ -512,9 +519,42 @@ def normalise_string(s: str) -> str:
         .replace('_28', '(')
         .replace('_29', ')')
         .replace('–', '-')
+        .replace('—', '-')
         .replace('’', "'")
+        .replace('‘', '\'')
+        .replace('`', '\'')
+        .replace('“', '"')
+        .replace('”', '"')
         .strip()
     )
+
+
+combining_marks_regex = compile(r'[\u0300-\u036f]')
+
+
+def fully_normalise_string(s: str) -> str:
+    """On top of the standard normalisation of `normalise_string()`, also
+    replace special characters with their ASCII version and remove accents.
+    E.g. 'æ' to 'ae', 'ō' to 'o' and 'é' to 'e'.
+
+    Args:
+        s (str): Input string.
+
+    Returns:
+        str: Normalised string.
+    """
+    s = (normalise_string(s)
+        .replace('æ', 'ae')
+        .replace('Æ', 'ae')
+        .replace('œ', 'oe')
+        .replace('Œ', 'oe')
+        .replace('ß', 'ss')
+        .replace('ø', 'o')
+        .replace('Ø', 'o')
+    )
+    s = normalize('NFKD', s)
+    s = combining_marks_regex.sub('', s)
+    return s
 
 
 def normalise_number(s: str) -> str:
@@ -553,6 +593,8 @@ def normalise_year(s: str) -> Union[int, None]:
 
     s = (s
         .strip()
+        .lower()
+        .replace('circa ', '')
         .replace('-', '0')
         .replace(',', '/')
         .replace('?', '')
@@ -575,8 +617,42 @@ def normalise_year(s: str) -> Union[int, None]:
     return None
 
 
+SCALE_SIZES = {
+    'b': 1,
+    'kb': 1000,
+    'mb': 1000000,
+    'gb': 1000000000,
+    'tb': 1000000000000
+}
+
+
+def normalise_size(s: str) -> int:
+    """Turn a user-entered file size string into an integer for byte size.
+
+    Args:
+        s (str): The string containing the file size (e.g. "200 MB").
+
+    Returns:
+        int: The number of bytes that the file size is.
+    """
+    # We remove the i from 'GiB' as it's not
+    # agreed upon which one means what anyway
+    s = s.lower().replace('i', '').strip()
+    for unit, size in SCALE_SIZES.items():
+        if not s.endswith(unit):
+            continue
+
+        n = s.replace(unit, "").strip()
+        try:
+            return int(float(n) * size)
+        except ValueError:
+            continue
+
+    return 0
+
+
 def normalise_base_url(base_url: str) -> str:
-    """Turn user-entered base URL's into a standard format. No trailing slash,
+    """Turn a user-entered base URL into a standard format. No trailing slash,
     and `http://` prefix applied if no protocol is found.
 
     Args:
@@ -877,6 +953,42 @@ class DictKeyedDict(dict):
         return zip(self.keys(), self.values())
 
 
+class DateFormatter:
+    """When inserting/formatting a date into a string (f-string or str.format()),
+    insert this class that receives the date instead to allow the date to be
+    formatted using strf formats.
+
+    ```
+    >>> df = DateFormatter("2026-02-03")
+    >>> f"Date: {df:%B %Y}"
+    'Date: February 2026'
+    ```
+    """
+
+    def __init__(self, date: str) -> None:
+        """Initialise the date formatter.
+
+        Args:
+            date (str): The date, in YYYY-MM-DD format.
+        """
+        self.date = date
+        self.date_obj = datetime.strptime(date, "%Y-%m-%d")
+        return
+
+    def __str__(self) -> str:
+        return self.date
+
+    def __format__(self, format_spec: str) -> str:
+        if not format_spec:
+            return self.date
+
+        try:
+            return self.date_obj.strftime(format_spec)
+        except (ValueError, TypeError):
+            # Invalid spec
+            return self.date
+
+
 # region Requests
 @lru_cache(1)
 def _running_urllib3_v2_and_above() -> bool:
@@ -966,9 +1078,9 @@ class Session(RSession):
         stream=None, verify=None,
         cert=None, json=None
     ):
-        ua, cf_cookies = self.fs.get_ua_cookies(url)
+        ua, cf_cookie = self.fs.get_ua_cookies(url)
         self.headers.update({"User-Agent": ua})
-        self.cookies.update(cf_cookies)
+        self.cookies.update({"cf_clearance": cf_cookie})
 
         result = super().request(
             method, url, params, data, headers,
@@ -1028,7 +1140,8 @@ class AsyncSession(ClientSession):
             timeout=ClientTimeout(
                 connect=Constants.REQUEST_TIMEOUT,
                 sock_read=Constants.REQUEST_TIMEOUT
-            )
+            ),
+            trust_env=True
         )
 
         self.fs = FlareSolverr()
@@ -1052,9 +1165,9 @@ class AsyncSession(ClientSession):
 
             sleep_time = Constants.BACKOFF_FACTOR_RETRIES
 
-            ua, cf_cookies = self.fs.get_ua_cookies(url)
+            ua, cf_cookie = self.fs.get_ua_cookies(url)
             self.headers.update({"User-Agent": ua})
-            self.cookie_jar.update_cookies(cf_cookies)
+            self.cookie_jar.update_cookies({"cf_clearance": cf_cookie})
 
             for round in range(1, Constants.TOTAL_RETRIES + 1):
                 try:
@@ -1390,7 +1503,7 @@ class PortablePool(Pool):
         log_filepath = get_log_filepath()
         log_folder = dirname(log_filepath)
         log_file = basename(log_filepath)
-        db_folder = dirname(DBConnection.file)
+        db_folder = dirname(DBConnection.default_file)
         ws_queue = WebSocket().client_manager.queue
 
         super().__init__(

@@ -121,6 +121,9 @@ class TestSyncIssues(unittest.TestCase):
             'backend.features.tasks.run',
             side_effect=lambda coro: coro
         ), patch(
+            'backend.features.tasks.commit',
+            side_effect=lambda: cursor.connection.commit()
+        ), patch(
             'backend.implementations.volumes.get_db',
             return_value=cursor
         ), patch(
@@ -160,6 +163,9 @@ class TestSyncIssues(unittest.TestCase):
         ), patch(
             'backend.features.tasks.run',
             side_effect=lambda coro: coro
+        ), patch(
+            'backend.features.tasks.commit',
+            side_effect=lambda: cursor.connection.commit()
         ), patch(
             'backend.implementations.volumes.commit',
             side_effect=lambda: cursor.connection.commit()
@@ -206,6 +212,9 @@ class TestRefreshMetadata(unittest.TestCase):
         ), patch(
             'backend.features.tasks.run',
             side_effect=lambda coro: coro
+        ), patch(
+            'backend.features.tasks.commit',
+            side_effect=lambda: cursor.connection.commit()
         ), patch(
             'backend.implementations.volumes.get_db',
             return_value=cursor

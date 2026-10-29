@@ -1,8 +1,8 @@
 //
 // General functions
 //
-function twoDigits(n) {
-	return n.toLocaleString("en", { minimumFractionDigits: 2 });
+function minDecimalPoints(n, pointCount) {
+	return n.toLocaleString("en", { minimumFractionDigits: pointCount });
 };
 
 function setIcon(container, icon, title='') {
@@ -51,10 +51,16 @@ async function sendAPI(method, endpoint, api_key, params={}, body={}) {
 		formatted_params = '&' + Object.entries(params).map(p => p.join('=')).join('&');
 	};
 
+	headers = {}
+	if (!(body instanceof FormData)) {
+		headers["Content-Type"] = "application/json"
+		body = JSON.stringify(body)
+	}
+
 	return fetch(`${url_base}/api${endpoint}?api_key=${api_key}${formatted_params}`, {
 		'method': method,
-		'headers': {'Content-Type': 'application/json'},
-		'body': JSON.stringify(body)
+		'headers': headers,
+		'body': body
 	})
 	.then(response => {
 		if (!response.ok) return Promise.reject(response);
@@ -75,7 +81,10 @@ async function sendAPI(method, endpoint, api_key, params={}, body={}) {
 //
 const icons = {
 	monitored: '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:svgjs="http://svgjs.com/svgjs" version="1.1" width="256" height="256" x="0" y="0" viewBox="0 0 24 24" style="enable-background:new 0 0 512 512" xml:space="preserve"><g><path d="M2.849,23.55a2.954,2.954,0,0,0,3.266-.644L12,17.053l5.885,5.853a2.956,2.956,0,0,0,2.1.881,3.05,3.05,0,0,0,1.17-.237A2.953,2.953,0,0,0,23,20.779V5a5.006,5.006,0,0,0-5-5H6A5.006,5.006,0,0,0,1,5V20.779A2.953,2.953,0,0,0,2.849,23.55Z"/></g></svg>',
-	unmonitored: '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:svgjs="http://svgjs.com/svgjs" version="1.1" width="256" height="256" x="0" y="0" viewBox="0 0 24 24" style="enable-background:new 0 0 512 512" xml:space="preserve"><g><path d="M20.137,24a2.8,2.8,0,0,1-1.987-.835L12,17.051,5.85,23.169a2.8,2.8,0,0,1-3.095.609A2.8,2.8,0,0,1,1,21.154V5A5,5,0,0,1,6,0H18a5,5,0,0,1,5,5V21.154a2.8,2.8,0,0,1-1.751,2.624A2.867,2.867,0,0,1,20.137,24ZM6,2A3,3,0,0,0,3,5V21.154a.843.843,0,0,0,1.437.6h0L11.3,14.933a1,1,0,0,1,1.41,0l6.855,6.819a.843.843,0,0,0,1.437-.6V5a3,3,0,0,0-3-3Z"/></g></svg>'
+	unmonitored: '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:svgjs="http://svgjs.com/svgjs" version="1.1" width="256" height="256" x="0" y="0" viewBox="0 0 24 24" style="enable-background:new 0 0 512 512" xml:space="preserve"><g><path d="M20.137,24a2.8,2.8,0,0,1-1.987-.835L12,17.051,5.85,23.169a2.8,2.8,0,0,1-3.095.609A2.8,2.8,0,0,1,1,21.154V5A5,5,0,0,1,6,0H18a5,5,0,0,1,5,5V21.154a2.8,2.8,0,0,1-1.751,2.624A2.867,2.867,0,0,1,20.137,24ZM6,2A3,3,0,0,0,3,5V21.154a.843.843,0,0,0,1.437.6h0L11.3,14.933a1,1,0,0,1,1.41,0l6.855,6.819a.843.843,0,0,0,1.437-.6V5a3,3,0,0,0-3-3Z"/></g></svg>',
+	clear: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><path d="M256,0C114.615,0,0,114.615,0,256s114.615,256,256,256s256-114.615,256-256C511.847,114.678,397.322,0.153,256,0z M256,64   c39.843,0.004,78.686,12.477,111.083,35.669L99.669,367.061c-61.503-86.178-41.499-205.897,44.679-267.4   C176.93,76.409,215.972,63.939,256,64z M256,448c-39.837-0.002-78.673-12.475-111.061-35.669l267.392-267.413   c61.514,86.17,41.527,205.891-44.643,267.406C335.098,435.588,296.042,448.064,256,448z"></path></svg>',
+	download: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><path d="M210.731,386.603c24.986,25.002,65.508,25.015,90.51,0.029c0.01-0.01,0.019-0.019,0.029-0.029l68.501-68.501   c7.902-8.739,7.223-22.23-1.516-30.132c-8.137-7.357-20.527-7.344-28.649,0.03l-62.421,62.443l0.149-329.109   C277.333,9.551,267.782,0,256,0l0,0c-11.782,0-21.333,9.551-21.333,21.333l-0.192,328.704L172.395,288   c-8.336-8.33-21.846-8.325-30.176,0.011c-8.33,8.336-8.325,21.846,0.011,30.176L210.731,386.603z" /><path d="M490.667,341.333L490.667,341.333c-11.782,0-21.333,9.551-21.333,21.333V448c0,11.782-9.551,21.333-21.333,21.333H64   c-11.782,0-21.333-9.551-21.333-21.333v-85.333c0-11.782-9.551-21.333-21.333-21.333l0,0C9.551,341.333,0,350.885,0,362.667V448   c0,35.346,28.654,64,64,64h384c35.346,0,64-28.654,64-64v-85.333C512,350.885,502.449,341.333,490.667,341.333z" /></svg>',
+	upload: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><path d="M172.399,117.448l62.421-62.443l-0.149,329.344c0,11.782,9.551,21.333,21.333,21.333l0,0   c11.782,0,21.333-9.551,21.333-21.333l0.149-328.981l62.123,62.144c8.475,8.185,21.98,7.951,30.165-0.524   c7.985-8.267,7.985-21.374,0-29.641L301.273,18.76c-24.986-25.002-65.508-25.015-90.51-0.029c-0.01,0.01-0.019,0.019-0.029,0.029   l-68.501,68.523c-8.185,8.475-7.951,21.98,0.524,30.165C151.024,125.433,164.131,125.433,172.399,117.448z"/><path d="M490.671,341.341L490.671,341.341c-11.782,0-21.333,9.551-21.333,21.333v85.333c0,11.782-9.551,21.333-21.333,21.333h-384   c-11.782,0-21.333-9.551-21.333-21.333v-85.333c0-11.782-9.551-21.333-21.333-21.333l0,0c-11.782,0-21.333,9.551-21.333,21.333   v85.333c0,35.346,28.654,64,64,64h384c35.346,0,64-28.654,64-64v-85.333C512.004,350.892,502.453,341.341,490.671,341.341z"/></svg>'
 };
 
 const images = {
@@ -89,11 +98,6 @@ const images = {
 const task_to_button = {};
 function mapButtons(id) {
 	if (window.location.pathname === (url_base + '/')) {
-		task_to_button['search_all'] = {
-			'button': document.querySelector('#searchall-button'),
-			'icon': `${url_base}/static/img/search.svg`,
-			'loading_icon': `${url_base}/static/img/loading.svg`
-		};
 		task_to_button['update_all'] = {
 			'button': document.querySelector('#updateall-button'),
 			'icon': `${url_base}/static/img/refresh.svg`,
@@ -228,13 +232,36 @@ function handleTaskRemoved(data) {
 		unspinButton(task_string);
 };
 
-function connectToWebSocket() {
+function updateBadge(count) {
+	const badge = document.querySelector('#system-issues-badge');
+	if (!badge) return;
+	badge.innerText = count;
+	if (count > 0)
+		badge.classList.remove('hidden');
+	else
+		badge.classList.add('hidden');
+};
+
+function handleStatusCount(data) {
+	updateBadge(data.count);
+};
+
+function initStatusBadge(api_key) {
+	fetchAPI('/system/status', api_key)
+	.then(json => {
+		updateBadge(json.result.length);
+	})
+	.catch(e => console.log(e));
+};
+
+function connectToWebSocket(api_key) {
 	const socket = io({
 		path: `${url_base}/api/socket.io`,
 		transports: ["polling"],
 		upgrade: false,
 		autoConnect: false,
-		closeOnBeforeunload: true
+		closeOnBeforeunload: true,
+		auth: {'api_key': api_key}
 	});
 	socket.on('connect', () => console.log('Connected to WebSocket'));
 	socket.on('disconnect', () => console.log('Disconnected from WebSocket'));
@@ -242,6 +269,7 @@ function connectToWebSocket() {
 	socket.on('task_added', handleTaskAdded);
 	socket.on('task_ended', handleTaskRemoved);
 	socket.on('task_status', data => setTaskMessage(data.message));
+	socket.on('status_count', handleStatusCount);
 	socket.connect();
 	return socket;
 };
@@ -256,17 +284,18 @@ const sizes = {
 	'GB': 1000000000,
 	'TB': 1000000000000
 };
-function convertSize(size) {
+function convertSize(size, decimalPointCount) {
 	if (size === null || size <= 0)
 		return 'Unknown';
 
 	for (const [term, division_size] of Object.entries(sizes)) {
 		let resulting_size = size / division_size
 		if (0 <= resulting_size && resulting_size <= 1000) {
-			size = twoDigits(
+			size = minDecimalPoints(
 				Math.round(
 					(size / division_size * 100)
-				) / 100
+				) / 100,
+				decimalPointCount
 			) + ' ' + term;
 			return size;
 		};
@@ -344,21 +373,45 @@ function setLocalStorage(keys_values) {
 	return;
 };
 
+function setupTheme() {
+	const theme = getLocalStorage('theme')['theme']
+	let className = ''
+	if (theme === 'dark') {
+		className = 'dark-mode'
+	}
+
+	const root = document.querySelector(":root")
+	root.classList.remove(...root.classList.values())
+	if (className)
+		document.querySelector(":root").classList.add(className)
+
+	const expires = new Date()
+	if (className === "")
+		// Expire it, which removes it
+		expires.setTime(expires.getTime() - 86400 * 1000)
+	else
+		expires.setTime(expires.getTime() + 86400 * 1000)
+
+	document.cookie = `theme=${className}; expires=${expires.toUTCString()}; path=/;`
+	return
+}
+
 // code run on load
 
 const url_base = document.querySelector('#url_base').dataset.value;
 const volume_id = parseInt(window.location.pathname.split('/').at(-1)) || null;
 mapButtons(volume_id);
 
+let socket;
 usingApiKey()
 .then(api_key => {
 	setTimeout(() => fillTaskQueue(api_key), 200);
+	socket = connectToWebSocket(api_key);
+	initStatusBadge(api_key);
 });
 
 setupLocalStorage();
-if (getLocalStorage('theme')['theme'] === 'dark')
-	document.querySelector(':root').classList.add('dark-mode');
-const socket = connectToWebSocket();
+setupTheme();
 
 document.querySelector('#toggle-nav').onclick = e =>
 	document.querySelector('#nav-bar').classList.toggle('show-nav');

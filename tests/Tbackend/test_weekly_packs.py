@@ -11,7 +11,7 @@ import unittest
 from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
 
-# The import chain getcomics → download_clients → naming → file_processing
+# The import chain GetComics indexer → helpers → settings
 # → root_folders → settings tries to import the Linux-only 'grp' module.
 # Mock it here at module level before any kapowarr imports happen.
 if 'grp' not in sys.modules:
@@ -93,6 +93,22 @@ _SEARCH_PAGE_HTML = """
 # Helpers
 # ---------------------------------------------------------------------------
 
+_GC_URL = 'https://getcomics.org'
+
+
+def _make_indexer(session):
+    """Create a GetComicsIndexer without touching the database."""
+    from backend.implementations.indexer_clients.ddl.GetComics import \
+        GetComicsIndexer
+    indexer = object.__new__(GetComicsIndexer)
+    indexer._id = 1
+    indexer._title = 'GetComics'
+    indexer._url = _GC_URL
+    indexer.session = session
+    indexer.request_count = 0
+    return indexer
+
+
 def _run(coro):
     """Run an async coroutine from sync test code."""
     return asyncio.run(coro)
@@ -107,8 +123,8 @@ class TestExtractPackEntries(unittest.TestCase):
 
     def test_extracts_title_and_download_link_pairs(self) -> None:
         """Should return (title, link) pairs for Download anchors."""
-        from backend.implementations.getcomics import _extract_pack_entries
-        entries = _extract_pack_entries(_PACK_PAGE_HTML)
+        from backend.implementations.indexer_clients.ddl.GetComics import _extract_pack_entries
+        entries = _extract_pack_entries(_PACK_PAGE_HTML, _GC_URL)
 
         self.assertEqual(len(entries), 3)
         self.assertIn(
@@ -128,8 +144,8 @@ class TestExtractPackEntries(unittest.TestCase):
 
     def test_ignores_non_download_anchors(self) -> None:
         """Read Online links should not be captured as entries."""
-        from backend.implementations.getcomics import _extract_pack_entries
-        entries = _extract_pack_entries(_PACK_PAGE_HTML_WITH_READ_ONLINE)
+        from backend.implementations.indexer_clients.ddl.GetComics import _extract_pack_entries
+        entries = _extract_pack_entries(_PACK_PAGE_HTML_WITH_READ_ONLINE, _GC_URL)
 
         self.assertEqual(len(entries), 1)
         self.assertEqual(
@@ -142,70 +158,16 @@ class TestExtractPackEntries(unittest.TestCase):
 
     def test_returns_empty_for_blank_page(self) -> None:
         """Empty/junk HTML should return an empty list."""
-        from backend.implementations.getcomics import _extract_pack_entries
-        entries = _extract_pack_entries('<html><body></body></html>')
+        from backend.implementations.indexer_clients.ddl.GetComics import _extract_pack_entries
+        entries = _extract_pack_entries('<html><body></body></html>', _GC_URL)
         self.assertEqual(entries, [])
 
     def test_extracts_title_text_before_first_anchor(self) -> None:
         """Should parse list-item text before the first anchor as title."""
-        from backend.implementations.getcomics import _extract_pack_entries
-        entries = _extract_pack_entries(_PACK_PAGE_HTML_WITH_READ_ONLINE)
+        from backend.implementations.indexer_clients.ddl.GetComics import _extract_pack_entries
+        entries = _extract_pack_entries(_PACK_PAGE_HTML_WITH_READ_ONLINE, _GC_URL)
 
         self.assertEqual(entries[0][0], 'Absolute Martian Manhunter #10')
-
-
-# ---------------------------------------------------------------------------
-# Tests: _filter_pack_results
-# ---------------------------------------------------------------------------
-
-class TestFilterPackResults(unittest.TestCase):
-    """Test the function that filters search results for Weekly Pack articles."""
-
-    def _make_result(self, display_title: str, link: str) -> dict:
-        return {
-            'link': link,
-            'display_title': display_title,
-            'source': 'GetComics',
-            'series': '',
-            'year': None,
-            'volume_number': None,
-            'special_version': None,
-            'issue_number': None,
-            'annual': False,
-        }
-
-    def test_keeps_weekly_pack_results(self) -> None:
-        """Results with 'Weekly Pack' in display_title should be kept."""
-        from backend.implementations.getcomics import _filter_pack_results
-        results = [
-            self._make_result(
-                '2026.03.18 Weekly Pack',
-                'https://getcomics.org/packs/2026-03-18/'
-            ),
-            self._make_result(
-                '2026.03.11 Weekly Pack',
-                'https://getcomics.org/packs/2026-03-11/'
-            ),
-        ]
-        filtered = _filter_pack_results(results)
-        self.assertEqual(len(filtered), 2)
-
-    def test_excludes_non_pack_results(self) -> None:
-        """Results without 'Weekly Pack' should be excluded."""
-        from backend.implementations.getcomics import _filter_pack_results
-        results = [
-            self._make_result(
-                '2026.03.18 Weekly Pack',
-                'https://getcomics.org/packs/2026-03-18/'
-            ),
-            self._make_result(
-                'Batman #150 (2026)',
-                'https://getcomics.org/dc/batman-150/'
-            ),
-        ]
-        filtered = _filter_pack_results(results)
-        self.assertEqual(len(filtered), 1)
-        self.assertEqual(filtered[0]['display_title'], '2026.03.18 Weekly Pack')
 
 
 # ---------------------------------------------------------------------------
@@ -213,15 +175,16 @@ class TestFilterPackResults(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestScrapeWeeklyPacks(unittest.TestCase):
-    """Integration test for the async scrape_weekly_packs function."""
+    """Integration test for GetComicsIndexer.scrape_weekly_packs."""
 
     def _make_mock_session(self) -> MagicMock:
         """Build a mock AsyncSession that returns sample HTML."""
         session = MagicMock()
 
         async def fake_search(*args, **kwargs):
+            from backend.base.definitions import QueryResult
             # Return two pack results and one non-pack result
-            return [
+            return QueryResult([
                 {
                     'link': 'https://getcomics.org/packs/2026-03-18-weekly-pack/',
                     'display_title': '2026.03.18 Weekly Pack',
@@ -249,7 +212,7 @@ class TestScrapeWeeklyPacks(unittest.TestCase):
                     'special_version': None, 'issue_number': 150.0,
                     'annual': False,
                 },
-            ]
+            ], next_page_available=False)
 
         async def fake_get_text(url, **kwargs):
             if '2026-03-18' in url:
@@ -266,33 +229,25 @@ class TestScrapeWeeklyPacks(unittest.TestCase):
 
     def test_returns_list_of_search_result_data(self) -> None:
         """scrape_weekly_packs should return SearchResultData objects."""
-        from backend.implementations.getcomics import scrape_weekly_packs
-
         session, fake_search = self._make_mock_session()
+        indexer = _make_indexer(session)
 
-        with patch(
-            'backend.implementations.getcomics.search_getcomics',
-            side_effect=fake_search
-        ):
-            results = _run(scrape_weekly_packs(session, pack_count=2))
+        with patch.object(indexer, 'search', side_effect=fake_search):
+            results = _run(indexer.scrape_weekly_packs(pack_count=2))
 
         self.assertIsInstance(results, list)
         for r in results:
             self.assertIn('link', r)
             self.assertIn('display_title', r)
-            self.assertIn('source', r)
+            self.assertEqual(r['indexer_id'], 1)
 
     def test_uses_entry_title_not_slug(self) -> None:
         """Display title should come from list-item text, not URL slug."""
-        from backend.implementations.getcomics import scrape_weekly_packs
-
         session, fake_search = self._make_mock_session()
+        indexer = _make_indexer(session)
 
-        with patch(
-            'backend.implementations.getcomics.search_getcomics',
-            side_effect=fake_search
-        ):
-            results = _run(scrape_weekly_packs(session, pack_count=2))
+        with patch.object(indexer, 'search', side_effect=fake_search):
+            results = _run(indexer.scrape_weekly_packs(pack_count=2))
 
         self.assertTrue(
             any(r['display_title'] == 'Batman #150' for r in results))
@@ -301,15 +256,11 @@ class TestScrapeWeeklyPacks(unittest.TestCase):
 
     def test_deduplicates_links_across_packs(self) -> None:
         """A link appearing in two packs should only be returned once."""
-        from backend.implementations.getcomics import scrape_weekly_packs
-
         session, fake_search = self._make_mock_session()
+        indexer = _make_indexer(session)
 
-        with patch(
-            'backend.implementations.getcomics.search_getcomics',
-            side_effect=fake_search
-        ):
-            results = _run(scrape_weekly_packs(session, pack_count=2))
+        with patch.object(indexer, 'search', side_effect=fake_search):
+            results = _run(indexer.scrape_weekly_packs(pack_count=2))
 
         links = [r['link'] for r in results]
         # batman-150 appears in both _PACK_PAGE_HTML and _PACK_PAGE_HTML_2
@@ -323,15 +274,11 @@ class TestScrapeWeeklyPacks(unittest.TestCase):
 
     def test_only_weekly_packs_processed(self) -> None:
         """Non-pack results from the search should not become sources."""
-        from backend.implementations.getcomics import scrape_weekly_packs
-
         session, fake_search = self._make_mock_session()
+        indexer = _make_indexer(session)
 
-        with patch(
-            'backend.implementations.getcomics.search_getcomics',
-            side_effect=fake_search
-        ):
-            results = _run(scrape_weekly_packs(session, pack_count=2))
+        with patch.object(indexer, 'search', side_effect=fake_search):
+            results = _run(indexer.scrape_weekly_packs(pack_count=2))
 
         # The batman-150 result from the search page itself should NOT appear
         # (pack_count=2 means only https://getcomics.org/packs/ URLs are fetched

@@ -10,6 +10,25 @@
 {% block main %}
 <main>
 	<div>
+		<section aria-label="Status Checks">
+			<h2>Status Checks</h2>
+			<div class="container">
+				<table id="status-table">
+					<thead>
+						<tr>
+							<th>Message</th>
+							<th>Actions</th>
+						</tr>
+					</thead>
+					<tbody id="status-body">
+						<tr id="status-clear-row">
+							<td>All systems operational</td>
+							<td></td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+		</section>
 		<section aria-label="About">
 			<h2>
 				<span>About</span>

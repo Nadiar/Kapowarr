@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Dict, List, Mapping, Tuple, Union
 
 from backend.base.definitions import IssueData, SpecialVersion, VolumeMetadata
 from backend.base.file_extraction import special_version_regex
-from backend.base.helpers import force_range
+from backend.base.helpers import force_range, fully_normalise_string
 from backend.implementations.blocklist import blocklist_contains
 
 if TYPE_CHECKING:
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
                                           SearchResultMatchData, VolumeData)
 
 clean_title_regex = compile(
-    r'((?<=annual)s|/|\-|–|\+|,|\.|\!|:|\bthe\s|\band\b|&|’|\'|\"|\bone[\-\s]?shot\b|\bhard[\-\s]?cover\b|\bomnibus\b|\btpb\b)'
+    r'((?<=annual)s|/|\-|–|\+|,|\.|\!|:|=|\bthe\s|\band\b|&|’|\'|\"|\bone[\-\s]?shot\b|\bhard[\-\s]?cover\b|\bomnibus\b|\btpb\b)'
 )
 
 
@@ -45,12 +45,12 @@ def match_title(
     """
     clean_reference_title = clean_title_regex.sub(
         '',
-        title1.lower()
+        fully_normalise_string(title1).lower()
     ).replace(' ', '')
 
     clean_title = clean_title_regex.sub(
         '',
-        title2.lower()
+        fully_normalise_string(title2).lower()
     ).replace(' ', '')
 
     if allow_contains:
@@ -241,9 +241,9 @@ def folder_extraction_filter(
     annual = 'annual' in volume_data.title.lower()
     matching_annual = file_data['annual'] == annual
 
-    matching_title = match_title(
-        file_data['series'],
-        volume_data.title
+    matching_title = (
+        match_title(volume_data.title, file_data['series'])
+        or match_title(volume_data.alt_title or '', file_data['series'])
     )
 
     matching_year = match_year(
@@ -294,6 +294,8 @@ def file_importing_filter(
         file_data (FilenameData): Extracted data from file.
         volume_data (VolumeData): The data of the volume.
         volume_issues (List[IssueData]): The data of the issues of the volume.
+        number_to_year (Mapping[float, Union[int, None]]): calculated issue
+            numbers mapped to their release year for all issues of volume.
 
     Returns:
         bool: Whether the file matches to the volume or not.
@@ -329,11 +331,18 @@ def file_importing_filter(
         number_to_year.get(force_range(issue_number)[-1])
     )
 
+    # Neither are given, so we'll never know what volume the files are exactly
+    # for. But they're in the volume folder, so we'll assume they match.
+    neither_found = (
+        file_data['year'], file_data['volume_number']
+    ) == (None, None)
+
     is_match = (
         matching_special_version
         and (
             matching_volume_number
             or matching_year
+            or neither_found
         )
     )
 
@@ -359,9 +368,9 @@ def download_group_filter(
     """
     annual = 'annual' in volume_data.title.lower()
 
-    matching_title = match_title(
-        volume_data.title,
-        processed_desc['series']
+    matching_title = (
+        match_title(volume_data.title, processed_desc['series'])
+        or match_title(volume_data.alt_title or '', processed_desc['series'])
     )
 
     matching_volume_number = match_volume_number(

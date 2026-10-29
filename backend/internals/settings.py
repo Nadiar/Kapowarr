@@ -2,7 +2,14 @@
 
 from dataclasses import _MISSING_TYPE, asdict, dataclass, field
 from functools import lru_cache
-from grp import getgrgid, getgrnam
+from time import time
+
+try:
+    from grp import getgrgid, getgrnam
+except ImportError:
+    getgrgid = None
+    getgrnam = None
+
 from logging import INFO
 from os import urandom
 from os.path import abspath, isdir, join, sep
@@ -15,8 +22,8 @@ from backend.base.custom_exceptions import (ClientNotWorking,
                                             InvalidSettingModification,
                                             KeyNotFound)
 from backend.base.definitions import (BaseEnum, Constants, DateType,
-                                      FileDate, GCDownloadSource,
-                                      ProxyType, SeedingHandling)
+                                      FileDate, OSType, ProxyType,
+                                      SeedingHandling, StatusType)
 from backend.base.files import (are_folders_colliding, folder_path,
                                 uppercase_drive_letter)
 from backend.base.helpers import (CommaList, Singleton, build_proxy_url,
@@ -51,7 +58,7 @@ def get_about_data() -> Dict[str, Any]:
         "version": get_version_from_pyproject(folder_path("pyproject.toml")),
         "python_version": get_python_version(),
         "database_version": DatabaseMigrationHandler.latest_db_version(),
-        "database_location": DBConnection.file,
+        "database_location": DBConnection.default_file,
         "data_folder": folder_path(),
         "os": System.os_type.value,
         "runs_64bit": System.runs_64bit
@@ -83,6 +90,9 @@ class PublicSettingsValues:
         default_factory=lambda: CommaList(['localhost', '127.0.0.1'])
     )
 
+    db_backup_amount: int = 3
+    db_backup_folder: str = folder_path(*Constants.DB_FOLDER)
+
     rename_downloaded_files: bool = True
     replace_illegal_characters: bool = True
     volume_folder_naming: str = join(
@@ -109,9 +119,6 @@ class PublicSettingsValues:
     extract_issue_ranges: bool = False
     format_preference: CommaList = field(default_factory=lambda: CommaList(''))
 
-    service_preference: CommaList = field(default_factory=lambda: CommaList(
-        (s.value for s in GCDownloadSource._member_map_.values())
-    ))
     download_folder: str = folder_path('temp_downloads')
     concurrent_direct_downloads: int = 1
     failing_download_timeout: int = 0
@@ -152,19 +159,11 @@ class SettingsValues(PublicSettingsValues):
     database_version: int = DatabaseMigrationHandler.latest_db_version()
     auth_salt: bytes = token_bytes()
 
+    last_rss_sync: int = round(time()) - 86400
+
     backup_host: str = '0.0.0.0'
     backup_port: int = 5656
     backup_url_base: str = ''
-
-
-task_intervals = {
-    # If there are tasks that should be run at the same time,
-    # but per se after each other, put them in that order in the dict.
-    'update_all': 86400,       # every 24 hours
-    'search_all': 604800,      # every week
-    'refresh_calendar': 86400, # every 24 hours
-    'search_recent': 3600      # every hour
-}
 
 
 class Settings(metaclass=Singleton):
@@ -262,6 +261,9 @@ class Settings(metaclass=Singleton):
             InvalidKeyValue: Value of the key is not allowed.
             InvalidSettingModification: Key can not be modified this way.
             FolderNotFound: Folder not found.
+            CredentialInvalid: The credential is not valid.
+            MetadataSourceNotWorking: Something went wrong contacting the
+                metadata source.
         """
         from backend.implementations.naming import (NAMING_MAPPING,
                                                     check_mock_filename)
@@ -366,7 +368,7 @@ class Settings(metaclass=Singleton):
         restore_settings = {
             'host': s.backup_host,
             'port': s.backup_port,
-            'url_prefix': s.backup_url_base
+            'url_base': s.backup_url_base
         }
         self.update(restore_settings)
         return
@@ -385,6 +387,9 @@ class Settings(metaclass=Singleton):
             InvalidKeyValue: Value of the key is not allowed.
             InvalidSettingModification: Key can not be modified this way.
             FolderNotFound: Folder not found.
+            CredentialInvalid: The credential is not valid.
+            MetadataSourceNotWorking: Something went wrong contacting the
+                metadata source.
 
         Returns:
             Any: (Converted) Setting value.
@@ -454,11 +459,23 @@ class Settings(metaclass=Singleton):
             if value == Constants.CREDENTIAL_REPLACEMENT:
                 converted_value = self.sv.proxy_password
 
+        elif key == 'db_backup_amount':
+            if value < 0:
+                raise InvalidKeyValue(key, value)
+
+        elif key == 'db_backup_folder':
+            if not isdir(value):
+                raise FolderNotFound(value)
+
+            converted_value = uppercase_drive_letter(
+                force_suffix(abspath(value))
+            )
+
         elif key == 'comicvine_api_key':
             from backend.implementations.comicvine import ComicVine
             converted_value = value.strip()
-            if converted_value and not ComicVine(converted_value).test_key():
-                raise InvalidKeyValue(key, value)
+            if converted_value:
+                ComicVine(converted_value).test_key()
 
         elif key == 'comicvine_api_url':
             converted_value = value.strip().rstrip('/')
@@ -495,6 +512,9 @@ class Settings(metaclass=Singleton):
             raise InvalidKeyValue(key, value)
 
         elif key == 'chmod_folder':
+            if System.os_type == OSType.WINDOWS and value:
+                raise InvalidKeyValue(key, value)
+
             if value.startswith('0'):
                 converted_value = value[1:]
 
@@ -517,6 +537,13 @@ class Settings(metaclass=Singleton):
             # We can't change existing group to a group that the running user
             # isn't a part of. If that's needed, we need to be root.
             if value:
+                if not (
+                    System.os_type != OSType.WINDOWS
+                    and getgrgid is not None # type: ignore
+                    and getgrnam is not None
+                ):
+                    raise InvalidKeyValue(key, value)
+
                 try:
                     getgrgid(int(value))
                 except (TypeError, ValueError, KeyError):
@@ -536,24 +563,9 @@ class Settings(metaclass=Singleton):
 
             converted_value = value
 
-        elif key == 'service_preference':
-            available = [
-                s.value
-                for s in GCDownloadSource._member_map_.values()
-            ]
-
-            for entry in value:
-                if entry not in available:
-                    raise InvalidKeyValue(key, value)
-
-            for entry in available:
-                if entry not in value:
-                    raise InvalidKeyValue(key, value)
-
-            converted_value = value
-
         elif key == 'flaresolverr_base_url':
             from backend.implementations.flaresolverr import FlareSolverr
+            from backend.internals.status import StatusHandlers
 
             converted_value = value
             if converted_value:
@@ -565,6 +577,9 @@ class Settings(metaclass=Singleton):
                 and not FlareSolverr.test_flaresolverr(converted_value)
             ):
                 raise InvalidKeyValue(key, value)
+
+            if converted_value:
+                StatusHandlers().clear(StatusType.CF_CHALLENGE_WITH_NO_FS, '')
 
         else:
             from backend.implementations.naming import (NAMING_MAPPING,

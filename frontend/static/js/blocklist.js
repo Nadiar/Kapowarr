@@ -13,6 +13,12 @@ const BlockEls = {
 	entry: document.querySelector('.pre-build-els .list-entry')
 };
 
+const reasonMap = {
+	link_broken: "Link broken",
+	no_working_links: "No supported or working links",
+	added_by_user: "Added by user"
+}
+
 var offset = 0;
 
 function fillList(api_key) {
@@ -32,15 +38,15 @@ function fillList(api_key) {
                 // Download link blocked
                 if (obj.web_title !== null) {
                     link.innerText = `${obj.web_title} - ${obj.web_sub_title}`;
-                    if (obj.source !== null)
-                        link.innerText += ` - ${obj.source}`;
+                    if (obj.download_service !== null)
+                        link.innerText += ` - ${obj.download_service}`;
                 } else
                     link.innerText = obj.download_link;
 
                 link.href = obj.download_link;
             };
 
-            entry.querySelector('.reason-column').innerText = obj.reason;
+            entry.querySelector('.reason-column').innerText = reasonMap[obj.reason];
 
 			var d = new Date(obj.added_at * 1000);
 			var formatted_date =

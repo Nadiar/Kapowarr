@@ -51,6 +51,7 @@ ONE_DAY = timedelta(days=1)
 THIRTY_DAYS = timedelta(days=30)
 split_regex = compile(r'(?<!vs)(?<!r\.i\.p)(?:(?<=[\.!\?])\s|(?<=[\.!\?]</p>)(?!$))', IGNORECASE)
 remove_link_regex = compile(r'<a[^>]*>.*?</a>', IGNORECASE)
+annual_regex = compile(r'\bannual\b', IGNORECASE)
 omnibus_regex = compile(r'\bomnibus\b', IGNORECASE)
 os_regex = compile(r'(?<!preceding\s)\bone[\- ]?shot\b(?!\scollections?)', IGNORECASE)
 hc_regex = compile(r'(?<!preceding\s)\bhard[\- ]?cover\b(?!\scollections?)', IGNORECASE)
@@ -708,10 +709,16 @@ class Volume:
             new_root_folder
         )
         for old_name, new_name in file_changes.items():
+            if not exists(old_name):
+                # File doesn't exist anymore. Maybe it got deleted with no R&S
+                # or it's already at the destination.
+                continue
+
             rename_file(
                 old_name,
                 new_name
             )
+
         if isdir(volume_data.folder):
             delete_empty_child_folders(volume_data.folder)
 
@@ -1126,10 +1133,12 @@ class Library:
 
         Raises:
             RootFolderNotFound: The root folder with the given ID was not found.
-            VolumeFolderInvalid: The volume folder is the parent or child of
-                another volume folder.
             VolumeAlreadyAdded: The volume already exists in the library.
-            CVRateLimitReached: The ComicVine API rate limit is reached.
+            CredentialInvalid: The API key of the metadata source is invalid.
+            MetadataSourceDataEntryNotFound: The ID doesn't map to any volume.
+            MetadataSourceRateLimitReached: The metadata source rate limit is
+                reached.
+            MetadataSourceNotWorking: Something went wrong contacting CV.
 
         Returns:
             int: The ID of the new volume.
@@ -1347,21 +1356,24 @@ def determine_special_version(volume_id: int) -> SpecialVersion:
         # Volume is annual
         return SpecialVersion.NORMAL
 
-    if one_issue and volume_data.description:
+    if volume_data.description:
         # Look for Special Version in first sentence of description. Only first
         # sentence as to avoid false hits, like referring to another volume that
         # is a Special Version in the description (e.g. "Included in the TPB")
         first_sentence = split_regex.split(volume_data.description)[0]
         first_sentence = remove_link_regex.sub('', first_sentence)
 
-        if omnibus_regex.search(first_sentence):
+        if one_issue and omnibus_regex.search(first_sentence):
             return SpecialVersion.OMNIBUS
 
-        if os_regex.search(first_sentence):
+        if one_issue and os_regex.search(first_sentence):
             return SpecialVersion.ONE_SHOT
 
-        if hc_regex.search(first_sentence):
+        if one_issue and hc_regex.search(first_sentence):
             return SpecialVersion.HARD_COVER
+
+        if annual_regex.search(first_sentence):
+            return SpecialVersion.NORMAL
 
     if one_issue and issues[0].date:
         thirty_plus_days_ago = (
@@ -1575,29 +1587,60 @@ def refresh_special_versions(
 
 
 def refresh_and_scan(
-    volume_id: int,
-    update_websocket: bool = False
+    volume_id: Union[int, None] = None,
+    update_websocket: bool = False,
+    allow_skipping: bool = True
 ) -> None:
-    """Refresh and scan a single volume.
-
-    Pulls the latest metadata from ComicVine and then scans the
-    volume's root folder for matching files.
+    """Refresh and scan one or more volumes, which means to pull metadata from
+    the online database and to scan for files.
 
     Args:
-        volume_id (int): The ID of the volume to refresh and scan.
+        volume_id (Union[int, None], optional): The ID of the volume if it is
+            desired to only refresh and scan one. If left to `None`, all volumes
+            are refreshed and scanned.
+            Defaults to None.
+
         update_websocket (bool, optional): Send task progress updates over
             the websocket.
             Defaults to False.
+
+        allow_skipping (bool, optional): Skip volumes that have been updated in
+            the last 24 hours or that have the same amount of issues as what
+            the metadata source reports.
+            Defaults to True.
+
+    Raises:
+        CredentialInvalid: The API key of the metadata source is invalid.
+        MetadataSourceNotWorking: Something went wrong contacting CV.
     """
+    current_time = datetime.now()
+    one_day_ago = current_time - ONE_DAY
+    thirty_days_ago = current_time - THIRTY_DAYS
+
     cursor = get_db()
-    cursor.execute("""
-        SELECT comicvine_id, id, last_cv_fetch
-        FROM volumes
-        WHERE id = ?
-        LIMIT 1;
-        """,
-        (volume_id,)
-    )
+    if volume_id:
+        cursor.execute("""
+            SELECT comicvine_id, id, last_cv_fetch
+            FROM volumes
+            WHERE id = ?
+            LIMIT 1;
+            """,
+            (volume_id,)
+        )
+
+    else:
+        cursor.execute("""
+            SELECT comicvine_id, id, last_cv_fetch
+            FROM volumes
+            WHERE last_cv_fetch <= ?
+            ORDER BY last_cv_fetch ASC;
+            """,
+            (
+                one_day_ago.timestamp()
+                if allow_skipping else
+                current_time.timestamp(),
+            )
+        )
 
     cv_to_id_fetch: Dict[int, Tuple[int, int]] = {
         e["comicvine_id"]: (e["id"], e["last_cv_fetch"])
@@ -1606,27 +1649,84 @@ def refresh_and_scan(
     if not cv_to_id_fetch:
         return
 
+    # Update volumes
     cv = ComicVine()
-    volume_datas = run(cv.fetch_volumes(tuple(cv_to_id_fetch.keys())))
+    volume_datas = filtered_volume_datas = run(
+        cv.fetch_volumes(tuple(cv_to_id_fetch.keys()))
+    )
+
+    if not volume_id and allow_skipping:
+        cv_id_to_issue_count: Dict[int, int] = dict(cursor.execute("""
+            SELECT v.comicvine_id, COUNT(i.id)
+            FROM volumes v
+            LEFT JOIN issues i
+            ON v.id = i.volume_id
+            WHERE v.last_cv_fetch <= ?
+            GROUP BY v.id;
+            """,
+            (one_day_ago.timestamp(),)
+        ))
+
+        filtered_volume_datas = [
+            v
+            for v in volume_datas
+            if cv_id_to_issue_count.get(v["comicvine_id"]) != v["issue_count"]
+            # Do a fetch anyway if it hasn't been done for 30 days
+            or cv_to_id_fetch[v["comicvine_id"]][1] <= thirty_days_ago.timestamp()
+        ]
+
     update_volume_metadata(cv_to_id_fetch, volume_datas)
 
-    issue_datas = run(cv.fetch_issues(tuple(cv_to_id_fetch.keys())))
+    # Update issues
+    issue_datas = run(cv.fetch_issues(
+        tuple(vd["comicvine_id"] for vd in filtered_volume_datas)
+    ))
     upsert_issues(cv_to_id_fetch, issue_datas)
-    delete_orphaned_issues(cv_to_id_fetch, volume_datas, issue_datas)
+    delete_orphaned_issues(cv_to_id_fetch, filtered_volume_datas, issue_datas)
     refresh_special_versions(cv_to_id_fetch, volume_datas)
 
-    # Reset consecutive-miss count so the volume floats back up in
-    # SearchAll priority. Wrapped in try/except — stats failure must
-    # never break the refresh.
-    try:
-        from backend.internals.db_models_search_stats import reset_misses
-        reset_misses(volume_id)
-    except Exception:
-        LOGGER.debug(
-            'Failed to reset search miss counter for volume %d', volume_id
-        )
+    # Scan for files
+    if volume_id:
+        # Reset consecutive-miss count so the volume floats back up in
+        # SearchAll priority. Stats failure must never break the refresh.
+        try:
+            from backend.internals.db_models_search_stats import reset_misses
+            reset_misses(volume_id)
+        except Exception:
+            LOGGER.debug(
+                'Failed to reset search miss counter for volume %d', volume_id
+            )
 
-    scan_files(volume_id, update_websocket=update_websocket)
+        scan_files(volume_id, update_websocket=update_websocket)
+
+    else:
+        v_ids = [
+            (v[0], [], False, update_websocket)
+            for v in cv_to_id_fetch.values()
+        ]
+        total_count = len(v_ids)
+
+        if not total_count:
+            return
+
+        with PortablePool(max_processes=min(
+            Constants.DB_MAX_CONCURRENT_CONNECTIONS,
+            total_count
+        )) as pool:
+            if update_websocket:
+                ws = WebSocket()
+                for idx, _ in enumerate(
+                    pool.istarmap_unordered(scan_files, v_ids)
+                ):
+                    ws.emit(TaskStatusEvent(
+                        f'Scanned files for volume {idx+1}/{total_count}'
+                    ))
+
+            else:
+                pool.starmap(scan_files, v_ids)
+
+        FilesDB.delete_unmatched_files()
+
     return
 
 
