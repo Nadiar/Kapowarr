@@ -720,7 +720,7 @@ class ComicVine:
         try:
             formatted_cv_ids = to_string_cv_id(cv_ids)
         except ValueError:
-            raise VolumeNotMatched
+            raise MetadataSourceDataEntryNotFound
 
         since_dt = datetime.fromtimestamp(
             since_timestamp, tz=timezone.utc
@@ -750,7 +750,7 @@ class ComicVine:
                             'filter': filt
                         }
                     )
-                except CVRateLimitReached:
+                except MetadataSourceRateLimitReached:
                     break
 
                 issue_infos.extend(
@@ -979,7 +979,7 @@ class ComicVine:
                 result = await self.__call_api(
                     session, '/issues', params
                 )
-            except CVRateLimitReached:
+            except MetadataSourceRateLimitReached:
                 LOGGER.warning(
                     'CV rate limit on calendar store_date request'
                 )
