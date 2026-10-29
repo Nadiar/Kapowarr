@@ -98,35 +98,6 @@ class DatabaseMigrationHandler:
         )
         return
 
-    @staticmethod
-    def _is_pre_merge_fork_db(current_db_version: int) -> bool:
-        """Whether the database was migrated with the fork's original
-        (colliding) migrations 45-50 instead of upstream's 45-51.
-
-        Upstream migration 45 adds `external_download_clients.enabled`, and the
-        fork's migration 46 created the `notifications` table. A database with
-        a version in 46..51 that has `notifications` but lacks `enabled` can
-        therefore only have come from the fork.
-        """
-        if not 45 < current_db_version <= 51:
-            return False
-
-        cursor = get_db()
-        has_notifications = cursor.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type='table' AND name='notifications';"
-        ).exists() is not None
-        if not has_notifications:
-            return False
-
-        ec_columns = {
-            r["name"]
-            for r in cursor.execute(
-                "PRAGMA table_info(external_download_clients);"
-            ).fetchall()
-        }
-        return "enabled" not in ec_columns
-
     @classmethod
     def migrate(cls) -> None:
         """
@@ -137,21 +108,6 @@ class DatabaseMigrationHandler:
 
         s = Settings()
         current_db_version = s.sv.database_version
-
-        if cls._is_pre_merge_fork_db(current_db_version):
-            # Databases created by the fork before merging upstream v1.3.2
-            # used versions 45-50 for fork-only migrations, which collide with
-            # upstream's 45-51. Rewind so upstream's migrations run; the fork
-            # migrations are re-registered as 52+ and are idempotent.
-            LOGGER.info(
-                "Detected pre-merge fork database (version %d), "
-                "rewinding to 45 to apply upstream migrations",
-                current_db_version
-            )
-            s.update({"database_version": 45})
-            s.clear_cache()
-            current_db_version = 45
-
         newest_version = cls.latest_db_version()
 
         if current_db_version > newest_version:
@@ -1360,9 +1316,8 @@ def _migrate_remove_search_all_task() -> None:
 
 @DatabaseMigrationHandler.register_handler(51)
 def _migrate_add_torrent_usenet_indexer_fields() -> None:
-    # The indexer_clients table is created by DB_SCHEMA before migrations run,
-    # so on databases coming from before migration 47 it already has these
-    # columns. Only add the ones that are missing.
+    # Fork: on a rewound pre-merge fork database, DB_SCHEMA has already
+    # created indexer_clients with these columns, so only add missing ones.
     cursor = get_db()
     existing_columns = {
         r["name"]
@@ -1376,92 +1331,4 @@ def _migrate_add_torrent_usenet_indexer_fields() -> None:
                 f"ALTER TABLE indexer_clients ADD COLUMN {column} VARCHAR(255);"
             )
 
-    return
-
-
-# region Fork migrations
-# These were originally registered as 45-50 in the fork, colliding with
-# upstream. They're renumbered after upstream's and written to be idempotent,
-# since pre-merge fork databases already applied them (see
-# `DatabaseMigrationHandler._is_pre_merge_fork_db`). Task interval rows are
-# created by `insert_task_intervals()` on startup, so these don't insert them.
-
-@DatabaseMigrationHandler.register_handler(52)
-def _migrate_add_comicvine_api_url():
-    get_db().execute("""
-        INSERT OR IGNORE INTO config(key, value)
-        VALUES ('comicvine_api_url', 'https://comicvine.gamespot.com/api');
-    """)
-    return
-
-
-@DatabaseMigrationHandler.register_handler(53)
-def _migrate_add_notifications():
-    get_db().executescript("""
-        CREATE TABLE IF NOT EXISTS notifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            provider_type TEXT NOT NULL,
-            settings TEXT NOT NULL DEFAULT '{}',
-            on_download BOOL NOT NULL DEFAULT 1,
-            on_health_check BOOL NOT NULL DEFAULT 1,
-            on_volume_add BOOL NOT NULL DEFAULT 1,
-            on_application_update BOOL NOT NULL DEFAULT 1,
-            enabled BOOL NOT NULL DEFAULT 1
-        );
-    """)
-    return
-
-
-@DatabaseMigrationHandler.register_handler(54)
-def _migrate_add_volume_search_stats():
-    get_db().executescript("""
-        CREATE TABLE IF NOT EXISTS volume_search_stats (
-            volume_id INTEGER PRIMARY KEY,
-            last_searched INTEGER NOT NULL DEFAULT 0,
-            consecutive_misses INTEGER NOT NULL DEFAULT 0,
-            total_searches INTEGER NOT NULL DEFAULT 0,
-            total_hits INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY (volume_id) REFERENCES volumes(id) ON DELETE CASCADE
-        );
-    """)
-    return
-
-
-@DatabaseMigrationHandler.register_handler(55)
-def _migrate_split_update_all():
-    get_db().execute(
-        "INSERT OR IGNORE INTO config(key, value) "
-        "VALUES ('last_issue_sync', '0');"
-    )
-    return
-
-
-@DatabaseMigrationHandler.register_handler(56)
-def _migrate_task_history_duration():
-    cursor = get_db()
-    existing_columns = {
-        row['name']
-        for row in cursor.execute("PRAGMA table_info(task_history);").fetchall()
-    }
-    if 'duration_seconds' in existing_columns:
-        return
-
-    cursor.execute(
-        "ALTER TABLE task_history ADD COLUMN duration_seconds INTEGER;"
-    )
-    return
-
-
-@DatabaseMigrationHandler.register_handler(57)
-def _migrate_add_volume_publisher_cache():
-    get_db().executescript("""
-        CREATE TABLE IF NOT EXISTS volume_publisher_cache (
-            comicvine_id   INTEGER PRIMARY KEY,
-            volume_name    TEXT    NOT NULL DEFAULT '',
-            publisher_name TEXT,
-            publisher_id   INTEGER,
-            cached_at      REAL    NOT NULL
-        );
-    """)
     return

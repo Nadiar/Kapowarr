@@ -364,7 +364,12 @@ def setup_db() -> None:
     if is_first_startup:
         DatabaseMigrationHandler.on_first_startup()
 
+    # Fork: schema outside upstream's numbered migrations
+    from backend.internals.fork_schema import (reconcile_fork_schema,
+                                               rewind_pre_merge_fork_db)
+    rewind_pre_merge_fork_db()
     DatabaseMigrationHandler.migrate()
+    reconcile_fork_schema()
 
     # Generate api key
     if not settings_values.api_key:
@@ -529,41 +534,12 @@ CREATE TABLE IF NOT EXISTS download_history(
 CREATE TABLE IF NOT EXISTS task_history(
     task_name NOT NULL,
     display_title NOT NULL,
-    run_at INTEGER NOT NULL,
-    duration_seconds INTEGER
+    run_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS task_intervals(
     task_name PRIMARY KEY,
     schedule TEXT NOT NULL,
     next_run INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS notifications(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    provider_type TEXT NOT NULL,
-    settings TEXT NOT NULL DEFAULT '{}',
-    on_download BOOL NOT NULL DEFAULT 1,
-    on_health_check BOOL NOT NULL DEFAULT 1,
-    on_volume_add BOOL NOT NULL DEFAULT 1,
-    on_application_update BOOL NOT NULL DEFAULT 1,
-    enabled BOOL NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS volume_search_stats(
-    volume_id INTEGER PRIMARY KEY,
-    last_searched INTEGER NOT NULL DEFAULT 0,
-    consecutive_misses INTEGER NOT NULL DEFAULT 0,
-    total_searches INTEGER NOT NULL DEFAULT 0,
-    total_hits INTEGER NOT NULL DEFAULT 0,
-
-    FOREIGN KEY (volume_id) REFERENCES volumes(id)
-        ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS volume_publisher_cache(
-    comicvine_id INTEGER PRIMARY KEY,
-    volume_name TEXT NOT NULL DEFAULT '',
-    publisher_name TEXT,
-    publisher_id INTEGER,
-    cached_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS blocklist(
     id INTEGER PRIMARY KEY,
