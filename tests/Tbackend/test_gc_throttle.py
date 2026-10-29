@@ -77,7 +77,7 @@ class TestAsyncSession429Logic(unittest.TestCase):
         return resp
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_429_from_gc_url_sets_throttle_timestamp(self):
         """A 429 from a GC URL must set _gc_throttle_until > now."""
