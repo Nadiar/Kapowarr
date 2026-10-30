@@ -57,12 +57,12 @@
 	border-top: 1px solid var(--border-color);
 }
 
-.task-entry .run-column button {
+.task-entry .actions-column button {
 	height: 2rem;
 	padding: .4rem;
 }
 
-.task-entry .run-column button img {
+.task-entry .actions-column button img {
 	height: 100%;
 }
 

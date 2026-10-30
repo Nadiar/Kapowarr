@@ -36,10 +36,43 @@ function formatDuration(seconds) {
 
 const scheduleDescriptions = {
 	'0 * * * *': 'Every hour',
-	'15 * * * *': 'Every hour (at :15)',
 	'0 0 * * *': 'Once per day',
 	'0 0 * * 1': 'Once per week',
 	'0,30 * * * *': 'Every half hour'
+};
+
+const weekdays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday',
+	'Friday', 'Saturday'];
+
+// Fork: readable text for the simple cron schedules the fork's tasks use
+function describeSchedule(schedule) {
+	if (scheduleDescriptions[schedule])
+		return scheduleDescriptions[schedule];
+
+	const fields = schedule.trim().split(/\s+/);
+	if (fields.length !== 5 || !/^\d+$/.test(fields[0]))
+		return schedule;
+
+	const [minute, hour, day, month, weekday] = fields;
+	const mm = minute.padStart(2, '0');
+	if (hour === '*' && day === '*' && month === '*' && weekday === '*')
+		return `Every hour at :${mm}`;
+
+	if (!/^\d+$/.test(hour) || month !== '*')
+		return schedule;
+
+	const time = `${hour.padStart(2, '0')}:${mm}`;
+	if (day === '*' && weekday === '*')
+		return `Daily at ${time}`;
+
+	if (day === '*' && /^[0-6]$/.test(weekday))
+		return `${weekdays[weekday]}s at ${time}`;
+
+	const everyNDays = day.match(/^\*\/(\d+)$/);
+	if (everyNDays && weekday === '*')
+		return `Every ${everyNDays[1]} days at ${time}`;
+
+	return schedule;
 };
 
 function convertTime(epoch, future) {
@@ -133,7 +166,8 @@ function fillPlanning(api_key) {
 
 			entry.querySelector('.task-name').innerText = task.display_name;
 			entry.querySelector('.schedule-column').innerText =
-				scheduleDescriptions[task.schedule] || task.schedule;
+				describeSchedule(task.schedule);
+			entry.querySelector('.schedule-column').title = task.schedule;
 			entry.querySelector('.prev-column').innerText =
 				convertTime(task.last_run, false);
 			entry.querySelector('.next-column').innerText =
