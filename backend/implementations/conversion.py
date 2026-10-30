@@ -8,6 +8,7 @@ from itertools import chain
 from typing import Dict, Iterator, List, Union
 
 from backend.base.helpers import PortablePool, filtered_iter
+from backend.features.external_files import skip_external
 from backend.implementations.converters import (ConvertersManager,
                                                 ProposedConversion)
 from backend.implementations.file_matching import scan_files
@@ -39,9 +40,11 @@ def _get_convertable_files(
             another format.
     """
     if issue_id:
-        file_list = Volume(volume_id).get_issue(issue_id).get_files()
+        file_list = skip_external(
+            Volume(volume_id).get_issue(issue_id).get_files()
+        )
     else:
-        file_list = Volume(volume_id).get_all_files()
+        file_list = skip_external(Volume(volume_id).get_all_files())
 
     for file in sorted(filtered_iter(
         (f["filepath"] for f in file_list),

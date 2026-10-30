@@ -29,6 +29,7 @@ from backend.base.files import (clean_filepath_simple, clean_filepath_smartly,
 from backend.base.helpers import (DateFormatter, extract_year_from_date,
                                   filtered_iter, force_range)
 from backend.base.logging import LOGGER
+from backend.features.external_files import skip_external
 from backend.implementations.file_processing import mass_process_files
 from backend.implementations.matching import file_importing_filter, match_title
 from backend.implementations.root_folders import RootFolders
@@ -736,7 +737,7 @@ def preview_mass_rename(
 
     if not issue_id:
         # Rename for volume
-        files = volume.get_all_files()
+        files = skip_external(volume.get_all_files())
 
         if not volume_data.custom_folder:
             root_folder = RootFolders()[volume_data.root_folder]
@@ -746,7 +747,7 @@ def preview_mass_rename(
 
     else:
         # Rename for issue
-        files = volume.get_issue(issue_id).get_files()
+        files = skip_external(volume.get_issue(issue_id).get_files())
 
     if not files and volume_folder == volume_data.folder:
         return {}, None

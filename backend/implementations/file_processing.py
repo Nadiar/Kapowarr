@@ -56,6 +56,7 @@ def mass_set_file_date(
             {issue_filter}
             {filepath_sql_filter}
             AND i.date IS NOT NULL
+            AND f.id NOT IN (SELECT file_id FROM external_files)
         """,
         {
             "volume_id": volume_id,

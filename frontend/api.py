@@ -28,6 +28,7 @@ from backend.features.calendar import get_calendar, get_publisher_presets
 from backend.features.download_queue import (DownloadHandler,
                                              delete_download_history,
                                              get_download_history)
+from backend.features.external_files import repoint_file
 from backend.features.library_import import (import_library,
                                              propose_library_import)
 from backend.features.mass_edit import MassEditorActionManager
@@ -1718,11 +1719,17 @@ def api_mass_editor():
 
 
 # region Files
-@api.route('/files/<int:f_id>', methods=['GET', 'DELETE'])
+@api.route('/files/<int:f_id>', methods=['GET', 'PUT', 'DELETE'])
 @error_handler
 @auth
 def api_files(f_id: int):
     if request.method == 'GET':
+        result = FilesDB.fetch(file_id=f_id)[0]
+        return return_api(result)
+
+    elif request.method == 'PUT':
+        # Fork: an external application moved the file
+        repoint_file(f_id, extract_key(request, 'filepath'))
         result = FilesDB.fetch(file_id=f_id)[0]
         return return_api(result)
 

@@ -35,6 +35,7 @@ from backend.base.files import (change_basefolder, create_folder,
 from backend.base.helpers import (PortablePool, extract_year_from_date,
                                   first_of_subarrays, to_number_cv_id)
 from backend.base.logging import LOGGER
+from backend.features.external_files import is_external, skip_external
 from backend.implementations.comicvine import ComicVine
 from backend.implementations.file_matching import scan_files
 from backend.implementations.file_processing import mass_process_files
@@ -704,7 +705,7 @@ class Volume:
 
         # Move files
         file_changes = change_basefolder(
-            (f["filepath"] for f in self.get_all_files()),
+            (f["filepath"] for f in skip_external(self.get_all_files())),
             current_root_folder,
             new_root_folder
         )
@@ -781,7 +782,7 @@ class Volume:
 
         # Move files
         file_changes = change_basefolder(
-            (f["filepath"] for f in self.get_all_files()),
+            (f["filepath"] for f in skip_external(self.get_all_files())),
             current_volume_folder,
             new_volume_folder
         )
@@ -860,7 +861,7 @@ class Volume:
 
         volume_data = self.get_data()
         if delete_folder and exists(volume_data.folder):
-            for f in self.get_all_files():
+            for f in skip_external(self.get_all_files()):
                 delete_file_folder(f["filepath"])
 
             delete_empty_child_folders(volume_data.folder)
@@ -1740,7 +1741,11 @@ def delete_issue_file(file_id: int) -> None:
     volume_id = FilesDB.volume_of_file(file_data["filepath"])
     unmonitor_deleted_issues = Settings().sv.unmonitor_deleted_issues and volume_id
 
-    if volume_id:
+    if is_external(file_id):
+        # Fork: the file is managed by an external application, so only
+        # forget about it; deleting it is up to that application
+        pass
+    elif volume_id:
         vf = Library.get_volume(volume_id).vd.folder
         delete_file_folder(file_data["filepath"])
         delete_empty_parent_folders(dirname(file_data["filepath"]), vf)

@@ -18,6 +18,7 @@ from backend.base.files import (create_folder, delete_empty_child_folders,
 from backend.base.helpers import (extract_year_from_date,
                                   filtered_iter, force_range)
 from backend.base.logging import LOGGER
+from backend.features.external_files import present_external_file_ids
 from backend.implementations.matching import file_importing_filter
 from backend.implementations.root_folders import RootFolders
 from backend.internals.db import commit, get_db
@@ -204,7 +205,13 @@ def scan_files(
 
     # Determine old and new bindings, and which issues change in
     # their marking of being downloaded because of the new bindings
-    manually_matched_files_missing = set(manually_matched_files.values())
+    # Fork: files managed by an external application aren't in the volume
+    # folder, but they're not missing or unmatched either
+    external_files_found = present_external_file_ids(volume_id)
+    manually_matched_files_found |= external_files_found
+    manually_matched_files_missing = (
+        set(manually_matched_files.values()) - external_files_found
+    )
     current_bindings: Set[Tuple[int, int]] = set(map(tuple, cursor.execute("""
         SELECT if.file_id, if.issue_id
         FROM issues_files if

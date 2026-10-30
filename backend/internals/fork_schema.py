@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS volume_publisher_cache(
     publisher_id INTEGER,
     cached_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS external_files(
+    file_id INTEGER PRIMARY KEY,
+
+    FOREIGN KEY (file_id) REFERENCES files(id)
+        ON DELETE CASCADE
+);
 """
 
 FORK_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
