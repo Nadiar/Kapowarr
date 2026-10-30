@@ -9,8 +9,8 @@ as external. Kapowarr then keeps the issue bound to it, and must not rename,
 convert, move or delete it, since the file is not Kapowarr's to touch.
 """
 
-from os import stat
-from os.path import isabs, isfile
+from os import environ, pathsep, stat
+from os.path import commonpath, isabs, isfile, normcase, realpath
 from typing import Iterable, List, Set, Union
 
 from backend.base.custom_exceptions import FileNotFound, InvalidKeyValue
@@ -58,6 +58,35 @@ def present_external_file_ids(volume_id: int) -> Set[int]:
     return {r[0] for r in rows if isfile(r[1])}
 
 
+def _allowed_roots() -> List[str]:
+    """Folders an external application may place files in: the root folders,
+    plus any listed in the `KAPOWARR_EXTERNAL_ROOTS` environment variable
+    (separated like PATH)."""
+    folders = [
+        r[0] for r in get_db().execute(
+            "SELECT folder FROM root_folders;"
+        ).fetchall()
+    ]
+    folders += [
+        f for f in environ.get("KAPOWARR_EXTERNAL_ROOTS", "").split(pathsep)
+        if f
+    ]
+    return [normcase(realpath(f)) for f in folders]
+
+
+def _is_in_allowed_root(path: str) -> bool:
+    "Whether the path, after resolving symlinks and `..`, is inside a root"
+    resolved = normcase(realpath(path))
+    for root in _allowed_roots():
+        try:
+            if commonpath((resolved, root)) == root:
+                return True
+        except ValueError:
+            # Different drives
+            continue
+    return False
+
+
 def repoint_file(file_id: int, new_path: Union[str, bytes]) -> None:
     """Point a file at a new location and mark it as external. Its issue
     bindings are kept. Can be called again when the external application
@@ -69,8 +98,9 @@ def repoint_file(file_id: int, new_path: Union[str, bytes]) -> None:
 
     Raises:
         FileNotFound: The file ID is unknown, or nothing exists at the path.
-        InvalidKeyValue: The path is not absolute, or is already used by
-            another file.
+        InvalidKeyValue: The path is not absolute, is outside every root
+            folder (and every `KAPOWARR_EXTERNAL_ROOTS` folder), or is already
+            used by another file.
     """
     new_path = str(new_path)
     cursor = get_db()
@@ -81,6 +111,9 @@ def repoint_file(file_id: int, new_path: Union[str, bytes]) -> None:
         raise FileNotFound(file_id)
 
     if not isabs(new_path):
+        raise InvalidKeyValue("filepath", new_path)
+
+    if not _is_in_allowed_root(new_path):
         raise InvalidKeyValue("filepath", new_path)
 
     if not isfile(new_path):

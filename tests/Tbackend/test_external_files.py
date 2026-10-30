@@ -1,5 +1,6 @@
 """Tests for files owned by an external manager (`external_files.py`)."""
 
+import os
 import sqlite3
 import sys
 import tempfile
@@ -15,6 +16,7 @@ from backend.features import external_files
 from backend.internals.db import KapowarrCursor
 
 SCHEMA = """
+    CREATE TABLE root_folders(id INTEGER PRIMARY KEY, folder TEXT UNIQUE);
     CREATE TABLE files(
         id INTEGER PRIMARY KEY,
         filepath TEXT UNIQUE NOT NULL,
@@ -49,6 +51,9 @@ class ExternalFilesTestCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.cursor = _make_cursor()
+        self.cursor.execute(
+            "INSERT INTO root_folders(folder) VALUES (?);", (self.tmp.name,)
+        )
         patcher = patch.object(
             external_files, 'get_db', return_value=self.cursor
         )
@@ -150,6 +155,76 @@ class TestRepointFile(ExternalFilesTestCase):
 
         with self.assertRaises(InvalidKeyValue):
             external_files.repoint_file(file_id, taken)
+
+
+class TestAllowedLocations(ExternalFilesTestCase):
+    """A repoint may only target files inside a root folder, or inside a
+    folder explicitly allowed by KAPOWARR_EXTERNAL_ROOTS."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.outside = tempfile.TemporaryDirectory()
+        self.addCleanup(self.outside.cleanup)
+        self.file_id = self.add_file_row('/kapowarr/vol/Batman 001.cbz')
+
+    def make_outside(self, name: str = 'secret.cbz') -> str:
+        path = join(self.outside.name, name)
+        with open(path, 'wb') as f:
+            f.write(b'x')
+        return path
+
+    def assert_rejected(self, path: str) -> None:
+        with self.assertRaises(InvalidKeyValue):
+            external_files.repoint_file(self.file_id, path)
+        self.assertEqual(
+            self.row(self.file_id)['filepath'], '/kapowarr/vol/Batman 001.cbz'
+        )
+        self.assertFalse(external_files.is_external(self.file_id))
+
+    def test_file_outside_every_root_folder_is_rejected(self) -> None:
+        self.assert_rejected(self.make_outside())
+
+    def test_dot_dot_traversal_out_of_a_root_is_rejected(self) -> None:
+        outside = self.make_outside('escape.cbz')
+        traversal = join(
+            self.tmp.name, '..', os.path.basename(self.outside.name),
+            'escape.cbz'
+        )
+        self.assertTrue(os.path.isfile(traversal))
+        self.assert_rejected(traversal)
+
+    def test_symlink_inside_a_root_pointing_outside_is_rejected(self) -> None:
+        outside = self.make_outside()
+        link = join(self.tmp.name, 'link.cbz')
+        try:
+            os.symlink(outside, link)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlinks not available')
+        self.assert_rejected(link)
+
+    def test_folder_with_a_shared_name_prefix_is_rejected(self) -> None:
+        sibling = self.tmp.name + '-evil'
+        os.makedirs(sibling)
+        self.addCleanup(os.rmdir, sibling)
+        path = join(sibling, 'a.cbz')
+        with open(path, 'wb') as f:
+            f.write(b'x')
+        self.addCleanup(os.remove, path)
+        self.assert_rejected(path)
+
+    def test_extra_allowed_root_from_environment(self) -> None:
+        outside = self.make_outside()
+        with patch.dict(
+            os.environ, {'KAPOWARR_EXTERNAL_ROOTS': self.outside.name}
+        ):
+            external_files.repoint_file(self.file_id, outside)
+        self.assertTrue(external_files.is_external(self.file_id))
+
+    def test_file_inside_a_root_folder_is_accepted(self) -> None:
+        external_files.repoint_file(
+            self.file_id, self.make_file('inside.cbz')
+        )
+        self.assertTrue(external_files.is_external(self.file_id))
 
 
 class TestQueries(ExternalFilesTestCase):
