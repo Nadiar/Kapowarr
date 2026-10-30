@@ -138,7 +138,12 @@ def _main(
                 settings.proxy_password
             )
             if proxy_url:
-                apply_proxy(proxy_url, settings.proxy_ignored_addresses)
+                # Fork: never proxy the local ComicVine cache
+                from backend.internals.fork_proxy import proxy_ignored_addresses
+                apply_proxy(proxy_url, proxy_ignored_addresses(
+                    settings.proxy_ignored_addresses,
+                    settings.comicvine_api_url
+                ))
 
         download_handler = DownloadHandler()
         download_handler.load_downloads()
