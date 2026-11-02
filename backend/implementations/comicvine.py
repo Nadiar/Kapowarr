@@ -137,6 +137,19 @@ def _clean_description(description: str, short: bool = False) -> str:
     return result
 
 
+def _import_match(volume: Union[VolumeMetadata, None]) -> Dict[str, Any]:
+    "A volume as the match of a library import group"
+    if volume is None:
+        return {'id': None, 'title': None, 'issue_count': None, 'link': None}
+
+    return {
+        'id': volume['comicvine_id'],
+        'title': f"{volume['title']} ({volume['year']})",
+        'issue_count': volume['issue_count'],
+        'link': volume['site_url']
+    }
+
+
 class ComicVine:
     volume_field_list = ','.join((
         'aliases',
@@ -923,23 +936,69 @@ class ComicVine:
                     only_english=only_english
                 )
 
-                if result is None:
-                    matches[group_number] = {
-                        'id': None,
-                        'title': None,
-                        'issue_count': None,
-                        'link': None
-                    }
-
-                else:
-                    matches[group_number] = {
-                        'id': result['comicvine_id'],
-                        'title': f"{result['title']} ({result['year']})",
-                        'issue_count': result['issue_count'],
-                        'link': result['site_url']
-                    }
+                matches[group_number] = _import_match(result)
 
         return matches
+
+    async def fetch_volume_matches_of_issues(
+        self,
+        issue_ids: Iterable[int]
+    ) -> Dict[int, Dict[str, Any]]:
+        """Find the volume of each issue, as a library import match.
+
+        Args:
+            issue_ids (Iterable[int]): The CV IDs of the issues.
+
+        Raises:
+            CredentialInvalid: The API key is not valid.
+            MetadataSourceNotWorking: Something went wrong contacting CV.
+
+        Returns:
+            Dict[int, Dict[str, Any]]: A mapping from issue ID to the match of
+                its volume. Issues that CV doesn't know, or that couldn't be
+                fetched because the rate limit was reached, are left out.
+        """
+        issue_ids = sorted({int(i) for i in issue_ids})
+        if not issue_ids:
+            return {}
+
+        issue_to_volume: Dict[int, int] = {}
+        volumes: Dict[int, VolumeMetadata] = {}
+        async with AsyncSession() as session:
+            for id_batch in batched(issue_ids, 100):
+                response = await self.__call_api(
+                    session,
+                    '/issues',
+                    {
+                        'field_list': 'id,volume',
+                        'filter': f'id:{"|".join(map(str, id_batch))}'
+                    },
+                    {'results': []}
+                )
+                for result in response['results']:
+                    issue_to_volume[int(result['id'])] = int(
+                        result['volume']['id']
+                    )
+
+            for id_batch in batched(sorted(set(issue_to_volume.values())), 100):
+                response = await self.__call_api(
+                    session,
+                    '/volumes',
+                    {
+                        'field_list': self.search_field_list,
+                        'filter': f'id:{"|".join(map(str, id_batch))}'
+                    },
+                    {'results': []}
+                )
+                for result in response['results']:
+                    volume = self.__format_volume_output(result)
+                    volumes[volume['comicvine_id']] = volume
+
+        return {
+            issue_id: _import_match(volumes[volume_id])
+            for issue_id, volume_id in issue_to_volume.items()
+            if volume_id in volumes
+        }
 
     async def fetch_issues_by_date_range(
         self,

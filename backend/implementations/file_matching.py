@@ -8,6 +8,7 @@ from collections import Counter
 from os.path import basename, isdir
 from typing import Dict, List, Set, Tuple, Union
 
+from backend.base.comicinfo import read_comicvine_issue_id
 from backend.base.definitions import (FileConstants, FileMatch,
                                       GeneralFileType, SpecialVersion)
 from backend.base.file_extraction import (extract_filename_data,
@@ -76,6 +77,19 @@ def scan_files(
         f['filepath']: f['id']
         for f in volume.get_all_files()
     }
+    # Fork: a file whose name matches no issue can still be tagged with one
+    comicvine_to_issue: Dict[int, int] = {
+        i.comicvine_id: i.id
+        for i in volume_issues
+    }
+
+    def bind_by_comicinfo(file: str) -> None:
+        issue_id = comicvine_to_issue.get(read_comicvine_issue_id(file) or 0)
+        if issue_id is None:
+            return
+        if file not in current_issue_files:
+            current_issue_files[file] = FilesDB.add_file(file)
+        new_issue_bindings.add((current_issue_files[file], issue_id))
 
     # Skip processing manually matched files, but do note that they are found
     manually_matched_files: Dict[str, int] = dict(cursor.execute(
@@ -126,6 +140,7 @@ def scan_files(
             )
             continue
 
+        bindings_before = len(new_issue_bindings) + len(new_general_bindings)
         file_data = extract_filename_data(
             file,
             assume_volume_number=False
@@ -138,6 +153,7 @@ def scan_files(
             volume_issues,
             number_to_year
         ):
+            bind_by_comicinfo(file)
             continue
 
         file_data = refine_special_version(volume_data, file_data)
@@ -202,6 +218,11 @@ def scan_files(
                     new_issue_bindings.add(
                         (current_issue_files[file], issue)
                     )
+
+        if bindings_before == (
+            len(new_issue_bindings) + len(new_general_bindings)
+        ):
+            bind_by_comicinfo(file)
 
     # Determine old and new bindings, and which issues change in
     # their marking of being downloaded because of the new bindings

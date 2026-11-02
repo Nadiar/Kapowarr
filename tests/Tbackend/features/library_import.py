@@ -3,7 +3,8 @@ from typing import Dict
 
 from backend.base.definitions import FilenameData
 from backend.base.file_extraction import extract_filename_data
-from backend.features.library_import import create_groups
+from backend.features.library_import import (create_groups,
+                                             match_groups_by_comicinfo)
 
 
 class CreateGroupsTests(unittest.TestCase):
@@ -66,3 +67,120 @@ class CreateGroupsTests(unittest.TestCase):
         groups = create_groups(files)
         self.assertEqual(len(groups), 1)
         self.assertEqual(set(groups[1].keys()), set(files.keys()))
+
+
+class MatchGroupsByComicInfoTests(unittest.TestCase):
+    """Groups whose ComicInfo.xml issue IDs all point at one volume."""
+
+    MATCHES = {
+        1: {'id': 100, 'title': 'Batman (2016)', 'issue_count': 150,
+            'link': 'https://comicvine.gamespot.com/batman/4050-100/'},
+        2: {'id': 100, 'title': 'Batman (2016)', 'issue_count': 150,
+            'link': 'https://comicvine.gamespot.com/batman/4050-100/'},
+        3: {'id': 200, 'title': 'Robin (1993)', 'issue_count': 183,
+            'link': 'https://comicvine.gamespot.com/robin/4050-200/'},
+    }
+
+    def match(self, groups, issue_ids):
+        self.lookups = []
+
+        def lookup(ids):
+            self.lookups.append(set(ids))
+            return {i: self.MATCHES[i] for i in ids if i in self.MATCHES}
+
+        return match_groups_by_comicinfo(groups, issue_ids.get, lookup)
+
+    def test_group_whose_files_agree_gets_that_volume(self):
+        result = self.match({1: {'a': {}, 'b': {}}}, {'a': 1, 'b': 2})
+        self.assertEqual(result, {1: self.MATCHES[1]})
+
+    def test_files_without_an_id_follow_the_others(self):
+        result = self.match({1: {'a': {}, 'b': {}}}, {'a': 1})
+        self.assertEqual(result, {1: self.MATCHES[1]})
+
+    def test_group_pointing_at_two_volumes_is_left_for_the_title_search(self):
+        self.assertEqual(
+            self.match({1: {'a': {}, 'b': {}}}, {'a': 1, 'b': 3}), {}
+        )
+
+    def test_unknown_issue_ids_are_left_for_the_title_search(self):
+        self.assertEqual(self.match({1: {'a': {}}}, {'a': 999}), {})
+
+    def test_groups_without_ids_skip_the_lookup(self):
+        self.assertEqual(self.match({1: {'a': {}}, 2: {'b': {}}}, {}), {})
+        self.assertEqual(self.lookups, [])
+
+    def test_all_ids_are_looked_up_in_one_call(self):
+        self.match({1: {'a': {}}, 2: {'b': {}}}, {'a': 1, 'b': 3})
+        self.assertEqual(self.lookups, [{1, 3}])
+
+
+class ProposeLibraryImportTests(unittest.TestCase):
+    """Tagged groups are matched by their issue, the rest by title."""
+
+    TAGGED = {'id': 100, 'title': 'Batman (2016)', 'issue_count': 150,
+              'link': 'https://comicvine.gamespot.com/batman/4050-100/'}
+    BY_TITLE = {'id': 200, 'title': 'Robin (1993)', 'issue_count': 183,
+                'link': 'https://comicvine.gamespot.com/robin/4050-200/'}
+
+    def propose(self, tagged_files):
+        import os
+        from unittest.mock import MagicMock, patch
+
+        from backend.features import library_import
+
+        root = os.path.abspath('/comics')
+        files = [
+            os.path.join(root, 'Batman (2016)', 'Batman 001.cbz'),
+            os.path.join(root, 'Robin (1993)', 'Robin 001.cbz'),
+        ]
+        self.title_searched = []
+
+        async def filenames_to_cvs(groups, only_english):
+            self.title_searched.extend(
+                os.path.basename(f) for g in groups.values() for f in g
+            )
+            return {n: self.BY_TITLE for n in groups}
+
+        async def fetch_volume_matches_of_issues(issue_ids):
+            return {i: self.TAGGED for i in issue_ids}
+
+        comicvine = MagicMock()
+        comicvine.filenames_to_cvs = filenames_to_cvs
+        comicvine.fetch_volume_matches_of_issues = (
+            fetch_volume_matches_of_issues
+        )
+        root_folders = MagicMock()
+        root_folders.return_value.get_folder_list.return_value = [root]
+
+        with patch.object(library_import, 'RootFolders', root_folders), \
+                patch.object(library_import, 'list_files',
+                             return_value=files), \
+                patch.object(library_import.FilesDB, 'fetch',
+                             return_value=[]), \
+                patch.object(library_import, 'ComicVine',
+                             return_value=comicvine), \
+                patch.object(library_import, 'read_comicvine_issue_id',
+                             side_effect=lambda f: (
+                                 7 if os.path.basename(f) in tagged_files
+                                 else None
+                             )):
+            result = library_import.propose_library_import()
+
+        return {os.path.basename(r['filepath']): r['cv']['id'] for r in result}
+
+    def test_tagged_group_skips_the_title_search(self):
+        self.assertEqual(
+            self.propose({'Batman 001.cbz'}),
+            {'Batman 001.cbz': 100, 'Robin 001.cbz': 200}
+        )
+        self.assertEqual(self.title_searched, ['Robin 001.cbz'])
+
+    def test_untagged_groups_are_all_searched_by_title(self):
+        self.assertEqual(
+            self.propose(set()),
+            {'Batman 001.cbz': 200, 'Robin 001.cbz': 200}
+        )
+        self.assertEqual(
+            sorted(self.title_searched), ['Batman 001.cbz', 'Robin 001.cbz']
+        )

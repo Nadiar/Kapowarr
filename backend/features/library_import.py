@@ -4,8 +4,9 @@ from asyncio import run
 from glob import glob
 from itertools import chain
 from os.path import abspath, basename, dirname, isfile, join, splitext
-from typing import Any, Dict, List, Union
+from typing import Any, Callable, Dict, Iterable, List, Set, Union
 
+from backend.base.comicinfo import read_comicvine_issue_id
 from backend.base.custom_exceptions import (InvalidKeyValue,
                                             MetadataSourceDataEntryNotFound,
                                             MetadataSourceRateLimitReached,
@@ -116,6 +117,51 @@ def create_groups(
 
     LOGGER.debug('File groupings: %s', groups)
     return groups
+
+
+def match_groups_by_comicinfo(
+    file_groups: Dict[int, Dict[str, FilenameData]],
+    issue_id_of: Callable[[str], Union[int, None]],
+    volume_matches_of: Callable[[Iterable[int]], Dict[int, Dict[str, Any]]]
+) -> Dict[int, Dict[str, Any]]:
+    """Match groups by the ComicVine issues their files are tagged with.
+
+    Args:
+        file_groups (Dict[int, Dict[str, FilenameData]]): The file groups.
+
+        issue_id_of (Callable[[str], Union[int, None]]): Gives the ComicVine
+            issue ID a file is tagged with, if any.
+
+        volume_matches_of (Callable): Gives the volume match of each issue
+            ID, in one call.
+
+    Returns:
+        Dict[int, Dict[str, Any]]: A mapping from group number to its match,
+            for the groups whose tagged files all belong to one volume. The
+            other groups are left for the title search.
+    """
+    group_issue_ids: Dict[int, Set[int]] = {}
+    for group_number, files in file_groups.items():
+        issue_ids = {issue_id_of(f) for f in files} - {None}
+        if issue_ids:
+            group_issue_ids[group_number] = issue_ids # type: ignore
+
+    if not group_issue_ids:
+        return {}
+
+    matches = volume_matches_of(set().union(*group_issue_ids.values()))
+
+    result: Dict[int, Dict[str, Any]] = {}
+    for group_number, issue_ids in group_issue_ids.items():
+        volumes = {
+            matches[i]['id']: matches[i]
+            for i in issue_ids
+            if i in matches
+        }
+        if len(volumes) == 1:
+            result[group_number] = next(iter(volumes.values()))
+
+    return result
 
 
 def propose_library_import(
@@ -231,12 +277,25 @@ def propose_library_import(
         )
     }
 
-    # Find a match for the groups on CV
+    # Find a match for the groups on CV, first by the issue the files are
+    # tagged with, then by title
     group_to_files = create_groups(unimported_files)
-    group_to_cv = run(ComicVine().filenames_to_cvs(
+    comicvine = ComicVine()
+    group_to_cv = match_groups_by_comicinfo(
         group_to_files,
+        read_comicvine_issue_id,
+        lambda issue_ids: run(
+            comicvine.fetch_volume_matches_of_issues(issue_ids)
+        )
+    )
+    group_to_cv.update(run(comicvine.filenames_to_cvs(
+        {
+            group_number: files
+            for group_number, files in group_to_files.items()
+            if group_number not in group_to_cv
+        },
         only_english=only_english
-    ))
+    )))
 
     # Build result
     result = [
