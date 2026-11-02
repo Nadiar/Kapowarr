@@ -137,7 +137,7 @@ def _clean_description(description: str, short: bool = False) -> str:
     return result
 
 
-def _import_match(volume: Union[VolumeMetadata, None]) -> Dict[str, Any]:
+def import_match(volume: Union[VolumeMetadata, None]) -> Dict[str, Any]:
     "A volume as the match of a library import group"
     if volume is None:
         return {'id': None, 'title': None, 'issue_count': None, 'link': None}
@@ -936,15 +936,15 @@ class ComicVine:
                     only_english=only_english
                 )
 
-                matches[group_number] = _import_match(result)
+                matches[group_number] = import_match(result)
 
         return matches
 
-    async def fetch_volume_matches_of_issues(
+    async def fetch_volumes_of_issues(
         self,
         issue_ids: Iterable[int]
-    ) -> Dict[int, Dict[str, Any]]:
-        """Find the volume of each issue, as a library import match.
+    ) -> Dict[int, VolumeMetadata]:
+        """Find the volume of each issue, without its issues or cover.
 
         Args:
             issue_ids (Iterable[int]): The CV IDs of the issues.
@@ -954,9 +954,9 @@ class ComicVine:
             MetadataSourceNotWorking: Something went wrong contacting CV.
 
         Returns:
-            Dict[int, Dict[str, Any]]: A mapping from issue ID to the match of
-                its volume. Issues that CV doesn't know, or that couldn't be
-                fetched because the rate limit was reached, are left out.
+            Dict[int, VolumeMetadata]: A mapping from issue ID to its volume.
+                Issues that CV doesn't know, or that couldn't be fetched
+                because the rate limit was reached, are left out.
         """
         issue_ids = sorted({int(i) for i in issue_ids})
         if not issue_ids:
@@ -995,7 +995,7 @@ class ComicVine:
                     volumes[volume['comicvine_id']] = volume
 
         return {
-            issue_id: _import_match(volumes[volume_id])
+            issue_id: volumes[volume_id]
             for issue_id, volume_id in issue_to_volume.items()
             if volume_id in volumes
         }

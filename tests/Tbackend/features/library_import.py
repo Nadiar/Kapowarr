@@ -72,54 +72,92 @@ class CreateGroupsTests(unittest.TestCase):
 class MatchGroupsByComicInfoTests(unittest.TestCase):
     """Groups whose ComicInfo.xml issue IDs all point at one volume."""
 
-    MATCHES = {
-        1: {'id': 100, 'title': 'Batman (2016)', 'issue_count': 150,
-            'link': 'https://comicvine.gamespot.com/batman/4050-100/'},
-        2: {'id': 100, 'title': 'Batman (2016)', 'issue_count': 150,
-            'link': 'https://comicvine.gamespot.com/batman/4050-100/'},
-        3: {'id': 200, 'title': 'Robin (1993)', 'issue_count': 183,
-            'link': 'https://comicvine.gamespot.com/robin/4050-200/'},
-    }
+    @staticmethod
+    def Volume(volume_id, title, year, aliases=()):
+        return {
+            'comicvine_id': volume_id, 'title': title, 'year': year,
+            'aliases': list(aliases), 'issue_count': 10,
+            'site_url': f'https://comicvine.gamespot.com/v/4050-{volume_id}',
+        }
+
+    def setUp(self):
+        self.volumes = {
+            1: self.Volume(100, 'Batman', 2016),
+            2: self.Volume(100, 'Batman', 2016),
+            3: self.Volume(200, 'Robin', 1993),
+            4: self.Volume(300, 'Ghost Rider', 1973),
+            5: self.Volume(400, 'The Dark Knight Returns', 1986, ['DKR']),
+        }
 
     def match(self, groups, issue_ids):
         self.lookups = []
 
         def lookup(ids):
             self.lookups.append(set(ids))
-            return {i: self.MATCHES[i] for i in ids if i in self.MATCHES}
+            return {i: self.volumes[i] for i in ids if i in self.volumes}
 
         return match_groups_by_comicinfo(groups, issue_ids.get, lookup)
 
+    @staticmethod
+    def Group(series, *files):
+        return {f: {'series': series} for f in files}
+
     def test_group_whose_files_agree_gets_that_volume(self):
-        result = self.match({1: {'a': {}, 'b': {}}}, {'a': 1, 'b': 2})
-        self.assertEqual(result, {1: self.MATCHES[1]})
+        result = self.match({1: self.Group('Batman', 'a', 'b')},
+                            {'a': 1, 'b': 2})
+        self.assertEqual(result, {1: {
+            'id': 100, 'title': 'Batman (2016)', 'issue_count': 10,
+            'link': 'https://comicvine.gamespot.com/v/4050-100',
+        }})
 
     def test_files_without_an_id_follow_the_others(self):
-        result = self.match({1: {'a': {}, 'b': {}}}, {'a': 1})
-        self.assertEqual(result, {1: self.MATCHES[1]})
+        result = self.match({1: self.Group('Batman', 'a', 'b')}, {'a': 1})
+        self.assertEqual(result[1]['id'], 100)
 
     def test_group_pointing_at_two_volumes_is_left_for_the_title_search(self):
         self.assertEqual(
-            self.match({1: {'a': {}, 'b': {}}}, {'a': 1, 'b': 3}), {}
+            self.match({1: self.Group('Batman', 'a', 'b')}, {'a': 1, 'b': 3}),
+            {}
         )
 
+    def test_tag_of_a_differently_named_volume_is_not_trusted(self):
+        # e.g. a file mis-tagged by an older tool
+        self.assertEqual(
+            self.match({1: self.Group('Amazing Spider-Man', 'a')}, {'a': 4}),
+            {}
+        )
+
+    def test_title_match_ignores_punctuation_and_accepts_aliases(self):
+        result = self.match(
+            {1: self.Group('Batman', 'a'), 2: self.Group('DKR', 'b')},
+            {'a': 1, 'b': 5}
+        )
+        self.assertEqual((result[1]['id'], result[2]['id']), (100, 400))
+
     def test_unknown_issue_ids_are_left_for_the_title_search(self):
-        self.assertEqual(self.match({1: {'a': {}}}, {'a': 999}), {})
+        self.assertEqual(self.match({1: self.Group('Batman', 'a')},
+                                    {'a': 999}), {})
 
     def test_groups_without_ids_skip_the_lookup(self):
-        self.assertEqual(self.match({1: {'a': {}}, 2: {'b': {}}}, {}), {})
+        self.assertEqual(
+            self.match({1: self.Group('Batman', 'a'),
+                        2: self.Group('Robin', 'b')}, {}),
+            {}
+        )
         self.assertEqual(self.lookups, [])
 
     def test_all_ids_are_looked_up_in_one_call(self):
-        self.match({1: {'a': {}}, 2: {'b': {}}}, {'a': 1, 'b': 3})
+        self.match({1: self.Group('Batman', 'a'), 2: self.Group('Robin', 'b')},
+                   {'a': 1, 'b': 3})
         self.assertEqual(self.lookups, [{1, 3}])
 
 
 class ProposeLibraryImportTests(unittest.TestCase):
     """Tagged groups are matched by their issue, the rest by title."""
 
-    TAGGED = {'id': 100, 'title': 'Batman (2016)', 'issue_count': 150,
-              'link': 'https://comicvine.gamespot.com/batman/4050-100/'}
+    TAGGED = {'comicvine_id': 100, 'title': 'Batman', 'year': 2016,
+              'aliases': [], 'issue_count': 150,
+              'site_url': 'https://comicvine.gamespot.com/batman/4050-100/'}
     BY_TITLE = {'id': 200, 'title': 'Robin (1993)', 'issue_count': 183,
                 'link': 'https://comicvine.gamespot.com/robin/4050-200/'}
 
@@ -142,14 +180,12 @@ class ProposeLibraryImportTests(unittest.TestCase):
             )
             return {n: self.BY_TITLE for n in groups}
 
-        async def fetch_volume_matches_of_issues(issue_ids):
+        async def fetch_volumes_of_issues(issue_ids):
             return {i: self.TAGGED for i in issue_ids}
 
         comicvine = MagicMock()
         comicvine.filenames_to_cvs = filenames_to_cvs
-        comicvine.fetch_volume_matches_of_issues = (
-            fetch_volume_matches_of_issues
-        )
+        comicvine.fetch_volumes_of_issues = fetch_volumes_of_issues
         root_folders = MagicMock()
         root_folders.return_value.get_folder_list.return_value = [root]
 

@@ -61,22 +61,23 @@ class FetchVolumeMatchesOfIssues(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_issues_map_to_their_volume_as_an_import_match(self):
-        result = run(ComicVine().fetch_volume_matches_of_issues([1, 2, 1001]))
+    def test_issues_map_to_their_volume(self):
+        result = run(ComicVine().fetch_volumes_of_issues([1, 2, 1001]))
 
-        self.assertEqual(result[1], {
-            'id': 100, 'title': 'Batman (2016)', 'issue_count': 150,
-            'link': 'https://comicvine.gamespot.com/v/4050-100',
-        })
-        self.assertEqual(result[2]['id'], 100)
-        self.assertEqual(result[1001]['id'], 200)
+        self.assertEqual(
+            (result[1]['comicvine_id'], result[1]['title'], result[1]['year'],
+             result[1]['issue_count']),
+            (100, 'Batman', 2016, 150)
+        )
+        self.assertEqual(result[2]['comicvine_id'], 100)
+        self.assertEqual(result[1001]['title'], 'Robin')
 
     def test_unknown_issues_are_left_out(self):
-        result = run(ComicVine().fetch_volume_matches_of_issues([1, 404]))
+        result = run(ComicVine().fetch_volumes_of_issues([1, 404]))
         self.assertEqual(set(result), {1})
 
     def test_requests_are_batched_by_one_hundred_without_covers(self):
-        run(ComicVine().fetch_volume_matches_of_issues(range(1, 251)))
+        run(ComicVine().fetch_volumes_of_issues(range(1, 251)))
 
         issue_calls = [p for u, p in self.calls if u == '/issues']
         volume_calls = [p for u, p in self.calls if u == '/volumes']
@@ -87,7 +88,7 @@ class FetchVolumeMatchesOfIssues(unittest.TestCase):
 
     def test_no_issues_makes_no_requests(self):
         self.assertEqual(
-            run(ComicVine().fetch_volume_matches_of_issues([])), {})
+            run(ComicVine().fetch_volumes_of_issues([])), {})
         self.assertEqual(self.calls, [])
 
 

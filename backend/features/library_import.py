@@ -13,7 +13,7 @@ from backend.base.custom_exceptions import (InvalidKeyValue,
                                             VolumeAlreadyAdded)
 from backend.base.definitions import (CVFileMapping, FileConstants,
                                       FilenameData, MonitorScheme,
-                                      SpecialVersion)
+                                      SpecialVersion, VolumeMetadata)
 from backend.base.file_extraction import extract_filename_data
 from backend.base.files import (change_basefolder, common_folder,
                                 delete_empty_parent_folders,
@@ -21,9 +21,9 @@ from backend.base.files import (change_basefolder, common_folder,
                                 list_files, rename_file)
 from backend.base.helpers import force_suffix
 from backend.base.logging import LOGGER
-from backend.implementations.comicvine import ComicVine
+from backend.implementations.comicvine import ComicVine, import_match
 from backend.implementations.file_matching import scan_files
-from backend.implementations.matching import match_special_version
+from backend.implementations.matching import match_special_version, match_title
 from backend.implementations.naming import mass_rename
 from backend.implementations.root_folders import RootFolders
 from backend.implementations.volumes import Library
@@ -122,9 +122,13 @@ def create_groups(
 def match_groups_by_comicinfo(
     file_groups: Dict[int, Dict[str, FilenameData]],
     issue_id_of: Callable[[str], Union[int, None]],
-    volume_matches_of: Callable[[Iterable[int]], Dict[int, Dict[str, Any]]]
+    volumes_of: Callable[[Iterable[int]], Dict[int, VolumeMetadata]]
 ) -> Dict[int, Dict[str, Any]]:
     """Match groups by the ComicVine issues their files are tagged with.
+
+    A tag is only trusted when the volume's title (or an alias) matches the
+    series name of the files, so a file tagged wrongly by some tool doesn't
+    bring the wrong volume.
 
     Args:
         file_groups (Dict[int, Dict[str, FilenameData]]): The file groups.
@@ -132,13 +136,12 @@ def match_groups_by_comicinfo(
         issue_id_of (Callable[[str], Union[int, None]]): Gives the ComicVine
             issue ID a file is tagged with, if any.
 
-        volume_matches_of (Callable): Gives the volume match of each issue
-            ID, in one call.
+        volumes_of (Callable): Gives the volume of each issue ID, in one call.
 
     Returns:
         Dict[int, Dict[str, Any]]: A mapping from group number to its match,
-            for the groups whose tagged files all belong to one volume. The
-            other groups are left for the title search.
+            for the groups whose tagged files all belong to one volume with a
+            matching title. The other groups are left for the title search.
     """
     group_issue_ids: Dict[int, Set[int]] = {}
     for group_number, files in file_groups.items():
@@ -149,17 +152,25 @@ def match_groups_by_comicinfo(
     if not group_issue_ids:
         return {}
 
-    matches = volume_matches_of(set().union(*group_issue_ids.values()))
+    issue_volumes = volumes_of(set().union(*group_issue_ids.values()))
 
     result: Dict[int, Dict[str, Any]] = {}
     for group_number, issue_ids in group_issue_ids.items():
         volumes = {
-            matches[i]['id']: matches[i]
+            issue_volumes[i]['comicvine_id']: issue_volumes[i]
             for i in issue_ids
-            if i in matches
+            if i in issue_volumes
         }
-        if len(volumes) == 1:
-            result[group_number] = next(iter(volumes.values()))
+        if len(volumes) != 1:
+            continue
+
+        volume = next(iter(volumes.values()))
+        series = next(iter(file_groups[group_number].values()))['series']
+        if any(
+            match_title(series, title)
+            for title in (volume['title'], *volume['aliases'])
+        ):
+            result[group_number] = import_match(volume)
 
     return result
 
@@ -284,9 +295,7 @@ def propose_library_import(
     group_to_cv = match_groups_by_comicinfo(
         group_to_files,
         read_comicvine_issue_id,
-        lambda issue_ids: run(
-            comicvine.fetch_volume_matches_of_issues(issue_ids)
-        )
+        lambda issue_ids: run(comicvine.fetch_volumes_of_issues(issue_ids))
     )
     group_to_cv.update(run(comicvine.filenames_to_cvs(
         {
