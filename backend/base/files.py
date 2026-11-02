@@ -742,21 +742,26 @@ def set_volume_folder_owner_group(
         # Only Linux and MacOS support chown-type ownership
         return
 
+    # chown looks a string up as a group name, so pass a group number as int
+    group: Union[str, int] = (
+        int(owner_group) if owner_group.isdigit() else owner_group
+    )
+
     # Set folders leading up to, and including, the volume folder
     towards_volume_folder = relpath(volume_folder, root_folder).split(sep)
     for i in range(len(towards_volume_folder)):
         chown(
             join(root_folder, *towards_volume_folder[:i + 1]),
-            group=owner_group
+            group=group
         )
 
     # Set all sub-folders
     for folder in list_folders(volume_folder):
-        chown(folder, group=owner_group)
+        chown(folder, group=group)
 
     # Set all files in the folder
     for file in list_files(volume_folder):
-        chown(file, group=owner_group)
+        chown(file, group=group)
 
     return
 
