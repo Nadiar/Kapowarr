@@ -13,7 +13,7 @@ from os.path import (abspath, basename, commonpath, dirname, isdir,
                      isfile, join, relpath, samefile, sep, splitext)
 from re import compile
 from shutil import chown, copy2, copytree, move, rmtree
-from typing import Dict, Iterable, List, Sequence, Union
+from typing import Any, Callable, Dict, Iterable, List, Sequence, Union
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from backend.base.definitions import (CharConstants, Constants,
@@ -660,6 +660,17 @@ def set_file_date(filepath: str, file_date: str) -> None:
     return
 
 
+def _skip_if_vanished(change: Callable[..., Any], path: str, **kwargs) -> None:
+    """Change a sub-folder or file of a volume folder. A parallel download's
+    conversion can remove its temporary files while the folder is processed,
+    and those need no permissions or owner."""
+    try:
+        change(path, **kwargs)
+    except FileNotFoundError:
+        pass
+    return
+
+
 def set_volume_folder_permissions(
     volume_folder: str,
     root_folder: str,
@@ -701,7 +712,7 @@ def set_volume_folder_permissions(
 
     # Set all sub-folders
     for folder in list_folders(volume_folder):
-        chmod(folder, octal_folder_permissions)
+        _skip_if_vanished(chmod, folder, mode=octal_folder_permissions)
 
     # Set all files in the folder
     file_permissions = ''.join((
@@ -710,7 +721,7 @@ def set_volume_folder_permissions(
     ))
     octal_file_permissions = int(file_permissions, 8)
     for file in list_files(volume_folder):
-        chmod(file, octal_file_permissions)
+        _skip_if_vanished(chmod, file, mode=octal_file_permissions)
 
     return
 
@@ -757,11 +768,11 @@ def set_volume_folder_owner_group(
 
     # Set all sub-folders
     for folder in list_folders(volume_folder):
-        chown(folder, group=group)
+        _skip_if_vanished(chown, folder, group=group)
 
     # Set all files in the folder
     for file in list_files(volume_folder):
-        chown(file, group=group)
+        _skip_if_vanished(chown, file, group=group)
 
     return
 
