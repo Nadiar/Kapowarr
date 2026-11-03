@@ -113,6 +113,9 @@ class PostProcessingContext:
             except Exception:
                 is_upgrade = False
 
+            # Converting adds the new file after the original it removed
+            files = [f for f in download.files if exists(f)] or download.files
+
             event = DownloadEvent(
                 volume_id=vd.id,
                 volume_title=vd.title,
@@ -123,7 +126,7 @@ class PostProcessingContext:
                 issue_comicvine_id=issue_comicvine_id,
                 issue_number=issue_number,
                 issue_title=issue_title,
-                file_path=download.files[0] if download.files else '',
+                file_path=files[0] if files else '',
                 download_source=download.source_name,
                 is_upgrade=is_upgrade
             )
