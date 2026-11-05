@@ -79,13 +79,19 @@ class TestEvent:
 
 # region Event formatters
 
+def _volume_name(title: str, year: int) -> str:
+    """The volume title with its year, or without it when ComicVine has no
+    start year yet (stored as 0)."""
+    return f'{title} ({year})' if year else title
+
+
 def format_download_notification(
     event: DownloadEvent
 ) -> Tuple[str, str]:
     """Return (title, body) for a download-complete event."""
     title = 'Download Complete'
     body = (
-        f'{event.volume_title} ({event.volume_year})'
+        f'{_volume_name(event.volume_title, event.volume_year)}'
         f' #{event.issue_number}\n'
         f'Source: {event.download_source}'
     )
@@ -98,7 +104,7 @@ def format_volume_add_notification(
     """Return (title, body) for a volume-added event."""
     title = 'Volume Added'
     body = (
-        f'{event.volume_title} ({event.volume_year})'
+        f'{_volume_name(event.volume_title, event.volume_year)}'
         f' added to library\n'
         f'Publisher: {event.publisher}'
     )

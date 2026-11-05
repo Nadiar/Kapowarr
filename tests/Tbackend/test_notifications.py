@@ -14,7 +14,10 @@ from unittest.mock import MagicMock, call, patch
 from backend.features.notifications import (ApplicationUpdateEvent,
                                             DownloadEvent, HealthCheckEvent,
                                             NotificationService, TestEvent,
-                                            VolumeAddEvent, provider_registry)
+                                            VolumeAddEvent,
+                                            format_download_notification,
+                                            format_volume_add_notification,
+                                            provider_registry)
 from backend.implementations.notification_providers.custom_script import \
     CustomScriptProvider
 from backend.implementations.notification_providers.webhook import \
@@ -59,6 +62,28 @@ def make_health_event():
         message='ComicVine API key is not set or invalid.',
         check_type='ComicVineApiKey'
     )
+
+
+# ---------------------------------------------------------------------------
+# Formatter tests
+# ---------------------------------------------------------------------------
+
+class TestNotificationVolumeYear(unittest.TestCase):
+    def test_download_shows_known_year(self):
+        _, body = format_download_notification(make_download_event())
+        self.assertTrue(body.startswith('Batman (1940) #5'))
+
+    def test_download_omits_unknown_year(self):
+        event = make_download_event()
+        event.volume_year = 0
+        _, body = format_download_notification(event)
+        self.assertTrue(body.startswith('Batman #5'))
+
+    def test_volume_add_omits_unknown_year(self):
+        event = make_volume_add_event()
+        event.volume_year = 0
+        _, body = format_volume_add_notification(event)
+        self.assertTrue(body.startswith('Spider-Man added to library'))
 
 
 # ---------------------------------------------------------------------------
