@@ -5,7 +5,7 @@ from __future__ import annotations
 from os.path import basename, exists, isfile, join, splitext
 from sqlite3 import OperationalError
 from time import sleep, time
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Any, Callable, Dict
 
 from backend.base.definitions import (BlocklistReason,
                                       DownloadState, FileConstants)
@@ -34,16 +34,26 @@ class PostProcessingContext:
         return
 
     # region Ctx Database
-    def remove_from_queue(self) -> None:
-        """Delete the download from the queue in the database. Retries a few
-        times when the database is locked."""
+    def _retry_while_locked(
+        self,
+        step: Callable[[], Any],
+        description: str
+    ) -> None:
+        """Run a database step, retrying it a few times when the database is
+        locked.
+
+        Args:
+            step (Callable[[], Any]): The step to run.
+            description (str): What the step does, for the log.
+
+        Raises:
+            OperationalError: The step failed for another reason, or the
+                database stayed locked.
+        """
         retries = 5
         for attempt in range(1, retries + 1):
             try:
-                get_db().execute(
-                    "DELETE FROM download_queue WHERE id = ?",
-                    (self.download.id,)
-                )
+                step()
                 return
 
             except OperationalError as exc:
@@ -54,11 +64,23 @@ class PostProcessingContext:
                     raise
 
                 LOGGER.warning(
-                    'Database locked while removing download %s from queue '
+                    'Database locked while %s for download %s '
                     '(attempt %s/%s); retrying',
-                    self.download.id, attempt, retries
+                    description, self.download.id, attempt, retries
                 )
                 sleep(min(0.2 * attempt, 1.0))
+        return
+
+    def remove_from_queue(self) -> None:
+        """Delete the download from the queue in the database. Retries a few
+        times when the database is locked."""
+        self._retry_while_locked(
+            lambda: get_db().execute(
+                "DELETE FROM download_queue WHERE id = ?",
+                (self.download.id,)
+            ),
+            'removing it from the queue'
+        )
         return
 
     def try_remove_from_queue(self) -> None:
@@ -168,6 +190,22 @@ class PostProcessingContext:
                 'success': self.download.state != DownloadState.FAILED_STATE
             }
         )
+        return
+
+    def try_add_to_history(self) -> None:
+        """Add the download to history and save it, retrying while the
+        database is locked. Never raises, so that a locked database can't
+        stop the downloaded file from being moved into the library."""
+        try:
+            # Separate steps, so a failed commit doesn't write history twice
+            self._retry_while_locked(self.add_to_history, 'adding to history')
+            self._retry_while_locked(commit, 'saving history')
+        except Exception:
+            LOGGER.exception(
+                'Failed to add download %s to history; '
+                'continuing with post-processing',
+                self.download.id
+            )
         return
 
     def add_file_to_database(self) -> None:
@@ -363,8 +401,7 @@ class PostProcessor:
             f'Postprocessing of successful download: {self.download.id}'
         )
         self.ctx.try_remove_from_queue()
-        self.ctx.add_to_history()
-        commit()
+        self.ctx.try_add_to_history()
         self.ctx.move_to_dest()
         self.ctx.rename_with_proper_extension()
         commit()
@@ -415,8 +452,7 @@ class PostProcessorTorrentsComplete(PostProcessor):
             f'Postprocessing of successful download: {self.download.id}'
         )
         self.ctx.try_remove_from_queue()
-        self.ctx.add_to_history()
-        commit()
+        self.ctx.try_add_to_history()
         self.ctx.move_torrent_to_dest()
         commit()
         self.ctx.convert_file()
@@ -438,8 +474,7 @@ class PostProcessorTorrentsCopy(PostProcessor):
 
     def seeding(self) -> None:
         LOGGER.info(f'Postprocessing of seeding download: {self.download.id}')
-        self.ctx.add_to_history()
-        commit()
+        self.ctx.try_add_to_history()
         self.ctx.copy_file_torrent()
         commit()
         self.ctx.convert_file()
