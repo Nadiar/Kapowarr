@@ -8,7 +8,8 @@ from time import time
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Tuple, Union
 from urllib.parse import urlparse
 
-from requests import RequestException
+from aiohttp import ClientError
+from requests import RequestException, Session as PlainSession
 
 from backend.base.definitions import Constants, ProxyType, StatusType
 from backend.base.helpers import Session
@@ -20,9 +21,32 @@ if TYPE_CHECKING:
     from backend.base.helpers import AsyncSession
 
 
+FAILED_SOLVE_COOLDOWN = 3600 # seconds
+"How long to skip a server after FlareSolverr failed to solve its challenge"
+
+
 class FSCache:
     cookie_mapping: Dict[str, Tuple[str, float]] = {}
     ua_mapping: Dict[str, str] = {}
+    failed_until: Dict[str, float] = {}
+    "Domain to the time until which FlareSolverr isn't asked for it again"
+
+    @classmethod
+    def is_cooling_down(cls, url: str) -> bool:
+        """Whether FlareSolverr recently failed to solve the challenge of the
+        URL's domain, so asking again would only waste time."""
+        return time() < cls.failed_until.get(urlparse(url).netloc, 0.0)
+
+    @classmethod
+    def mark_failed(cls, url: str, reason: str) -> None:
+        """Skip the URL's domain for `FAILED_SOLVE_COOLDOWN` seconds."""
+        domain = urlparse(url).netloc
+        cls.failed_until[domain] = time() + FAILED_SOLVE_COOLDOWN
+        LOGGER.warning(
+            "FlareSolverr couldn't solve the challenge of %s (%s). Skipping"
+            " it for %d minutes",
+            domain, reason, FAILED_SOLVE_COOLDOWN // 60
+        )
 
     @staticmethod
     def _build_cookie(cookie: Dict[str, Any]) -> str:
@@ -117,7 +141,7 @@ class FlareSolverr:
     @staticmethod
     def __api_request(
         base_url: str,
-        session: Session,
+        session: PlainSession,
         data: Dict[str, Any]
     ) -> Dict[str, Any]:
         return session.post(
@@ -137,7 +161,8 @@ class FlareSolverr:
             base_url + Constants.FS_API_BASE,
             json=data,
             headers={'Content-Type': 'application/json'},
-            timeout=Constants.REQUEST_TIMEOUT + Constants.FS_RESOLVE_TIMEOUT
+            timeout=Constants.REQUEST_TIMEOUT + Constants.FS_RESOLVE_TIMEOUT,
+            retry=False
         )).json()
 
     @staticmethod
@@ -221,16 +246,25 @@ class FlareSolverr:
             StatusHandlers().report(StatusType.CF_CHALLENGE_WITH_NO_FS, '')
             return
 
-        with Session() as session:
-            result = self.__api_request(
-                self.base_url, session,
-                {
-                    'cmd': 'request.get',
-                    'url': url,
-                    'maxTimeout': Constants.FS_RESOLVE_TIMEOUT * 1000,
-                    **(self.proxy_data or {})
-                }
-            )["solution"]
+        if FSCache.is_cooling_down(url):
+            return
+
+        try:
+            # A plain session: retrying a failed solve only wastes time
+            with PlainSession() as session:
+                result = self.__api_request(
+                    self.base_url, session,
+                    {
+                        'cmd': 'request.get',
+                        'url': url,
+                        'maxTimeout': Constants.FS_RESOLVE_TIMEOUT * 1000,
+                        **(self.proxy_data or {})
+                    }
+                )["solution"]
+
+        except (RequestException, ValueError, KeyError) as e:
+            FSCache.mark_failed(url, repr(e))
+            return
 
         if result["response"] is None:
             # FlareSolverr responded, but content of
@@ -283,16 +317,24 @@ class FlareSolverr:
                 Constants.MAX_CONCURRENT_FS_SESSIONS
             )
 
-        async with self.session_semaphore:
-            result = (await self.__async_api_request(
-                self.base_url, session,
-                {
-                    'cmd': 'request.get',
-                    'url': url,
-                    'maxTimeout': Constants.FS_RESOLVE_TIMEOUT * 1000,
-                    **(self.proxy_data or {})
-                }
-            ))["solution"]
+        if FSCache.is_cooling_down(url):
+            return
+
+        try:
+            async with self.session_semaphore:
+                result = (await self.__async_api_request(
+                    self.base_url, session,
+                    {
+                        'cmd': 'request.get',
+                        'url': url,
+                        'maxTimeout': Constants.FS_RESOLVE_TIMEOUT * 1000,
+                        **(self.proxy_data or {})
+                    }
+                ))["solution"]
+
+        except (ClientError, TimeoutError, ValueError, KeyError) as e:
+            FSCache.mark_failed(url, repr(e))
+            return
 
         if result["response"] is None:
             # FlareSolverr responded, but content of

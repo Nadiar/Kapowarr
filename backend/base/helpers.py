@@ -1150,6 +1150,11 @@ class AsyncSession(ClientSession):
 
     async def _request(self, *args, **kwargs):
         method, url = args[0], args[1]
+        # `retry=False` makes a single attempt, for requests where a failed
+        # answer won't change by asking again.
+        total_rounds = (
+            Constants.TOTAL_RETRIES if kwargs.pop('retry', True) else 1
+        )
 
         while True:
             # Wait if GC is currently throttled
@@ -1169,7 +1174,7 @@ class AsyncSession(ClientSession):
             self.headers.update({"User-Agent": ua})
             self.cookie_jar.update_cookies({"cf_clearance": cf_cookie})
 
-            for round in range(1, Constants.TOTAL_RETRIES + 1):
+            for round in range(1, total_rounds + 1):
                 try:
                     response = await super()._request(*args, **kwargs)
                     LOGGER.debug(
@@ -1183,7 +1188,7 @@ class AsyncSession(ClientSession):
                         raise ClientError
 
                 except ClientError:
-                    if round == Constants.TOTAL_RETRIES:
+                    if round == total_rounds:
                         # Exhausted retries
                         raise
 
