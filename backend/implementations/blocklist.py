@@ -174,32 +174,36 @@ def add_to_blocklist(
         if download_service is not None else
         None
     )
-    id = get_db().execute("""
-        INSERT INTO blocklist(
-            volume_id, issue_id,
-            web_link, web_title, web_sub_title,
-            download_link, download_service,
-            reason, added_at
-        )
-        VALUES (
-            :volume_id, :issue_id,
-            :web_link, :web_title, :web_sub_title,
-            :download_link, :download_service,
-            :reason, :added_at
-        );
-        """,
-        {
-            "volume_id": volume_id,
-            "issue_id": issue_id,
-            "web_link": web_link,
-            "web_title": web_title,
-            "web_sub_title": web_sub_title,
-            "download_link": download_link,
-            "download_service": service_value,
-            "reason": reason_id,
-            "added_at": round(time())
-        }
-    ).lastrowid
+    # Commit right away: callers often go on to slow network requests, and
+    # an open write transaction would hold the database lock all that time.
+    cursor = get_db()
+    with cursor:
+        id = cursor.execute("""
+            INSERT INTO blocklist(
+                volume_id, issue_id,
+                web_link, web_title, web_sub_title,
+                download_link, download_service,
+                reason, added_at
+            )
+            VALUES (
+                :volume_id, :issue_id,
+                :web_link, :web_title, :web_sub_title,
+                :download_link, :download_service,
+                :reason, :added_at
+            );
+            """,
+            {
+                "volume_id": volume_id,
+                "issue_id": issue_id,
+                "web_link": web_link,
+                "web_title": web_title,
+                "web_sub_title": web_sub_title,
+                "download_link": download_link,
+                "download_service": service_value,
+                "reason": reason_id,
+                "added_at": round(time())
+            }
+        ).lastrowid
 
     return get_blocklist_entry(id)
 
