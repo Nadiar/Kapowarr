@@ -5,7 +5,7 @@ from __future__ import annotations
 from os import listdir
 from os.path import basename, join
 from sqlite3 import OperationalError
-from threading import Lock
+from threading import Event, Lock
 from time import sleep
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Tuple, Union
 
@@ -108,6 +108,7 @@ class DownloadHandler(metaclass=Singleton):
         """Setup the download handler"""
         self.settings = Settings()
         self._queue_lock = Lock()
+        self._stop_watching = Event()
         create_folder(self.settings.sv.download_folder)
         return
 
@@ -192,11 +193,7 @@ class DownloadHandler(metaclass=Singleton):
 
         for download in downloads:
             if not isinstance(download, ExternalDownload):
-                download.download_thread = Server().get_db_thread(
-                    target=self.__run_download,
-                    args=(download,),
-                    name=f'DownloadThread-{download.id}'
-                )
+                download.download_thread = self._new_download_thread(download)
 
             else:
                 thread = Server().get_db_thread(
@@ -678,7 +675,16 @@ class DownloadHandler(metaclass=Singleton):
                     # reaches download.run(). Starting it again would raise.
                     thread = download.download_thread
                     if thread is not None and thread.ident is None:
-                        thread.start()
+                        try:
+                            thread.start()
+                        except RuntimeError:
+                            LOGGER.warning(
+                                'Download thread %s was unusable, '
+                                'replacing it', download.id
+                            )
+                            new_thread = self._new_download_thread(download)
+                            download.download_thread = new_thread
+                            new_thread.start()
                     active_downloads += 1
 
                 if active_downloads >= max_downloads:
@@ -837,9 +843,58 @@ class DownloadHandler(metaclass=Singleton):
 
         return
 
+    def _new_download_thread(self, download: Download) -> Thread:
+        return Server().get_db_thread(
+            target=self.__run_download,
+            args=(download,),
+            name=f'DownloadThread-{download.id}'
+        )
+
+    def watch_queue(self) -> None:
+        """Check the queue for stuck downloads every
+        `Constants.QUEUE_WATCH_INTERVAL` seconds, in a background thread."""
+        def watch() -> None:
+            while not self._stop_watching.wait(
+                Constants.QUEUE_WATCH_INTERVAL
+            ):
+                try:
+                    self.repair_queue()
+                except Exception:
+                    LOGGER.exception('Failed to check the download queue')
+
+        Server().get_db_thread(target=watch, name='QueueWatchThread').start()
+        return
+
+    def repair_queue(self) -> None:
+        """Re-queue downloads whose thread died without finishing, then
+        start whatever the queue has room for. A download that finishes
+        normally removes itself from the queue, so one that's still there with
+        a dead thread was stranded."""
+        with self._queue_lock:
+            for download in self.queue:
+                thread = download.download_thread
+                if (
+                    isinstance(download, ExternalDownload)
+                    or thread is None
+                    or thread.ident is None
+                    or thread.is_alive()
+                ):
+                    continue
+
+                LOGGER.warning(
+                    'Download %s was stuck in state %s, queueing it again',
+                    download.id, download.state.value
+                )
+                download.state = DownloadState.QUEUED_STATE
+                download.download_thread = self._new_download_thread(download)
+
+        self._process_queue()
+        return
+
     def stop_handle(self) -> None:
         """Cancel any running download and stop the handler"""
         LOGGER.debug('Stopping download thread')
+        self._stop_watching.set()
 
         for e in self.queue:
             e.stop(DownloadState.SHUTDOWN_STATE)

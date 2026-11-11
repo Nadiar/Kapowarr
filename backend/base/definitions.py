@@ -143,6 +143,7 @@ class Constants:
     """
 
     EXTERNAL_CLIENT_UPDATE_INTERVAL = 30 # seconds
+    QUEUE_WATCH_INTERVAL = 300 # seconds
     "The interval in seconds between status updates from external clients"
 
     EXTERNAL_DOWNLOAD_TAG = "kapowarr"

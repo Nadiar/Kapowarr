@@ -147,6 +147,7 @@ def _main(
 
         download_handler = DownloadHandler()
         download_handler.load_downloads()
+        download_handler.watch_queue()
         task_handler = TaskHandler()
         task_handler.handle_intervals()
 
