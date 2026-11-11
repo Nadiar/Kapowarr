@@ -403,7 +403,12 @@ class ComicVine:
             'issue_number': issue_data['issue_number'].replace('/', '-').strip(),
             'calculated_issue_number': calculated_issue_number,
             'title': normalise_string(issue_data['name'] or '') or None,
-            'date': issue_data[self.date_type] or None,
+            # CV rarely has a store date for older issues
+            'date': (
+                issue_data[self.date_type]
+                or issue_data['cover_date']
+                or None
+            ),
             'description': _clean_description(
                 issue_data['description'],
                 short=True
