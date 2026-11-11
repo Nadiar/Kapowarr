@@ -1101,11 +1101,15 @@ class Session(RSession):
             cert, json
         )
 
-        if (
-            result.status_code == 403
-            and self.fs.handle_cf_block(result.url, result.headers)
-        ):
-            # Retry with the clearance FlareSolverr got for the site
+        # Retry with the clearance of the site: the cached one first, then a
+        # newly solved one if CF rejects the cached one
+        for _ in range(2):
+            if not (
+                result.status_code == 403
+                and self.fs.handle_cf_block(result.url, result.headers)
+            ):
+                break
+
             challenged_url = result.url
             ua, clearance = self.fs.get_clearance(challenged_url)
             result = super().request(
@@ -1118,9 +1122,7 @@ class Session(RSession):
                 cert, json
             )
             if is_cloudflare_challenge(result.status_code, result.headers):
-                self.fs.mark_failed(
-                    challenged_url, 'the clearance was rejected'
-                )
+                self.fs.forget_clearance(challenged_url)
 
         if 400 <= result.status_code < 500:
             LOGGER.warning(
@@ -1207,13 +1209,17 @@ class AsyncSession(ClientSession):
                 )
                 continue
 
-            if (
-                response.status == 403
-                and await self.fs.handle_cf_block_async(
-                    self, str(response.url), response.headers
-                )
-            ):
-                # Retry with the clearance FlareSolverr got for the site
+            # Retry with the clearance of the site: the cached one first, then
+            # a newly solved one if CF rejects the cached one
+            for _ in range(2):
+                if not (
+                    response.status == 403
+                    and await self.fs.handle_cf_block_async(
+                        self, str(response.url), response.headers
+                    )
+                ):
+                    break
+
                 challenged_url = str(response.url)
                 ua, clearance = self.fs.get_clearance(challenged_url)
                 response.release()
@@ -1230,9 +1236,7 @@ class AsyncSession(ClientSession):
                     }
                 )
                 if is_cloudflare_challenge(response.status, response.headers):
-                    self.fs.mark_failed(
-                        challenged_url, 'the clearance was rejected'
-                    )
+                    self.fs.forget_clearance(challenged_url)
 
             if 400 <= response.status < 500:
                 LOGGER.warning(

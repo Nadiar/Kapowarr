@@ -95,6 +95,14 @@ class FSCache:
         return (ua, cookie[0])
 
     @classmethod
+    def forget(cls, url: str) -> None:
+        """Drop the cached UA and clearance cookie of the URL's domain."""
+        domain = urlparse(url).netloc
+        cls.ua_mapping.pop(domain, None)
+        cls.cookie_mapping.pop(domain, None)
+        return
+
+    @classmethod
     def set_ua_cookies(cls, url: str, fs_response: Dict[str, Any]) -> None:
         """Cache the user agent and cookies for CF clearance.
 
@@ -215,15 +223,14 @@ class FlareSolverr:
         return ua, cookie.split(';', 1)[0]
 
     @staticmethod
-    def mark_failed(url: str, reason: str) -> None:
-        """Skip the site of the URL for a while, as its challenge couldn't be
-        passed.
+    def forget_clearance(url: str) -> None:
+        """Forget the clearance of the URL's site, as CF rejected it, so the
+        next challenge is solved again.
 
         Args:
-            url (str): The URL whose site to skip.
-            reason (str): Why, for the log.
+            url (str): The URL whose clearance was rejected.
         """
-        FSCache.mark_failed(url, reason)
+        FSCache.forget(url)
         return
 
     def __should_solve(self, url: str, headers: Mapping[str, str]) -> bool:
@@ -287,6 +294,11 @@ class FlareSolverr:
         if not self.__should_solve(url, headers):
             return False
 
+        if self.get_clearance(url)[1]:
+            # The site was cleared before, but the request didn't carry the
+            # clearance, e.g. because it was redirected from another site
+            return True
+
         try:
             # A plain session: retrying a failed solve only wastes time
             with PlainSession() as session:
@@ -321,6 +333,11 @@ class FlareSolverr:
         """
         if not self.__should_solve(url, headers):
             return False
+
+        if self.get_clearance(url)[1]:
+            # The site was cleared before, but the request didn't carry the
+            # clearance, e.g. because it was redirected from another site
+            return True
 
         # Technically this makes it a max amount of FS sessions per AsyncSession
         # instance, but in most cases the application only has one AsyncSession
