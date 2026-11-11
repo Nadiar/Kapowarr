@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from asyncio import Semaphore
+from asyncio import TimeoutError as AsyncTimeoutError
 from datetime import datetime, timezone
 from time import time
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Tuple, Union
@@ -349,11 +350,20 @@ class FlareSolverr:
 
         try:
             async with self.session_semaphore:
+                # Another request may have cleared the site, or failed to,
+                # while this one waited for its turn
+                if self.get_clearance(url)[1]:
+                    return True
+                if FSCache.is_cooling_down(url):
+                    return False
+
                 solution = (await self.__async_api_request(
                     self.base_url or '', session, self.__solve_request(url)
                 ))["solution"]
 
-        except (ClientError, TimeoutError, ValueError, KeyError) as e:
+        except (
+            ClientError, TimeoutError, AsyncTimeoutError, ValueError, KeyError
+        ) as e:
             FSCache.mark_failed(url, repr(e))
             return False
 
