@@ -1088,7 +1088,7 @@ class Session(RSession):
         stream=None, verify=None,
         cert=None, json=None
     ):
-        ua, cf_cookie = self.fs.get_ua_cookies(url)
+        ua, cf_cookie = self.fs.get_clearance(url)
         self.headers.update({"User-Agent": ua})
         self.cookies.update({"cf_clearance": cf_cookie})
 
@@ -1173,7 +1173,7 @@ class AsyncSession(ClientSession):
             Constants.TOTAL_RETRIES if kwargs.pop('retry', True) else 1
         )
 
-        ua, cf_cookie = self.fs.get_ua_cookies(url)
+        ua, cf_cookie = self.fs.get_clearance(url)
         self.headers.update({"User-Agent": ua})
         self.cookie_jar.update_cookies({"cf_clearance": cf_cookie})
 
