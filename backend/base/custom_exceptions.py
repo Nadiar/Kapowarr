@@ -492,6 +492,29 @@ class DownloadLinkBroken(KapowarrException):
         }
 
 
+class DownloadLinkChallenged(KapowarrException):
+    """The download link is behind a CloudFlare challenge that couldn't be
+    solved. The link may well work, so it's only unavailable for now."""
+
+    def __init__(self, link: str) -> None:
+        self.link = link
+        LOGGER.warning(
+            f"Download link is behind an unsolved CloudFlare challenge: "
+            f"{self.link}"
+        )
+        return
+
+    @property
+    def api_response(self) -> ApiResponse:
+        return {
+            "code": 509,
+            "error": self.__class__.__name__,
+            "result": {
+                "link": self.link
+            }
+        }
+
+
 class EnqueuingDownloadFailure(KapowarrException):
     "Failed to enqueue download"
 

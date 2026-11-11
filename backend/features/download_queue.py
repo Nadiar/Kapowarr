@@ -11,6 +11,7 @@ from typing_extensions import assert_never
 
 from backend.base.custom_exceptions import (ClientNotWorking,
                                             DownloadLinkBroken,
+                                            DownloadLinkChallenged,
                                             DownloadQueueEntryNotFound,
                                             DownloadQueueEntryUnmovable,
                                             DownloadServiceRateLimitReached,
@@ -335,7 +336,8 @@ class DownloadHandler(metaclass=Singleton):
                 continue
 
             except (
-                DownloadServiceRateLimitReached, IssueNotFound, ClientNotWorking
+                DownloadServiceRateLimitReached, DownloadLinkChallenged,
+                IssueNotFound, ClientNotWorking
             ):
                 cursor.execute(
                     "DELETE FROM download_queue WHERE id = ?;",
