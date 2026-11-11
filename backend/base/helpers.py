@@ -429,6 +429,20 @@ def first_of_subarrays(
     return [e[0] for e in subarrays]
 
 
+def is_cloudflare_challenge(status: int, headers: Mapping[str, str]) -> bool:
+    """Whether a response is a CloudFlare challenge instead of the page.
+
+    Args:
+        status (int): The status code of the response.
+        headers (Mapping[str, str]): The headers of the response.
+
+    Returns:
+        bool: Whether it's a challenge.
+    """
+    name, value = Constants.CF_CHALLENGE_HEADER
+    return status == 403 and headers.get(name) == value
+
+
 def force_range(
     n: Union[T, Tuple[T, ...], List[T]]
 ) -> Sequence[T]:
