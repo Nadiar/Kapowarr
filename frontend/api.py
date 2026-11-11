@@ -993,7 +993,12 @@ def api_volumes():
         query = extract_key(request, 'query', False)
         sort = extract_key(request, 'sort', False)
         filter = extract_key(request, 'filter', False)
-        limit = extract_key(request, 'limit', False) or 0
+        # Only page when asked to, so callers without a limit get every volume
+        limit = (
+            extract_key(request, 'limit', False)
+            if 'limit' in request.values
+            else 0
+        )
         offset = extract_key(request, 'offset', False) or 0
         if query:
             volumes = Library.search(query, sort, filter)
