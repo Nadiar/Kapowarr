@@ -68,6 +68,14 @@ class TestSearchAndQueue(unittest.TestCase):
         self.hit.assert_called_once_with(VOLUME_ID)
         self.miss.assert_not_called()
 
+    def test_locked_database_while_recording_stats_does_not_stop_search(self):
+        from sqlite3 import OperationalError
+        self.record_issues.side_effect = OperationalError('database is locked')
+
+        queued = self.search([search_result(2.0)])
+
+        self.assertEqual(queued, 1)
+
     def test_failed_search_is_not_a_miss(self):
         queued = self.search([], errored=True)
 

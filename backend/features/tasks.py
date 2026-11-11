@@ -1173,12 +1173,19 @@ def _record_search_outcome(
         else:
             issue_outcomes[searched_issue_id] = IssueSearchOutcome.NOT_FOUND
 
-    record_issue_searches(issue_outcomes)
+    # Search stats must never stop a search, e.g. when the DB is locked
+    try:
+        record_issue_searches(issue_outcomes)
 
-    if queued:
-        record_search_hit(volume_id)
-    elif not outcome.errored:
-        record_search_miss(volume_id)
+        if queued:
+            record_search_hit(volume_id)
+        elif not outcome.errored:
+            record_search_miss(volume_id)
+
+    except Exception:
+        LOGGER.exception(
+            'Failed to record the search outcome of volume %d', volume_id
+        )
     return
 
 
