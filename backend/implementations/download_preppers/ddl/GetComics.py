@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup, Tag
 from requests import RequestException
 
 from backend.base.custom_exceptions import (DownloadLinkBroken,
+                                            DownloadLinkChallenged,
                                             DownloadServiceRateLimitReached,
                                             EnqueuingDownloadFailure,
                                             IssueNotFound)
@@ -28,7 +29,8 @@ from backend.base.file_extraction import (extract_filename_data,
 from backend.base.helpers import (AsyncSession, Session, build_magnet_link,
                                   check_overlapping_issues, first_of_range,
                                   fix_year, force_range, get_torrent_info,
-                                  normalise_size, normalise_year)
+                                  is_cloudflare_challenge, normalise_size,
+                                  normalise_year)
 from backend.base.logging import LOGGER
 from backend.implementations.blocklist import (add_to_blocklist,
                                                blocklist_contains)
@@ -355,6 +357,10 @@ async def _purify_link(
     if r.status == 429 and download_service == GCDownloadService.GETCOMICS:
         raise DownloadServiceRateLimitReached(DownloadService.GETCOMICS)
 
+    if is_cloudflare_challenge(r.status, r.headers):
+        # FlareSolverr couldn't get past it, which doesn't mean it's broken
+        raise DownloadLinkChallenged(link)
+
     if not r.ok:
         raise DownloadLinkBroken(link)
 
@@ -633,6 +639,12 @@ class GetComicsPrepper(DownloadPrepper):
                     # Link blocked by CF and FS not setup
                     continue
 
+                except DownloadLinkChallenged:
+                    # Unavailable for now, like a rate limit, so don't
+                    # blocklist it and let the download be retried later
+                    limit_reached = True
+                    continue
+
                 except DownloadServiceRateLimitReached:
                     # Link is rate limited so just go to the next one
                     continue
@@ -668,9 +680,11 @@ class GetComicsPrepper(DownloadPrepper):
                     # volume, and download is not forced.
                     return None, False
 
-                except DownloadServiceRateLimitReached:
+                except (
+                    DownloadServiceRateLimitReached, DownloadLinkChallenged
+                ):
                     # Link works but the download limit for the service is
-                    # reached
+                    # reached, or it's behind a challenge for now
                     limit_reached = True
 
                 else:

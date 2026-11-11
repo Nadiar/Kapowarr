@@ -26,12 +26,9 @@ from urllib.parse import quote_plus, unquote, urlencode
 from aiohttp import ClientError, ClientSession, ClientTimeout
 from bencoding import bdecode
 from cron_converter import Cron
-from multidict import CIMultiDict, CIMultiDictProxy
 from requests import RequestException, Session as RSession
 from requests.adapters import HTTPAdapter, Retry
-from requests.structures import CaseInsensitiveDict
 from urllib3 import __version__ as urllib3_version
-from yarl import URL
 
 from backend.base.custom_exceptions import ClientNotWorking, CredentialInvalid
 from backend.base.definitions import (RAR_EXECUTABLES, BrokenClientReason,
@@ -426,6 +423,20 @@ def first_of_subarrays(
         List[T]: List with first value of each sub-array.
     """
     return [e[0] for e in subarrays]
+
+
+def is_cloudflare_challenge(status: int, headers: Mapping[str, str]) -> bool:
+    """Whether a response is a CloudFlare challenge instead of the page.
+
+    Args:
+        status (int): The status code of the response.
+        headers (Mapping[str, str]): The headers of the response.
+
+    Returns:
+        bool: Whether it's a challenge.
+    """
+    name, value = Constants.CF_CHALLENGE_HEADER
+    return status == 403 and headers.get(name) == value
 
 
 def force_range(
@@ -1077,7 +1088,7 @@ class Session(RSession):
         stream=None, verify=None,
         cert=None, json=None
     ):
-        ua, cf_cookie = self.fs.get_ua_cookies(url)
+        ua, cf_cookie = self.fs.get_clearance(url)
         self.headers.update({"User-Agent": ua})
         self.cookies.update({"cf_clearance": cf_cookie})
 
@@ -1090,14 +1101,26 @@ class Session(RSession):
             cert, json
         )
 
-        if result.status_code == 403:
-            fs_result = self.fs.handle_cf_block(result.url, result.headers)
-
-            if fs_result:
-                result.url = fs_result["url"]
-                result.status_code = fs_result["status"]
-                result._content = fs_result["response"].encode("utf-8")
-                result.headers = CaseInsensitiveDict(fs_result["headers"])
+        if (
+            result.status_code == 403
+            and self.fs.handle_cf_block(result.url, result.headers)
+        ):
+            # Retry with the clearance FlareSolverr got for the site
+            challenged_url = result.url
+            ua, clearance = self.fs.get_clearance(challenged_url)
+            result = super().request(
+                method, challenged_url, None, data,
+                {**(headers or {}), "User-Agent": ua},
+                {"cf_clearance": clearance}, files, auth,
+                timeout, allow_redirects,
+                proxies, hooks,
+                stream, verify,
+                cert, json
+            )
+            if is_cloudflare_challenge(result.status_code, result.headers):
+                self.fs.mark_failed(
+                    challenged_url, 'the clearance was rejected'
+                )
 
         if 400 <= result.status_code < 500:
             LOGGER.warning(
@@ -1144,12 +1167,17 @@ class AsyncSession(ClientSession):
     async def _request(self, *args, **kwargs):
         method, url = args[0], args[1]
         sleep_time = Constants.BACKOFF_FACTOR_RETRIES
+        # `retry=False` makes a single attempt, for requests where a failed
+        # answer won't change by asking again.
+        total_rounds = (
+            Constants.TOTAL_RETRIES if kwargs.pop('retry', True) else 1
+        )
 
-        ua, cf_cookie = self.fs.get_ua_cookies(url)
+        ua, cf_cookie = self.fs.get_clearance(url)
         self.headers.update({"User-Agent": ua})
         self.cookie_jar.update_cookies({"cf_clearance": cf_cookie})
 
-        for round in range(1, Constants.TOTAL_RETRIES + 1):
+        for round in range(1, total_rounds + 1):
             try:
                 response = await super()._request(*args, **kwargs)
                 LOGGER.debug(
@@ -1163,7 +1191,7 @@ class AsyncSession(ClientSession):
                     raise ClientError
 
             except ClientError:
-                if round == Constants.TOTAL_RETRIES:
+                if round == total_rounds:
                     # Exhausted retries
                     raise
 
@@ -1179,19 +1207,32 @@ class AsyncSession(ClientSession):
                 )
                 continue
 
-            if response.status == 403:
-                fs_result = await self.fs.handle_cf_block_async(
+            if (
+                response.status == 403
+                and await self.fs.handle_cf_block_async(
                     self, str(response.url), response.headers
                 )
-
-                if fs_result:
-                    response._url = URL(fs_result["url"])
-                    response._real_url = URL(fs_result["url"])
-                    response.status = fs_result["status"]
-                    response._body = fs_result["response"].encode("utf-8")
-                    response._headers = CIMultiDictProxy(CIMultiDict(
-                        fs_result["headers"]
-                    ))
+            ):
+                # Retry with the clearance FlareSolverr got for the site
+                challenged_url = str(response.url)
+                ua, clearance = self.fs.get_clearance(challenged_url)
+                response.release()
+                response = await super()._request(
+                    method, challenged_url,
+                    **{
+                        **kwargs,
+                        "params": None,
+                        "headers": {
+                            **(kwargs.get("headers") or {}),
+                            "User-Agent": ua
+                        },
+                        "cookies": {"cf_clearance": clearance}
+                    }
+                )
+                if is_cloudflare_challenge(response.status, response.headers):
+                    self.fs.mark_failed(
+                        challenged_url, 'the clearance was rejected'
+                    )
 
             if 400 <= response.status < 500:
                 LOGGER.warning(

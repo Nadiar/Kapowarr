@@ -8,7 +8,8 @@ from time import time
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Tuple, Union
 from urllib.parse import urlparse
 
-from requests import RequestException
+from aiohttp import ClientError
+from requests import RequestException, Session as PlainSession
 
 from backend.base.definitions import Constants, ProxyType, StatusType
 from backend.base.helpers import Session
@@ -20,9 +21,32 @@ if TYPE_CHECKING:
     from backend.base.helpers import AsyncSession
 
 
+FAILED_SOLVE_COOLDOWN = 3600 # seconds
+"How long to skip a server after FlareSolverr failed to solve its challenge"
+
+
 class FSCache:
     cookie_mapping: Dict[str, Tuple[str, float]] = {}
     ua_mapping: Dict[str, str] = {}
+    failed_until: Dict[str, float] = {}
+    "Domain to the time until which FlareSolverr isn't asked for it again"
+
+    @classmethod
+    def is_cooling_down(cls, url: str) -> bool:
+        """Whether FlareSolverr recently failed to solve the challenge of the
+        URL's domain, so asking again would only waste time."""
+        return time() < cls.failed_until.get(urlparse(url).netloc, 0.0)
+
+    @classmethod
+    def mark_failed(cls, url: str, reason: str) -> None:
+        """Skip the URL's domain for `FAILED_SOLVE_COOLDOWN` seconds."""
+        domain = urlparse(url).netloc
+        cls.failed_until[domain] = time() + FAILED_SOLVE_COOLDOWN
+        LOGGER.warning(
+            "FlareSolverr couldn't solve the challenge of %s (%s). Skipping"
+            " it for %d minutes",
+            domain, reason, FAILED_SOLVE_COOLDOWN // 60
+        )
 
     @staticmethod
     def _build_cookie(cookie: Dict[str, Any]) -> str:
@@ -117,7 +141,7 @@ class FlareSolverr:
     @staticmethod
     def __api_request(
         base_url: str,
-        session: Session,
+        session: PlainSession,
         data: Dict[str, Any]
     ) -> Dict[str, Any]:
         return session.post(
@@ -137,7 +161,8 @@ class FlareSolverr:
             base_url + Constants.FS_API_BASE,
             json=data,
             headers={'Content-Type': 'application/json'},
-            timeout=Constants.REQUEST_TIMEOUT + Constants.FS_RESOLVE_TIMEOUT
+            timeout=Constants.REQUEST_TIMEOUT + Constants.FS_RESOLVE_TIMEOUT,
+            retry=False
         )).json()
 
     @staticmethod
@@ -174,106 +199,128 @@ class FlareSolverr:
         """
         return self.base_url is not None
 
-    def get_ua_cookies(self, url: str) -> Tuple[str, str]:
-        """Get the user agent and cookies for a certain URL. The UA and cookies
-        can be cleared by CF, so use them to avoid challenges. In case the URL
-        is not CF protected, or hasn't explicitly been cleared yet, then the
-        default UA is returned and no cookie definitions.
+    def get_clearance(self, url: str) -> Tuple[str, str]:
+        """Get the user agent and clearance cookie value to send to the site
+        of a URL. A site that CF cleared earlier gets the UA and cookie that
+        passed the challenge, so it isn't challenged again. Otherwise the
+        default UA and an empty cookie are returned.
 
         Args:
             url (str): The URL to get the UA and cookie for.
 
         Returns:
-            Tuple[str, str]: First element is the UA, or default UA. Second
-                element is the clearance cookie value.
+            Tuple[str, str]: The UA and the value of the cf_clearance cookie.
         """
-        return FSCache.get_ua_cookies(url)
+        ua, cookie = FSCache.get_ua_cookies(url)
+        return ua, cookie.split(';', 1)[0]
 
-    def handle_cf_block(
-        self,
-        url: str,
-        headers: Mapping[str, str]
-    ) -> Union[None, Dict[str, Any]]:
-        """Let FS handle a URL to aquire cleared cookies and UA. These become
-        available using `get_ua_cookies()` after this method completes.
+    @staticmethod
+    def mark_failed(url: str, reason: str) -> None:
+        """Skip the site of the URL for a while, as its challenge couldn't be
+        passed.
 
         Args:
-            url (str): The URL to clear.
-            headers (Mapping[str, str]): The response headers from the
-                (possibly) blocked request.
-
-        Returns:
-            Union[None, Dict[str, Any]]: None if FlareSolverr wasn't needed or
-                couldn't solve the problem, or a dictionary with the FlareSolverr
-                response.
+            url (str): The URL whose site to skip.
+            reason (str): Why, for the log.
         """
+        FSCache.mark_failed(url, reason)
+        return
+
+    def __should_solve(self, url: str, headers: Mapping[str, str]) -> bool:
         if (
             headers.get(Constants.CF_CHALLENGE_HEADER[0])
             != Constants.CF_CHALLENGE_HEADER[1]
         ):
             # Request not failed because of CF block
-            return
+            return False
 
         if not self.base_url:
             LOGGER.warning(
                 "Request blocked by CloudFlare and FlareSolverr not setup"
             )
             StatusHandlers().report(StatusType.CF_CHALLENGE_WITH_NO_FS, '')
-            return
+            return False
 
-        with Session() as session:
-            result = self.__api_request(
-                self.base_url, session,
-                {
-                    'cmd': 'request.get',
-                    'url': url,
-                    'maxTimeout': Constants.FS_RESOLVE_TIMEOUT * 1000,
-                    **(self.proxy_data or {})
-                }
-            )["solution"]
+        return not FSCache.is_cooling_down(url)
 
-        if result["response"] is None:
-            # FlareSolverr responded, but content of
-            # returned webpage is empty.
-            return
+    def __solve_request(self, url: str) -> Dict[str, Any]:
+        # Solve the site's front page instead of the URL itself: when the URL
+        # is a file, the browser downloads it instead of showing a page, so
+        # FlareSolverr never sees the challenge finish. The clearance cookie
+        # is valid for the whole site.
+        parsed = urlparse(url)
+        return {
+            'cmd': 'request.get',
+            'url': f'{parsed.scheme}://{parsed.netloc}/',
+            'maxTimeout': Constants.FS_RESOLVE_TIMEOUT * 1000,
+            **(self.proxy_data or {})
+        }
 
-        FSCache.set_ua_cookies(url, result)
+    @staticmethod
+    def __store_clearance(url: str, solution: Dict[str, Any]) -> bool:
+        if not any(
+            c["name"] == "cf_clearance" for c in solution.get("cookies", [])
+        ):
+            FSCache.mark_failed(url, 'no clearance cookie in the solution')
+            return False
 
-        return result
+        FSCache.set_ua_cookies(url, solution)
+        return True
+
+    def handle_cf_block(
+        self,
+        url: str,
+        headers: Mapping[str, str]
+    ) -> bool:
+        """Let FS clear the site of a URL that got a CF challenge. The UA and
+        cookie to retry the request with are then available using
+        `get_clearance()`.
+
+        Args:
+            url (str): The URL that got the challenge.
+            headers (Mapping[str, str]): The response headers from the
+                (possibly) blocked request.
+
+        Returns:
+            bool: Whether the site was cleared, so the request can be retried.
+        """
+        if not self.__should_solve(url, headers):
+            return False
+
+        try:
+            # A plain session: retrying a failed solve only wastes time
+            with PlainSession() as session:
+                solution = self.__api_request(
+                    self.base_url or '', session, self.__solve_request(url)
+                )["solution"]
+
+        except (RequestException, ValueError, KeyError) as e:
+            FSCache.mark_failed(url, repr(e))
+            return False
+
+        return self.__store_clearance(url, solution)
 
     async def handle_cf_block_async(
         self,
         session: AsyncSession,
         url: str,
         headers: Mapping[str, str]
-    ) -> Union[None, Dict[str, Any]]:
-        """Let FS handle a URL to aquire cleared cookies and UA. These become
-        available using `get_ua_cookies()` after this method completes.
+    ) -> bool:
+        """Let FS clear the site of a URL that got a CF challenge. The UA and
+        cookie to retry the request with are then available using
+        `get_clearance()`.
 
         Args:
             session (AsyncSession): The session to make the request to FS with.
-            url (str): The URL to clear.
+            url (str): The URL that got the challenge.
             headers (Mapping[str, str]): The response headers from the
                 (possibly) blocked request.
 
         Returns:
-            Union[None, Dict[str, Any]]: None if FlareSolverr wasn't needed or
-                couldn't solve the problem, or a dictionary with the FlareSolverr
-                response.
+            bool: Whether the site was cleared, so the request can be retried.
         """
-        if (
-            headers.get(Constants.CF_CHALLENGE_HEADER[0])
-            != Constants.CF_CHALLENGE_HEADER[1]
-        ):
-            # Request not failed because of CF block
-            return
-
-        if not self.base_url:
-            LOGGER.warning(
-                "Request blocked by CloudFlare and FlareSolverr not setup"
-            )
-            StatusHandlers().report(StatusType.CF_CHALLENGE_WITH_NO_FS, '')
-            return
+        if not self.__should_solve(url, headers):
+            return False
 
         # Technically this makes it a max amount of FS sessions per AsyncSession
         # instance, but in most cases the application only has one AsyncSession
@@ -283,22 +330,14 @@ class FlareSolverr:
                 Constants.MAX_CONCURRENT_FS_SESSIONS
             )
 
-        async with self.session_semaphore:
-            result = (await self.__async_api_request(
-                self.base_url, session,
-                {
-                    'cmd': 'request.get',
-                    'url': url,
-                    'maxTimeout': Constants.FS_RESOLVE_TIMEOUT * 1000,
-                    **(self.proxy_data or {})
-                }
-            ))["solution"]
+        try:
+            async with self.session_semaphore:
+                solution = (await self.__async_api_request(
+                    self.base_url or '', session, self.__solve_request(url)
+                ))["solution"]
 
-        if result["response"] is None:
-            # FlareSolverr responded, but content of
-            # returned webpage is empty.
-            return
+        except (ClientError, TimeoutError, ValueError, KeyError) as e:
+            FSCache.mark_failed(url, repr(e))
+            return False
 
-        FSCache.set_ua_cookies(url, result)
-
-        return result
+        return self.__store_clearance(url, solution)

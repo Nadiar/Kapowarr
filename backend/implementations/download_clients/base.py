@@ -11,11 +11,12 @@ from urllib.parse import unquote_plus
 from requests import RequestException, Response
 
 from backend.base.custom_exceptions import (DownloadLinkBroken,
+                                            DownloadLinkChallenged,
                                             DownloadServiceRateLimitReached,
                                             IssueNotFound)
 from backend.base.definitions import (Constants, Download,
                                       DownloadService, DownloadState)
-from backend.base.helpers import Session
+from backend.base.helpers import Session, is_cloudflare_challenge
 from backend.base.logging import LOGGER
 from backend.implementations.naming import generate_issue_name
 from backend.implementations.volumes import Volume
@@ -196,6 +197,11 @@ class BaseDirectDownload(Download):
                 raise DownloadServiceRateLimitReached(
                     DownloadService.PIXELDRAIN
                 )
+
+            if e.response is not None and is_cloudflare_challenge(
+                e.response.status_code, e.response.headers
+            ):
+                raise DownloadLinkChallenged(download_link)
 
             raise DownloadLinkBroken(download_link)
 
