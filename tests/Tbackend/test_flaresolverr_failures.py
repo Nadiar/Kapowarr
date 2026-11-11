@@ -23,7 +23,11 @@ SOLUTION = {
     'headers': {},
     'response': '<html></html>',
     'userAgent': 'Mozilla/5.0',
-    'cookies': []
+    'cookies': [{
+        'name': 'cf_clearance', 'value': 'abc', 'sameSite': 'None',
+        'httpOnly': True, 'secure': True, 'path': '/',
+        'domain': 'files.example', 'expiry': 4102444800
+    }]
 }
 
 
@@ -89,13 +93,13 @@ class FlareSolverrTestCase(unittest.TestCase):
 
 class TestFailedSolve(FlareSolverrTestCase):
     def test_failed_solve_is_asked_once_not_retried(self):
-        self.assertIsNone(self.solve_async())
+        self.assertFalse(self.solve_async())
         self.assertEqual(len(self.server.requests), 1)
 
     def test_server_that_failed_is_skipped_for_a_while(self):
         self.solve_async()
-        self.assertIsNone(self.solve_async())
-        self.assertIsNone(self.solve_sync())
+        self.assertFalse(self.solve_async())
+        self.assertFalse(self.solve_sync())
 
         self.assertEqual(len(self.server.requests), 1)
 
@@ -110,7 +114,7 @@ class TestFailedSolve(FlareSolverrTestCase):
         self.assertEqual(len(self.server.requests), 2)
 
     def test_sync_failed_solve_returns_none(self):
-        self.assertIsNone(self.solve_sync())
+        self.assertFalse(self.solve_sync())
         self.assertEqual(len(self.server.requests), 1)
 
 
@@ -119,11 +123,17 @@ class TestSuccessfulSolve(FlareSolverrTestCase):
         super().setUp()
         self.server.reply = (200, {'status': 'ok', 'solution': SOLUTION})
 
-    def test_solution_is_returned_and_solving_is_capped_at_a_minute(self):
-        result = self.solve_async()
-
-        self.assertEqual(result, SOLUTION)
+    def test_site_is_cleared_and_solving_is_capped_at_a_minute(self):
+        self.assertTrue(self.solve_async())
         self.assertEqual(self.server.requests[0]['maxTimeout'], 60_000)
+
+    def test_solution_without_clearance_cookie_is_a_failure(self):
+        self.server.reply = (200, {
+            'status': 'ok', 'solution': {**SOLUTION, 'cookies': []}
+        })
+
+        self.assertFalse(self.solve_async())
+        self.assertTrue(FSCache.is_cooling_down(CHALLENGED_URL))
 
 
 if __name__ == '__main__':

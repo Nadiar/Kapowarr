@@ -214,100 +214,126 @@ class FlareSolverr:
         """
         return FSCache.get_ua_cookies(url)
 
-    def handle_cf_block(
-        self,
-        url: str,
-        headers: Mapping[str, str]
-    ) -> Union[None, Dict[str, Any]]:
-        """Let FS handle a URL to aquire cleared cookies and UA. These become
-        available using `get_ua_cookies()` after this method completes.
+    def get_clearance(self, url: str) -> Tuple[str, str]:
+        """Get the user agent and clearance cookie value to retry a request
+        with, after `handle_cf_block()` cleared its site.
 
         Args:
-            url (str): The URL to clear.
-            headers (Mapping[str, str]): The response headers from the
-                (possibly) blocked request.
+            url (str): The URL to get the clearance for.
 
         Returns:
-            Union[None, Dict[str, Any]]: None if FlareSolverr wasn't needed or
-                couldn't solve the problem, or a dictionary with the FlareSolverr
-                response.
+            Tuple[str, str]: The UA and the value of the cf_clearance cookie.
         """
+        ua, cookie = FSCache.get_ua_cookies(url)
+        return ua, cookie.split(';', 1)[0]
+
+    @staticmethod
+    def mark_failed(url: str, reason: str) -> None:
+        """Skip the site of the URL for a while, as its challenge couldn't be
+        passed.
+
+        Args:
+            url (str): The URL whose site to skip.
+            reason (str): Why, for the log.
+        """
+        FSCache.mark_failed(url, reason)
+        return
+
+    def __should_solve(self, url: str, headers: Mapping[str, str]) -> bool:
         if (
             headers.get(Constants.CF_CHALLENGE_HEADER[0])
             != Constants.CF_CHALLENGE_HEADER[1]
         ):
             # Request not failed because of CF block
-            return
+            return False
 
         if not self.base_url:
             LOGGER.warning(
                 "Request blocked by CloudFlare and FlareSolverr not setup"
             )
             StatusHandlers().report(StatusType.CF_CHALLENGE_WITH_NO_FS, '')
-            return
+            return False
 
-        if FSCache.is_cooling_down(url):
-            return
+        return not FSCache.is_cooling_down(url)
+
+    def __solve_request(self, url: str) -> Dict[str, Any]:
+        # Solve the site's front page instead of the URL itself: when the URL
+        # is a file, the browser downloads it instead of showing a page, so
+        # FlareSolverr never sees the challenge finish. The clearance cookie
+        # is valid for the whole site.
+        parsed = urlparse(url)
+        return {
+            'cmd': 'request.get',
+            'url': f'{parsed.scheme}://{parsed.netloc}/',
+            'maxTimeout': Constants.FS_RESOLVE_TIMEOUT * 1000,
+            **(self.proxy_data or {})
+        }
+
+    @staticmethod
+    def __store_clearance(url: str, solution: Dict[str, Any]) -> bool:
+        if not any(
+            c["name"] == "cf_clearance" for c in solution.get("cookies", [])
+        ):
+            FSCache.mark_failed(url, 'no clearance cookie in the solution')
+            return False
+
+        FSCache.set_ua_cookies(url, solution)
+        return True
+
+    def handle_cf_block(
+        self,
+        url: str,
+        headers: Mapping[str, str]
+    ) -> bool:
+        """Let FS clear the site of a URL that got a CF challenge. The UA and
+        cookie to retry the request with are then available using
+        `get_clearance()`.
+
+        Args:
+            url (str): The URL that got the challenge.
+            headers (Mapping[str, str]): The response headers from the
+                (possibly) blocked request.
+
+        Returns:
+            bool: Whether the site was cleared, so the request can be retried.
+        """
+        if not self.__should_solve(url, headers):
+            return False
 
         try:
             # A plain session: retrying a failed solve only wastes time
             with PlainSession() as session:
-                result = self.__api_request(
-                    self.base_url, session,
-                    {
-                        'cmd': 'request.get',
-                        'url': url,
-                        'maxTimeout': Constants.FS_RESOLVE_TIMEOUT * 1000,
-                        **(self.proxy_data or {})
-                    }
+                solution = self.__api_request(
+                    self.base_url or '', session, self.__solve_request(url)
                 )["solution"]
 
         except (RequestException, ValueError, KeyError) as e:
             FSCache.mark_failed(url, repr(e))
-            return
+            return False
 
-        if result["response"] is None:
-            # FlareSolverr responded, but content of
-            # returned webpage is empty.
-            return
-
-        FSCache.set_ua_cookies(url, result)
-
-        return result
+        return self.__store_clearance(url, solution)
 
     async def handle_cf_block_async(
         self,
         session: AsyncSession,
         url: str,
         headers: Mapping[str, str]
-    ) -> Union[None, Dict[str, Any]]:
-        """Let FS handle a URL to aquire cleared cookies and UA. These become
-        available using `get_ua_cookies()` after this method completes.
+    ) -> bool:
+        """Let FS clear the site of a URL that got a CF challenge. The UA and
+        cookie to retry the request with are then available using
+        `get_clearance()`.
 
         Args:
             session (AsyncSession): The session to make the request to FS with.
-            url (str): The URL to clear.
+            url (str): The URL that got the challenge.
             headers (Mapping[str, str]): The response headers from the
                 (possibly) blocked request.
 
         Returns:
-            Union[None, Dict[str, Any]]: None if FlareSolverr wasn't needed or
-                couldn't solve the problem, or a dictionary with the FlareSolverr
-                response.
+            bool: Whether the site was cleared, so the request can be retried.
         """
-        if (
-            headers.get(Constants.CF_CHALLENGE_HEADER[0])
-            != Constants.CF_CHALLENGE_HEADER[1]
-        ):
-            # Request not failed because of CF block
-            return
-
-        if not self.base_url:
-            LOGGER.warning(
-                "Request blocked by CloudFlare and FlareSolverr not setup"
-            )
-            StatusHandlers().report(StatusType.CF_CHALLENGE_WITH_NO_FS, '')
-            return
+        if not self.__should_solve(url, headers):
+            return False
 
         # Technically this makes it a max amount of FS sessions per AsyncSession
         # instance, but in most cases the application only has one AsyncSession
@@ -317,30 +343,14 @@ class FlareSolverr:
                 Constants.MAX_CONCURRENT_FS_SESSIONS
             )
 
-        if FSCache.is_cooling_down(url):
-            return
-
         try:
             async with self.session_semaphore:
-                result = (await self.__async_api_request(
-                    self.base_url, session,
-                    {
-                        'cmd': 'request.get',
-                        'url': url,
-                        'maxTimeout': Constants.FS_RESOLVE_TIMEOUT * 1000,
-                        **(self.proxy_data or {})
-                    }
+                solution = (await self.__async_api_request(
+                    self.base_url or '', session, self.__solve_request(url)
                 ))["solution"]
 
         except (ClientError, TimeoutError, ValueError, KeyError) as e:
             FSCache.mark_failed(url, repr(e))
-            return
+            return False
 
-        if result["response"] is None:
-            # FlareSolverr responded, but content of
-            # returned webpage is empty.
-            return
-
-        FSCache.set_ua_cookies(url, result)
-
-        return result
+        return self.__store_clearance(url, solution)
