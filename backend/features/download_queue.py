@@ -318,6 +318,10 @@ class DownloadHandler(metaclass=Singleton):
             List[Tuple[str, int, FilenameData, int, Union[int, None], bool]]:
                 The arguments of the downloads that are now in the queue.
         """
+        # Save the caller's pending writes first, so rolling back a failed
+        # download can only ever undo that download.
+        commit()
+
         added = []
         pending = list(add_args)
         for attempt in range(1, ADD_ATTEMPTS + 1):

@@ -39,7 +39,7 @@ def make_cursor(schema: str) -> KapowarrCursor:
 class TestAddMultiple(unittest.TestCase):
     def setUp(self):
         patch('backend.features.download_queue.sleep').start()
-        patch('backend.features.download_queue.commit').start()
+        self.commit = patch('backend.features.download_queue.commit').start()
         self.get_db = patch('backend.features.download_queue.get_db').start()
         self.addCleanup(patch.stopall)
         self.handler = MagicMock()
@@ -85,6 +85,19 @@ class TestAddMultiple(unittest.TestCase):
         )
 
         self.get_db.return_value.connection.rollback.assert_called()
+
+    def test_earlier_writes_are_committed_before_any_rollback(self):
+        order = []
+        self.commit.side_effect = lambda: order.append('commit')
+        self.get_db.return_value.connection.rollback.side_effect = (
+            lambda: order.append('rollback')
+        )
+
+        self.add_multiple(
+            [entry('error')], {'error': [RuntimeError('unexpected')]}
+        )
+
+        self.assertEqual(order[:2], ['commit', 'rollback'])
 
     def test_download_that_stays_locked_is_given_up(self):
         added = self.add_multiple(
