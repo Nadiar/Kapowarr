@@ -43,6 +43,14 @@ class ProtectedSiteAndFlareSolverr(BaseHTTPRequestHandler):
         }).encode())
 
     def do_GET(self):
+        if self.path.startswith('/dls/'):
+            # Like GetComics' links, which redirect to its file server
+            self.reply(302, 'text/html', b'', {
+                'Location': 'http://127.0.0.1:%d/2026/Comic%%20001.cbz'
+                % self.server.server_port
+            })
+            return
+
         cleared = (
             f'cf_clearance={CLEARANCE}' in (self.headers['Cookie'] or '')
             and self.headers['User-Agent'] == SOLVED_UA
@@ -92,10 +100,10 @@ class ClearanceRetryTestCase(unittest.TestCase):
         FSCache.cookie_mapping.clear()
         FSCache.ua_mapping.clear()
 
-    def fetch_async(self):
+    def fetch_async(self, url=None):
         async def fetch():
             async with AsyncSession() as session:
-                response = await session.get(self.file_url)
+                response = await session.get(url or self.file_url)
                 return response.status, await response.read()
         return asyncio.run(fetch())
 
@@ -125,14 +133,27 @@ class TestClearanceRetry(ClearanceRetryTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(self.server.solve_requests), 1)
 
-    def test_clearance_that_does_not_work_puts_the_site_on_cooldown(self):
+    def test_link_that_redirects_to_a_cleared_site_reuses_the_clearance(self):
+        link = 'http://localhost:%d/dls/abc' % self.server.server_port
+
+        first = self.fetch_async(link)
+        second = self.fetch_async(link)
+        with Session() as session:
+            response = session.get(link)
+
+        self.assertEqual(first, (200, b'FILE'))
+        self.assertEqual(second, (200, b'FILE'))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.server.solve_requests), 1)
+
+    def test_rejected_clearance_is_solved_once_more_then_given_up(self):
         self.server.accept_clearance = False
 
         with Session() as session:
             response = session.get(self.file_url)
 
         self.assertEqual(response.status_code, 403)
-        self.assertTrue(FSCache.is_cooling_down(self.file_url))
+        self.assertEqual(len(self.server.solve_requests), 2)
 
 
 if __name__ == '__main__':
