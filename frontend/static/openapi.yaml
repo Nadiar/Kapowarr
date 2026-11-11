@@ -1,0 +1,2737 @@
+openapi: 3.1.0
+info:
+  title: Kapowarr API
+  version: "1.3.2"
+  description: |
+    The JSON API that the Kapowarr web UI is built on.
+
+    **Authentication.** Every endpoint except `POST /auth` and `GET /public`
+    needs the API key as the `api_key` query parameter. Find it under
+    Settings → General, or get it from `POST /auth`. A missing or wrong key
+    returns `401 ApiKeyInvalid`.
+
+    **Response envelope.** Every JSON response has the shape
+    `{"error": null | "<ErrorName>", "result": <payload>}`; the status code
+    is carried by HTTP only. On an error, `result` holds details such as the
+    offending key.
+
+    **Request bodies** are JSON unless stated otherwise. Query parameters
+    may also be sent as form fields.
+
+    **Live updates** of tasks, the download queue and the mass editor are
+    pushed over Socket.IO at `/api/socket.io` (authenticate with
+    `{"api_key": "..."}`), which this document does not cover.
+  license:
+    name: GPL-3.0
+    url: https://github.com/Casvt/Kapowarr/blob/development/LICENSE
+servers:
+  - url: ../api
+    description: This Kapowarr instance
+
+security:
+  - ApiKey: []
+
+tags:
+  - name: Authentication
+  - name: System
+  - name: Tasks
+  - name: Database
+  - name: Settings
+  - name: Root folders
+  - name: Remote mappings
+  - name: Indexers
+  - name: Library import
+  - name: Volumes
+  - name: Issues
+  - name: Files
+  - name: Download queue
+  - name: Download history
+  - name: Blocklist
+  - name: Credentials
+  - name: Download clients
+  - name: Mass editor
+  - name: Calendar
+    description: Fork addition. New releases from ComicVine.
+  - name: Notifications
+    description: Fork addition. Connections that notify on events.
+
+paths:
+  # region Authentication
+  /auth:
+    post:
+      tags: [Authentication]
+      summary: Log in and get the API key
+      description: |
+        Without a password set in Kapowarr, any request succeeds. With only
+        a password set, `username` is ignored.
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: {type: string}
+                password: {type: string}
+      responses:
+        "200":
+          description: Logged in.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      api_key: {type: string}
+        "401":
+          description: "`PasswordInvalid`: wrong username or password."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+
+  /auth/check:
+    post:
+      tags: [Authentication]
+      summary: Check that an API key is valid
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /public:
+    get:
+      tags: [Authentication]
+      summary: Get the login method
+      security: []
+      responses:
+        "200":
+          description: The login method.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      authentication_method:
+                        type: integer
+                        enum: [0, 1, 2]
+                        description: |
+                          0 = no login, 1 = password only,
+                          2 = username and password.
+
+  # region System
+  /system/about:
+    get:
+      tags: [System]
+      summary: Get version and environment information
+      responses:
+        "200":
+          description: About data.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      version: {type: string}
+                      python_version: {type: string}
+                      database_version: {type: integer}
+                      database_location: {type: string}
+                      data_folder: {type: string}
+                      os: {type: string}
+                      runs_64bit: {type: boolean}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /system/status:
+    get:
+      tags: [System]
+      summary: List active status warnings
+      responses:
+        "200":
+          description: The warnings, such as rate limits or a full root folder.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/Status"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    delete:
+      tags: [System]
+      summary: Clear status warnings
+      parameters:
+        - name: type
+          in: query
+          description: Only clear warnings of this type. Omit to clear all.
+          schema: {$ref: "#/components/schemas/StatusType"}
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /system/logs:
+    get:
+      tags: [System]
+      summary: Download the log file
+      responses:
+        "200":
+          description: The log file as text.
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /system/power/shutdown:
+    post:
+      tags: [System]
+      summary: Shut Kapowarr down
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /system/power/restart:
+    post:
+      tags: [System]
+      summary: Restart Kapowarr
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  # region Tasks
+  /system/tasks:
+    get:
+      tags: [Tasks]
+      summary: List queued and running tasks
+      responses:
+        "200":
+          description: The task queue.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/Task"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Tasks]
+      summary: Queue a task
+      description: |
+        Extra keys depend on `cmd`:
+
+        | `cmd` | Required keys | Optional keys |
+        |---|---|---|
+        | `refresh_and_scan`, `auto_search` | `volume_id` | |
+        | `auto_search_issue` | `volume_id`, `issue_id` | |
+        | `mass_rename`, `mass_convert` | `volume_id` | `filepath_filter` |
+        | `mass_rename_issue`, `mass_convert_issue` | `volume_id`, `issue_id` | `filepath_filter` |
+        | `update_all` | | `allow_skipping` |
+        | all others | | |
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cmd]
+              properties:
+                cmd: {$ref: "#/components/schemas/TaskCommand"}
+                volume_id: {type: integer}
+                issue_id: {type: integer}
+                filepath_filter:
+                  type: array
+                  items: {type: string}
+                  description: Only process these files. Empty means all files.
+                allow_skipping:
+                  type: boolean
+                  default: true
+                  description: Skip volumes updated in the last 24 hours.
+            example: {cmd: refresh_and_scan, volume_id: 1}
+      responses:
+        "201":
+          description: Queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      id: {type: integer}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404":
+          description: "`TaskNotFound`: unknown `cmd`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+
+  /system/tasks/history:
+    get:
+      tags: [Tasks]
+      summary: List finished tasks
+      description: Returns up to 50 entries, newest first.
+      parameters:
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: The task history.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        task_name: {type: string}
+                        display_title: {type: string}
+                        run_at: {type: integer, description: Epoch seconds}
+                        duration_seconds: {type: integer}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    delete:
+      tags: [Tasks]
+      summary: Clear the task history
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /system/tasks/planning:
+    get:
+      tags: [Tasks]
+      summary: List scheduled tasks
+      responses:
+        "200": {$ref: "#/components/responses/TaskPlanning"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    put:
+      tags: [Tasks]
+      summary: Change a scheduled task's cron schedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_name, schedule]
+              properties:
+                task_name: {$ref: "#/components/schemas/TaskCommand"}
+                schedule:
+                  type: string
+                  description: A cron expression.
+                  example: "0 3 * * *"
+      responses:
+        "200": {$ref: "#/components/responses/TaskPlanning"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /system/tasks/{task_id}:
+    parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema: {type: integer}
+    get:
+      tags: [Tasks]
+      summary: Get a queued or running task
+      responses:
+        "200":
+          description: The task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result: {$ref: "#/components/schemas/Task"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Tasks]
+      summary: Cancel a queued task
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "400":
+          description: "`TaskNotDeletable`: the task is already running."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # region Database
+  /system/database:
+    get:
+      tags: [Database]
+      summary: Download a copy of the database
+      responses:
+        "200":
+          description: The SQLite database file.
+          content:
+            application/x-sqlite3:
+              schema: {type: string, format: binary}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Database]
+      summary: Replace the database with an uploaded one
+      description: Kapowarr restarts on the new database.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, copy_hosting_settings]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: A Kapowarr database with the `.db` extension.
+                copy_hosting_settings:
+                  type: string
+                  enum: ["true", "false"]
+                  description: Keep the current host, port and URL base.
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "400":
+          description: "`InvalidDatabaseFile`, `KeyNotFound` or `InvalidKeyValue`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /system/database/backups:
+    get:
+      tags: [Database]
+      summary: List database backups
+      responses:
+        "200":
+          description: The backups.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        index: {type: integer}
+                        creation_date: {type: integer, description: Epoch seconds}
+                        filepath: {type: string}
+                        filename: {type: string}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /system/database/backups/{b_idx}:
+    parameters:
+      - name: b_idx
+        in: path
+        required: true
+        description: The `index` of a backup.
+        schema: {type: integer}
+    get:
+      tags: [Database]
+      summary: Download a database backup
+      responses:
+        "200":
+          description: The SQLite database file.
+          content:
+            application/x-sqlite3:
+              schema: {type: string, format: binary}
+        "400":
+          description: "`DatabaseFileNotFound`: no backup with this index."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Database]
+      summary: Restore a database backup
+      description: Kapowarr restarts on the restored database.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [copy_hosting_settings]
+              properties:
+                copy_hosting_settings:
+                  type: boolean
+                  description: Keep the current host, port and URL base.
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  # region Settings
+  /settings:
+    get:
+      tags: [Settings]
+      summary: Get all settings
+      responses:
+        "200": {$ref: "#/components/responses/Settings"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    put:
+      tags: [Settings]
+      summary: Change settings
+      description: |
+        Send only the settings to change. Changing `host`, `port` or
+        `url_base` restarts Kapowarr on the new address, and reverts if the
+        new address isn't reached within a minute. Changing a proxy setting
+        restarts Kapowarr.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Settings"}
+            example: {rename_downloaded_files: true}
+      responses:
+        "200": {$ref: "#/components/responses/Settings"}
+        "400":
+          description: "`InvalidKeyValue`, `KeyNotFound` or `InvalidSettingModification`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    delete:
+      tags: [Settings]
+      summary: Reset settings to their defaults
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reset_keys]
+              properties:
+                reset_keys:
+                  type: array
+                  items: {type: string}
+                  description: Names of the settings to reset.
+            example: {reset_keys: [file_naming]}
+      responses:
+        "200": {$ref: "#/components/responses/Settings"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /settings/api_key:
+    post:
+      tags: [Settings]
+      summary: Generate a new API key
+      description: The old key stops working immediately.
+      responses:
+        "200": {$ref: "#/components/responses/Settings"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /settings/availableformats:
+    get:
+      tags: [Settings]
+      summary: List the formats files can be converted to
+      responses:
+        "200":
+          description: The formats.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {type: string}
+                    example: [cbz, cbr, zip, rar, folder]
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  # region Root folders
+  /rootfolder:
+    get:
+      tags: [Root folders]
+      summary: List root folders
+      responses:
+        "200":
+          description: The root folders.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/RootFolder"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Root folders]
+      summary: Add a root folder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [folder]
+              properties:
+                folder: {type: string}
+      responses:
+        "201":
+          description: Added.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result: {$ref: "#/components/schemas/RootFolder"}
+        "400":
+          description: "`KeyNotFound` or `RootFolderInvalid`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404":
+          description: "`FolderNotFound`: the folder doesn't exist."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+
+  /rootfolder/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Root folders]
+      summary: Get a root folder
+      responses:
+        "200":
+          description: The root folder.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result: {$ref: "#/components/schemas/RootFolder"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [Root folders]
+      summary: Change a root folder's path
+      description: Moves the volume folders inside it along.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [folder]
+              properties:
+                folder: {type: string}
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Root folders]
+      summary: Delete a root folder
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "400":
+          description: "`RootFolderInUse`: volumes still use it."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # region Remote mappings
+  /remotemapping:
+    get:
+      tags: [Remote mappings]
+      summary: List remote path mappings
+      responses:
+        "200":
+          description: The mappings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/RemoteMapping"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Remote mappings]
+      summary: Add a remote path mapping
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [external_download_client_id, remote_path, local_path]
+              properties:
+                external_download_client_id: {type: integer, minimum: 1}
+                remote_path: {type: string, minLength: 1}
+                local_path: {type: string, minLength: 1}
+      responses:
+        "201": {$ref: "#/components/responses/RemoteMapping"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /remotemapping/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Remote mappings]
+      summary: Get a remote path mapping
+      responses:
+        "200": {$ref: "#/components/responses/RemoteMapping"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [Remote mappings]
+      summary: Change a remote path mapping
+      description: Send only the fields to change. Note the 201 status.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                external_download_client_id: {type: integer, minimum: 1}
+                remote_path: {type: string, minLength: 1}
+                local_path: {type: string, minLength: 1}
+      responses:
+        "201": {$ref: "#/components/responses/RemoteMapping"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Remote mappings]
+      summary: Delete a remote path mapping
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # region Indexers
+  /indexers:
+    get:
+      tags: [Indexers]
+      summary: List indexers
+      responses:
+        "200":
+          description: The indexers.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/Indexer"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Indexers]
+      summary: Add an indexer
+      description: |
+        Which fields are needed depends on the client type; see
+        `GET /indexers/options`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/IndexerInput"}
+            example:
+              download_type: 2
+              client_type: Torznab
+              title: Prowlarr
+              url: http://prowlarr:9696/1
+              api_path: /api
+              api_key: abc123
+              categories: ["7030"]
+      responses:
+        "201": {$ref: "#/components/responses/Indexer"}
+        "400":
+          description: "`InvalidKeyValue`, `AddingIndexerForbidden` or `ClientNotWorking`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /indexers/options:
+    get:
+      tags: [Indexers]
+      summary: List the supported indexer types
+      responses:
+        "200":
+          description: |
+            Keyed by download type, then client type. `required_tokens`
+            lists the fields that client needs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      additionalProperties:
+                        type: object
+                        properties:
+                          required_tokens:
+                            type: array
+                            items: {type: string}
+                          allow_multiple_instances: {type: boolean}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /indexers/test:
+    post:
+      tags: [Indexers]
+      summary: Test indexer settings without saving them
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/IndexerInput"
+                - required: [download_type, client_type, url]
+      responses:
+        "200": {$ref: "#/components/responses/ClientTest"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /indexers/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Indexers]
+      summary: Get an indexer
+      responses:
+        "200": {$ref: "#/components/responses/Indexer"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [Indexers]
+      summary: Change an indexer
+      description: |
+        Send all fields of the indexer: missing fields are set to `null`.
+        The download and client type can't be changed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/IndexerInput"}
+      responses:
+        "200": {$ref: "#/components/responses/Indexer"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Indexers]
+      summary: Delete an indexer
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # region Library import
+  /libraryimport:
+    get:
+      tags: [Library import]
+      summary: Propose ComicVine matches for files not in the library
+      description: |
+        Scans the root folders for files that belong to no volume, groups
+        them and searches ComicVine for each group. Slow: it makes
+        ComicVine requests.
+      parameters:
+        - name: folder_filter
+          in: query
+          description: Only scan folders matching this path or glob pattern.
+          schema: {type: string}
+        - name: limit
+          in: query
+          description: Maximum number of folders to scan.
+          schema: {type: integer, default: 20}
+        - name: only_english
+          in: query
+          description: Only propose English volumes.
+          schema: {type: string, enum: ["true", "false"], default: "true"}
+        - name: limit_parent_folder
+          in: query
+          description: |
+            Count `limit` in parent folders instead of folders. Useful when
+            each issue has its own sub-folder.
+          schema: {type: string, enum: ["true", "false"], default: "false"}
+      responses:
+        "200":
+          description: The proposals, one entry per file.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        filepath: {type: string}
+                        file_title: {type: string}
+                        group_number: {type: integer}
+                        cv:
+                          type: object
+                          description: The proposed volume; all `null` without a match.
+                          properties:
+                            id: {type: [integer, "null"], description: ComicVine ID}
+                            title: {type: [string, "null"]}
+                            issue_count: {type: [integer, "null"]}
+                            link: {type: [string, "null"]}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Library import]
+      summary: Import files into the library
+      description: Adds each volume (if needed) and moves the files into it.
+      parameters:
+        - name: rename_files
+          in: query
+          description: Rename the files to the naming scheme.
+          schema: {type: string, enum: ["true", "false"], default: "false"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: object
+                required: [filepath, id]
+                properties:
+                  filepath: {type: string}
+                  id: {type: integer, description: ComicVine ID of the volume}
+      responses:
+        "201": {$ref: "#/components/responses/Empty"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  # region Volumes
+  /volumes:
+    get:
+      tags: [Volumes]
+      summary: List or search the library
+      description: |
+        With `query`, returns every matching volume as a plain list.
+        Without `limit` (or with `limit=0`), returns the whole library as a
+        plain list. With a positive `limit`, returns one page of `limit`
+        volumes starting at `offset`, wrapped as `{has_more, result}`.
+      parameters:
+        - name: query
+          in: query
+          description: Search the library by title.
+          schema: {type: string}
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [title, year, volume_number, recently_added, publisher, wanted, recently_released]
+            default: title
+        - name: filter
+          in: query
+          schema: {type: string, enum: [wanted, monitored]}
+        - name: limit
+          in: query
+          description: Page size. Leave out for the whole library.
+          schema: {type: integer, minimum: 0}
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: The volumes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    oneOf:
+                      - type: array
+                        items: {$ref: "#/components/schemas/VolumeSummary"}
+                      - type: object
+                        properties:
+                          has_more: {type: boolean}
+                          result:
+                            type: array
+                            items: {$ref: "#/components/schemas/VolumeSummary"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Volumes]
+      summary: Add a volume from ComicVine
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [comicvine_id, root_folder_id]
+              properties:
+                comicvine_id: {type: integer}
+                root_folder_id: {type: integer}
+                monitor: {type: boolean, default: true}
+                monitoring_scheme: {$ref: "#/components/schemas/MonitorScheme"}
+                monitor_new_issues: {type: boolean, default: true}
+                volume_folder:
+                  type: [string, "null"]
+                  description: Custom folder inside the root folder. Omit for the naming scheme.
+                auto_search:
+                  type: boolean
+                  default: true
+                  description: Search for the monitored issues after adding.
+                special_version:
+                  description: Omit or `auto` to detect it.
+                  oneOf:
+                    - $ref: "#/components/schemas/SpecialVersion"
+                    - const: auto
+      responses:
+        "201":
+          description: Added.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result: {$ref: "#/components/schemas/Volume"}
+        "400":
+          description: "`KeyNotFound`, `InvalidKeyValue` or `VolumeAlreadyAdded`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "509": {$ref: "#/components/responses/RateLimited"}
+
+  /volumes/search:
+    get:
+      tags: [Volumes]
+      summary: Search ComicVine for volumes
+      parameters:
+        - name: query
+          in: query
+          required: true
+          description: A title, or `cv:4050-<id>` for an exact volume.
+          schema: {type: string, minLength: 1}
+      responses:
+        "200":
+          description: The ComicVine volumes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/VolumeSearchResult"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "509": {$ref: "#/components/responses/RateLimited"}
+    post:
+      tags: [Volumes]
+      summary: Preview the folder name of a volume
+      description: Applies the volume folder naming scheme to a search result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [comicvine_id, title, year, volume_number, publisher]
+              properties:
+                comicvine_id: {type: integer}
+                title: {type: string}
+                year: {type: [integer, "null"]}
+                volume_number: {type: integer}
+                publisher: {type: [string, "null"]}
+                special_version: {$ref: "#/components/schemas/SpecialVersion"}
+      responses:
+        "200":
+          description: The folder name.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      folder: {type: string}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /volumes/stats:
+    get:
+      tags: [Volumes]
+      summary: Get library statistics
+      responses:
+        "200":
+          description: The statistics.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      volumes: {type: integer}
+                      monitored: {type: integer}
+                      unmonitored: {type: integer}
+                      issues: {type: integer}
+                      downloaded_issues: {type: integer}
+                      files: {type: integer}
+                      total_file_size: {type: integer, description: Bytes}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /volumes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Volumes]
+      summary: Get a volume with its issues and files
+      responses:
+        "200":
+          description: The volume.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result: {$ref: "#/components/schemas/Volume"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [Volumes]
+      summary: Change a volume
+      description: Send only the fields to change.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                monitored: {type: boolean}
+                monitor_new_issues: {type: boolean}
+                special_version: {$ref: "#/components/schemas/SpecialVersion"}
+                special_version_locked: {type: boolean}
+                root_folder:
+                  type: integer
+                  description: Move the volume to this root folder.
+                volume_folder:
+                  type: [string, "null"]
+                  description: Move the volume to this folder. Empty or `null` for the naming scheme.
+                monitoring_scheme: {$ref: "#/components/schemas/MonitorScheme"}
+      responses:
+        "200":
+          description: Changed. `result` is `null`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result: {type: "null"}
+        "400":
+          description: "`KeyNotFound` (not editable), `InvalidKeyValue` or `TaskForVolumeRunning`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Volumes]
+      summary: Delete a volume
+      parameters:
+        - name: delete_folder
+          in: query
+          required: true
+          description: Also delete the volume folder and its files.
+          schema: {type: string, enum: ["true", "false"]}
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "400":
+          description: "`KeyNotFound`, `VolumeDownloadedFor` or `TaskForVolumeRunning`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /volumes/{id}/cover:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Volumes]
+      summary: Get a volume's cover image
+      responses:
+        "200":
+          description: The cover.
+          content:
+            image/jpeg:
+              schema: {type: string, format: binary}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /volumes/{id}/manualmatch:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Volumes]
+      summary: Get which files are matched to which issues
+      responses:
+        "200":
+          description: One entry per file.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/FileMatch"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [Volumes]
+      summary: Change which files are matched to which issues
+      description: Send only the files to change.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: {$ref: "#/components/schemas/FileMatch"}
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /volumes/{id}/rename:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Volumes]
+      summary: Preview renaming a volume's files
+      description: Use `POST /system/tasks` with `mass_rename` to apply it.
+      responses:
+        "200": {$ref: "#/components/responses/PathMapping"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /volumes/{id}/convert:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Volumes]
+      summary: Preview converting a volume's files
+      description: Use `POST /system/tasks` with `mass_convert` to apply it.
+      responses:
+        "200": {$ref: "#/components/responses/PathMapping"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /volumes/{id}/manualsearch:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Volumes]
+      summary: Search the indexers for a volume
+      description: Slow; it queries every enabled indexer.
+      responses:
+        "200": {$ref: "#/components/responses/SearchResults"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /volumes/{id}/download:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    post:
+      tags: [Volumes]
+      summary: Download a search result for a volume
+      requestBody: {$ref: "#/components/requestBodies/Download"}
+      responses:
+        "201": {$ref: "#/components/responses/DownloadsAdded"}
+        "400":
+          description: "`KeyNotFound`, `InvalidKeyValue`, `DownloadLinkBroken` or `EnqueuingDownloadFailure`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "509": {$ref: "#/components/responses/RateLimited"}
+
+  # region Issues
+  /issues/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Issues]
+      summary: Get an issue
+      responses:
+        "200": {$ref: "#/components/responses/Issue"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [Issues]
+      summary: Change whether an issue is monitored
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                monitored: {type: boolean}
+      responses:
+        "200": {$ref: "#/components/responses/Issue"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /issues/{id}/rename:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Issues]
+      summary: Preview renaming an issue's files
+      description: Use `POST /system/tasks` with `mass_rename_issue` to apply it.
+      responses:
+        "200": {$ref: "#/components/responses/PathMapping"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /issues/{id}/convert:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Issues]
+      summary: Preview converting an issue's files
+      description: Use `POST /system/tasks` with `mass_convert_issue` to apply it.
+      responses:
+        "200": {$ref: "#/components/responses/PathMapping"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /issues/{id}/manualsearch:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Issues]
+      summary: Search the indexers for an issue
+      description: Slow; it queries every enabled indexer.
+      responses:
+        "200": {$ref: "#/components/responses/SearchResults"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /issues/{id}/download:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    post:
+      tags: [Issues]
+      summary: Download a search result for an issue
+      requestBody: {$ref: "#/components/requestBodies/Download"}
+      responses:
+        "201": {$ref: "#/components/responses/DownloadsAdded"}
+        "400":
+          description: "`KeyNotFound`, `InvalidKeyValue`, `DownloadLinkBroken` or `EnqueuingDownloadFailure`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "509": {$ref: "#/components/responses/RateLimited"}
+
+  # region Files
+  /files/{f_id}:
+    parameters:
+      - name: f_id
+        in: path
+        required: true
+        schema: {type: integer}
+    get:
+      tags: [Files]
+      summary: Get a file
+      responses:
+        "200": {$ref: "#/components/responses/File"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [Files]
+      summary: Record that a file was moved
+      description: |
+        Fork addition. For an application that moved the file itself:
+        updates the stored path without touching the disk.
+      parameters:
+        - name: filepath
+          in: query
+          required: true
+          description: The new absolute path. It must exist.
+          schema: {type: string}
+      responses:
+        "200": {$ref: "#/components/responses/File"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Files]
+      summary: Delete a file from disk and the library
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # region Download queue
+  /activity/queue:
+    get:
+      tags: [Download queue]
+      summary: List the download queue
+      responses:
+        "200":
+          description: The queue, in order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/Download"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    delete:
+      tags: [Download queue]
+      summary: Remove every download from the queue
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /activity/queue/{download_id}:
+    parameters:
+      - name: download_id
+        in: path
+        required: true
+        schema: {type: integer}
+    get:
+      tags: [Download queue]
+      summary: Get a download
+      responses:
+        "200":
+          description: The download.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result: {$ref: "#/components/schemas/Download"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [Download queue]
+      summary: Move a download in the queue
+      parameters:
+        - name: index
+          in: query
+          required: true
+          description: The new position, starting at 0.
+          schema: {type: integer}
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "400":
+          description: "`KeyNotFound`, `InvalidKeyValue` or `DownloadQueueEntryUnmovable`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Download queue]
+      summary: Remove a download from the queue
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                blocklist:
+                  type: boolean
+                  default: false
+                  description: Also add the link to the blocklist.
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /activity/folder:
+    delete:
+      tags: [Download queue]
+      summary: Empty the download folder
+      description: Deletes everything in it that isn't part of an active download.
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  # region Download history
+  /activity/history:
+    get:
+      tags: [Download history]
+      summary: List finished downloads
+      description: Returns up to 50 entries, newest first.
+      parameters:
+        - name: volume_id
+          in: query
+          description: Only downloads for this volume.
+          schema: {type: integer}
+        - name: issue_id
+          in: query
+          description: Only downloads for this issue.
+          schema: {type: integer}
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: The history.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        web_link: {type: [string, "null"]}
+                        web_title: {type: [string, "null"]}
+                        web_sub_title: {type: [string, "null"]}
+                        file_title: {type: [string, "null"]}
+                        volume_id: {type: [integer, "null"]}
+                        issue_id: {type: [integer, "null"]}
+                        source: {type: [string, "null"]}
+                        downloaded_at: {type: integer, description: Epoch seconds}
+                        success: {type: [boolean, "null"]}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Download history]
+      summary: Clear the download history
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  # region Blocklist
+  /blocklist:
+    get:
+      tags: [Blocklist]
+      summary: List blocklisted links
+      description: Returns up to 50 entries, newest first.
+      parameters:
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: The blocklist.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/BlocklistEntry"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Blocklist]
+      summary: Blocklist a link
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [web_link, volume_id, reason_id]
+              properties:
+                web_link: {type: string, minLength: 1}
+                web_title: {type: [string, "null"]}
+                web_sub_title: {type: [string, "null"]}
+                download_link: {type: [string, "null"]}
+                download_service:
+                  oneOf:
+                    - {$ref: "#/components/schemas/DownloadService"}
+                    - {type: "null"}
+                volume_id: {type: integer}
+                issue_id: {type: [integer, "null"]}
+                reason_id:
+                  type: integer
+                  enum: [1, 3, 4]
+                  description: 1 = link broken, 3 = no working links, 4 = added by user.
+      responses:
+        "201":
+          description: Added.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result: {$ref: "#/components/schemas/BlocklistEntry"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    delete:
+      tags: [Blocklist]
+      summary: Clear the blocklist
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /blocklist/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Blocklist]
+      summary: Get a blocklist entry
+      responses:
+        "200":
+          description: The entry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result: {$ref: "#/components/schemas/BlocklistEntry"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Blocklist]
+      summary: Remove a link from the blocklist
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # region Credentials
+  /credentials:
+    get:
+      tags: [Credentials]
+      summary: List download service credentials
+      responses:
+        "200":
+          description: The credentials, with passwords masked.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/Credential"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Credentials]
+      summary: Add download service credentials
+      description: Mega needs `email` and `password`; Pixeldrain needs `api_key`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source]
+              properties:
+                source: {type: string, enum: [mega, pixeldrain]}
+                username: {type: [string, "null"]}
+                email: {type: [string, "null"]}
+                password: {type: [string, "null"]}
+                api_key: {type: [string, "null"]}
+      responses:
+        "201":
+          description: Added.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result: {$ref: "#/components/schemas/Credential"}
+        "400":
+          description: "`KeyNotFound`, `InvalidKeyValue` or `CredentialInvalid`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /credentials/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Credentials]
+      summary: Get download service credentials
+      responses:
+        "200":
+          description: The credentials, with the password masked.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result: {$ref: "#/components/schemas/Credential"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Credentials]
+      summary: Delete download service credentials
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # region Download clients
+  /externalclients:
+    get:
+      tags: [Download clients]
+      summary: List torrent clients
+      responses:
+        "200":
+          description: The clients.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/ExternalClient"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Download clients]
+      summary: Add a torrent client
+      description: The settings are tested before saving.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/ExternalClientInput"
+                - required: [download_type, client_type, title, base_url]
+            example:
+              download_type: 2
+              client_type: qBittorrent
+              title: qBittorrent
+              base_url: http://qbittorrent:8080
+              username: admin
+              password: secret
+      responses:
+        "201": {$ref: "#/components/responses/ExternalClient"}
+        "400":
+          description: "`InvalidKeyValue` or `ClientNotWorking`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /externalclients/options:
+    get:
+      tags: [Download clients]
+      summary: List the supported client types
+      responses:
+        "200":
+          description: |
+            Keyed by download type, then client type, giving the fields
+            that client needs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      additionalProperties:
+                        type: array
+                        items: {type: string}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /externalclients/test:
+    post:
+      tags: [Download clients]
+      summary: Test torrent client settings without saving them
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/ExternalClientInput"
+                - required: [download_type, client_type, base_url]
+      responses:
+        "200": {$ref: "#/components/responses/ClientTest"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /externalclients/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      tags: [Download clients]
+      summary: Get a torrent client
+      responses:
+        "200": {$ref: "#/components/responses/ExternalClient"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [Download clients]
+      summary: Change a torrent client
+      description: |
+        Send all fields: missing fields are set to `null`. The download
+        and client type can't be changed. The settings are tested first.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ExternalClientInput"}
+      responses:
+        "200": {$ref: "#/components/responses/ExternalClient"}
+        "400":
+          description: "`InvalidKeyValue`, `ClientNotWorking` or `ExternalClientDownloading`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Download clients]
+      summary: Delete a torrent client
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "400":
+          description: "`ExternalClientDownloading`: a download still uses it."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # region Mass editor
+  /masseditor:
+    post:
+      tags: [Mass editor]
+      summary: Apply an action to several volumes
+      description: |
+        Runs synchronously; progress is pushed over the websocket. `args`
+        per action:
+
+        | `action` | `args` |
+        |---|---|
+        | `delete` | `delete_folder` (boolean, default false) |
+        | `root_folder` | `root_folder_id` (integer, required) |
+        | `monitoring_scheme` | `monitoring_scheme` (required) |
+        | `rename`, `update`, `search`, `convert`, `monitor`, `unmonitor`, `file_date`, `file_permissions`, `file_ownership` | none |
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, volume_ids]
+              properties:
+                action:
+                  type: string
+                  enum:
+                    - delete
+                    - root_folder
+                    - rename
+                    - update
+                    - search
+                    - convert
+                    - unmonitor
+                    - monitor
+                    - monitoring_scheme
+                    - file_date
+                    - file_permissions
+                    - file_ownership
+                volume_ids:
+                  type: array
+                  items: {type: integer}
+                args:
+                  type: object
+                  properties:
+                    delete_folder: {type: boolean}
+                    root_folder_id: {type: integer}
+                    monitoring_scheme: {$ref: "#/components/schemas/MonitorScheme"}
+            example: {action: monitor, volume_ids: [1, 2, 3]}
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # region Calendar
+  /calendar:
+    get:
+      tags: [Calendar]
+      summary: List issues released in a date range
+      description: |
+        Results come from ComicVine by store date and are cached for 24
+        hours; the library status of each issue is always current.
+      parameters:
+        - name: start
+          in: query
+          required: true
+          schema: {type: string, format: date}
+          example: "2026-11-01"
+        - name: end
+          in: query
+          required: true
+          schema: {type: string, format: date}
+          example: "2026-11-07"
+        - name: publishers
+          in: query
+          description: Comma-separated publisher names. Omit for all.
+          schema: {type: string}
+          example: Marvel,DC Comics
+        - name: force
+          in: query
+          description: Any non-empty value (even `false`) bypasses the cache.
+          schema: {type: string}
+      responses:
+        "200":
+          description: The issues.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/CalendarIssue"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "509": {$ref: "#/components/responses/RateLimited"}
+
+  /calendar/publishers:
+    get:
+      tags: [Calendar]
+      summary: List the calendar's publisher filter presets
+      responses:
+        "200":
+          description: The presets and their categories.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      publishers:
+                        type: array
+                        items: {type: string}
+                      categories:
+                        type: object
+                        additionalProperties:
+                          type: array
+                          items: {type: string}
+                        example: {western: [Marvel, DC Comics], manga: [Viz]}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  # region Notifications
+  /notifications:
+    get:
+      tags: [Notifications]
+      summary: List notification connections
+      responses:
+        "200":
+          description: The connections.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: array
+                    items: {$ref: "#/components/schemas/Notification"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Notifications]
+      summary: Add a notification connection
+      requestBody: {$ref: "#/components/requestBodies/Notification"}
+      responses:
+        "200":
+          description: Added. Note the 200 status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      id: {type: integer}
+        "400":
+          description: "`KeyNotFound` or `InvalidNotificationSettings`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /notifications/providers:
+    get:
+      tags: [Notifications]
+      summary: List notification providers and their settings
+      responses:
+        "200":
+          description: Keyed by provider type.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        fields:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              name: {type: string}
+                              type: {type: string}
+                              label: {type: string}
+                              placeholder: {type: string}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /notifications/{notification_id}:
+    parameters:
+      - $ref: "#/components/parameters/NotificationId"
+    get:
+      tags: [Notifications]
+      summary: Get a notification connection
+      responses:
+        "200":
+          description: The connection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result: {$ref: "#/components/schemas/Notification"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [Notifications]
+      summary: Change a notification connection
+      requestBody: {$ref: "#/components/requestBodies/Notification"}
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "400":
+          description: "`KeyNotFound` or `InvalidNotificationSettings`."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Notifications]
+      summary: Delete a notification connection
+      responses:
+        "200": {$ref: "#/components/responses/Empty"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /notifications/{notification_id}/test:
+    parameters:
+      - $ref: "#/components/parameters/NotificationId"
+    post:
+      tags: [Notifications]
+      summary: Send a test notification
+      description: A failed send still returns 200, with `success` false.
+      responses:
+        "200":
+          description: The outcome.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      success: {type: boolean}
+                      message: {type: string}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+components:
+  securitySchemes:
+    ApiKey:
+      type: apiKey
+      in: query
+      name: api_key
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: {type: integer}
+    NotificationId:
+      name: notification_id
+      in: path
+      required: true
+      schema: {type: integer}
+    Offset:
+      name: offset
+      in: query
+      description: Number of entries to skip.
+      schema: {type: integer, default: 0}
+
+  requestBodies:
+    Download:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [link, indexer_id, force_match, title_data]
+            properties:
+              link:
+                type: string
+                description: The `link` of a manual search result.
+              indexer_id: {type: integer}
+              force_match:
+                type: boolean
+                description: Download even if the result didn't match.
+              title_data:
+                $ref: "#/components/schemas/FilenameData"
+    Notification:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, provider_type, settings]
+            properties:
+              name: {type: string}
+              provider_type: {$ref: "#/components/schemas/NotificationProvider"}
+              settings:
+                type: object
+                description: Fields from `GET /notifications/providers`.
+              on_download: {type: boolean}
+              on_health_check: {type: boolean}
+              on_volume_add: {type: boolean}
+              on_application_update: {type: boolean}
+              enabled: {type: boolean}
+          example:
+            name: Webhook
+            provider_type: webhook
+            settings: {url: "https://example.com/hook"}
+            on_download: true
+
+  responses:
+    Empty:
+      description: Done.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Ok"
+            properties:
+              result: {type: object, maxProperties: 0}
+    Unauthorized:
+      description: "`ApiKeyInvalid`: the API key is missing or wrong."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    BadRequest:
+      description: |
+        `KeyNotFound` (a required key is missing; `result.key` names it)
+        or `InvalidKeyValue` (`result.key` and `result.value`).
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    NotFound:
+      description: The resource doesn't exist, for example `VolumeNotFound`.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    RateLimited:
+      description: |
+        `MetadataSourceRateLimitReached` or
+        `DownloadServiceRateLimitReached`: try again later.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    Settings:
+      description: All settings.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Ok"
+            properties:
+              result: {$ref: "#/components/schemas/Settings"}
+    TaskPlanning:
+      description: The scheduled tasks.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Ok"
+            properties:
+              result:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    task_name: {type: string}
+                    display_name: {type: string}
+                    description: {type: string}
+                    schedule: {type: string, description: Cron expression}
+                    next_run: {type: integer, description: Epoch seconds}
+                    last_run: {type: [integer, "null"], description: Epoch seconds}
+    RemoteMapping:
+      description: The mapping.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Ok"
+            properties:
+              result: {$ref: "#/components/schemas/RemoteMapping"}
+    Indexer:
+      description: The indexer.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Ok"
+            properties:
+              result: {$ref: "#/components/schemas/Indexer"}
+    ExternalClient:
+      description: The client.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Ok"
+            properties:
+              result: {$ref: "#/components/schemas/ExternalClient"}
+    ClientTest:
+      description: The test outcome. A failed test still returns 200.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Ok"
+            properties:
+              result:
+                type: object
+                properties:
+                  success: {type: boolean}
+                  description: {type: [string, "null"], description: Why it failed}
+    Issue:
+      description: The issue.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Ok"
+            properties:
+              result: {$ref: "#/components/schemas/Issue"}
+    File:
+      description: The file.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Ok"
+            properties:
+              result: {$ref: "#/components/schemas/File"}
+    PathMapping:
+      description: Current path → new path, only for files that would change.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Ok"
+            properties:
+              result:
+                type: object
+                additionalProperties: {type: string}
+    SearchResults:
+      description: The indexer results, matched against the volume or issue.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Ok"
+            properties:
+              result:
+                type: array
+                items: {$ref: "#/components/schemas/SearchResult"}
+    DownloadsAdded:
+      description: The downloads added to the queue (a pack can add several).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Ok"
+            properties:
+              result:
+                type: array
+                items: {$ref: "#/components/schemas/Download"}
+
+  schemas:
+    Ok:
+      type: object
+      required: [error, result]
+      properties:
+        error: {type: "null"}
+        result: {}
+    Error:
+      type: object
+      required: [error, result]
+      properties:
+        error:
+          type: string
+          description: The error name, such as `VolumeNotFound`.
+        result:
+          type: object
+          description: Details, such as the offending `key` and `value`.
+
+    StatusType:
+      type: string
+      enum:
+        - cv_rate_limit
+        - download_service_rate_limit
+        - root_folder_almost_full
+        - root_folder_full
+        - cf_challenge_with_no_fs
+    Status:
+      type: object
+      properties:
+        type: {$ref: "#/components/schemas/StatusType"}
+        display_subtypes:
+          type: array
+          items: {type: string}
+          description: What the warning is about, such as indexer titles.
+
+    TaskCommand:
+      type: string
+      enum:
+        - refresh_and_scan
+        - auto_search
+        - auto_search_issue
+        - mass_rename
+        - mass_rename_issue
+        - mass_convert
+        - mass_convert_issue
+        - update_all
+        - backup_db
+        - rss_sync
+        - sync_issues
+        - refresh_metadata
+        - scan_files
+        - special_version_refresh
+        - search_all
+        - refresh_calendar
+        - search_recent_fresh
+        - search_recent_week
+        - search_recent_stale
+        - health_check
+    Task:
+      type: object
+      properties:
+        id: {type: integer}
+        action: {$ref: "#/components/schemas/TaskCommand"}
+        display_title: {type: string}
+        running: {type: boolean}
+        status: {type: string, enum: [queued, running, paused]}
+        message: {type: string}
+        volume_id: {type: [integer, "null"]}
+        issue_id: {type: [integer, "null"]}
+
+    Settings:
+      type: object
+      description: |
+        Passwords and keys are returned as stored. `auth_password` and
+        `auth_username` are hashes; send plain text to change them.
+      properties:
+        log_level: {type: integer, description: 10 = debug, 20 = info}
+        auth_username: {type: string}
+        auth_password: {type: string}
+        api_key: {type: string, readOnly: true}
+        comicvine_api_key: {type: string}
+        comicvine_api_url: {type: string, description: Fork addition}
+        flaresolverr_base_url: {type: string}
+        host: {type: string}
+        port: {type: integer}
+        url_base: {type: string}
+        proxy_type: {type: [string, "null"], enum: [http, https, socks5, socks5h, null]}
+        proxy_host: {type: string}
+        proxy_port: {type: [integer, "null"]}
+        proxy_username: {type: string}
+        proxy_password: {type: string}
+        proxy_ignored_addresses:
+          type: array
+          items: {type: string}
+        db_backup_amount: {type: integer}
+        db_backup_folder: {type: string}
+        rename_downloaded_files: {type: boolean}
+        replace_illegal_characters: {type: boolean}
+        volume_folder_naming: {type: string}
+        file_naming: {type: string}
+        file_naming_empty: {type: string}
+        file_naming_special_version: {type: string}
+        file_naming_vai: {type: string}
+        long_special_version: {type: boolean}
+        volume_padding: {type: integer}
+        issue_padding: {type: integer}
+        create_empty_volume_folders: {type: boolean}
+        delete_empty_folders: {type: boolean}
+        unmonitor_deleted_issues: {type: boolean}
+        change_file_date: {type: [string, "null"], enum: [issue_release_date, null]}
+        chmod_folder: {type: string}
+        chown_group: {type: string}
+        convert: {type: boolean}
+        extract_issue_ranges: {type: boolean}
+        format_preference:
+          type: array
+          items: {type: string}
+        download_folder: {type: string}
+        concurrent_direct_downloads: {type: integer}
+        failing_download_timeout: {type: integer}
+        seeding_handling: {type: string, enum: [complete, copy]}
+        delete_completed_downloads: {type: boolean}
+        date_type: {type: string, enum: [cover_date, store_date]}
+
+    RootFolder:
+      type: object
+      properties:
+        id: {type: integer}
+        folder: {type: string}
+        size:
+          type: [object, "null"]
+          properties:
+            total: {type: integer}
+            used: {type: integer}
+            free: {type: integer}
+
+    RemoteMapping:
+      type: object
+      properties:
+        id: {type: integer}
+        external_download_client_id: {type: integer}
+        remote_path: {type: string}
+        local_path: {type: string}
+
+    DownloadType:
+      type: integer
+      enum: [1, 2]
+      description: 1 = direct download, 2 = torrent.
+    IndexerInput:
+      type: object
+      properties:
+        download_type: {$ref: "#/components/schemas/DownloadType"}
+        client_type: {type: string, enum: [GetComics, Torznab]}
+        title: {type: string}
+        enabled: {type: boolean}
+        url: {type: string}
+        gc_service_preference:
+          type: [array, "null"]
+          items: {type: string}
+          description: GetComics only. Download services in order of preference.
+        gc_avoid_large_downloads:
+          type: [boolean, "null"]
+          description: GetComics only.
+        api_path: {type: [string, "null"], description: Torznab only}
+        api_key: {type: [string, "null"], description: Torznab only}
+        categories:
+          type: [array, "null"]
+          items: {type: string}
+          description: Torznab only.
+    Indexer:
+      allOf:
+        - $ref: "#/components/schemas/IndexerInput"
+        - type: object
+          properties:
+            id: {type: integer}
+            required_tokens:
+              type: array
+              items: {type: string}
+
+    ExternalClientInput:
+      type: object
+      properties:
+        download_type: {$ref: "#/components/schemas/DownloadType"}
+        client_type: {type: string, enum: [qBittorrent, Transmission]}
+        title: {type: string}
+        enabled: {type: boolean}
+        base_url: {type: string}
+        username: {type: [string, "null"]}
+        password: {type: [string, "null"]}
+        api_token: {type: [string, "null"]}
+    ExternalClient:
+      allOf:
+        - $ref: "#/components/schemas/ExternalClientInput"
+        - type: object
+          properties:
+            id: {type: integer}
+            required_tokens:
+              type: array
+              items: {type: string}
+
+    MonitorScheme:
+      type: string
+      enum: [all, missing, none]
+      default: all
+    SpecialVersion:
+      type: [string, "null"]
+      enum: [tpb, one-shot, hard-cover, omnibus, volume-as-issue, cover, metadata, null]
+      description: "`null` for a normal volume."
+    VolumeSummary:
+      type: object
+      properties:
+        id: {type: integer}
+        comicvine_id: {type: integer}
+        title: {type: string}
+        year: {type: [integer, "null"]}
+        publisher: {type: [string, "null"]}
+        volume_number: {type: integer}
+        description: {type: [string, "null"]}
+        monitored: {type: boolean}
+        monitor_new_issues: {type: boolean}
+        folder: {type: string}
+        issue_count: {type: integer}
+        issue_count_monitored: {type: integer}
+        issues_downloaded: {type: integer}
+        issues_downloaded_monitored: {type: integer}
+        total_size: {type: integer, description: Bytes}
+    Volume:
+      type: object
+      properties:
+        id: {type: integer}
+        comicvine_id: {type: integer}
+        title: {type: string}
+        year: {type: [integer, "null"]}
+        publisher: {type: [string, "null"]}
+        volume_number: {type: integer}
+        special_version: {$ref: "#/components/schemas/SpecialVersion"}
+        special_version_locked: {type: boolean}
+        description: {type: [string, "null"]}
+        site_url: {type: string}
+        monitored: {type: boolean}
+        monitor_new_issues: {type: boolean}
+        folder: {type: string, description: Absolute path}
+        root_folder: {type: integer}
+        volume_folder: {type: string, description: Path inside the root folder}
+        issue_count: {type: integer}
+        issues_downloaded: {type: integer}
+        total_size: {type: integer, description: Bytes}
+        issues:
+          type: array
+          items: {$ref: "#/components/schemas/Issue"}
+        general_files:
+          type: array
+          description: Files that belong to the volume, not an issue.
+          items:
+            allOf:
+              - $ref: "#/components/schemas/File"
+              - type: object
+                properties:
+                  file_type: {type: string, enum: [metadata, cover]}
+    VolumeSearchResult:
+      type: object
+      properties:
+        comicvine_id: {type: integer}
+        title: {type: string}
+        year: {type: [integer, "null"]}
+        volume_number: {type: integer}
+        cover_link: {type: string}
+        description: {type: string}
+        site_url: {type: string}
+        aliases:
+          type: array
+          items: {type: string}
+        publisher: {type: [string, "null"]}
+        issue_count: {type: integer}
+        translated: {type: boolean}
+        already_added:
+          type: [integer, "null"]
+          description: The library ID, if the volume is already added.
+        issues: {type: "null"}
+    Issue:
+      type: object
+      properties:
+        id: {type: integer}
+        volume_id: {type: integer}
+        comicvine_id: {type: integer}
+        issue_number: {type: string}
+        calculated_issue_number: {type: number}
+        title: {type: [string, "null"]}
+        date: {type: [string, "null"], format: date}
+        description: {type: string}
+        monitored: {type: boolean}
+        files:
+          type: array
+          items: {$ref: "#/components/schemas/File"}
+    File:
+      type: object
+      properties:
+        id: {type: integer}
+        filepath: {type: string}
+        size: {type: integer, description: Bytes}
+    FileMatch:
+      type: object
+      properties:
+        filepath: {type: string}
+        issue_ids:
+          type: array
+          items: {type: integer}
+        general_file: {type: boolean}
+        forced_match: {type: boolean}
+
+    FilenameData:
+      type: object
+      description: What was extracted from a release title.
+      properties:
+        series: {type: string}
+        year: {type: [integer, "null"]}
+        volume_number:
+          description: A number, or `[start, end]` for a range.
+          oneOf:
+            - {type: integer}
+            - {type: array, items: {type: integer}, minItems: 2, maxItems: 2}
+            - {type: "null"}
+        special_version: {type: [string, "null"]}
+        issue_number:
+          description: A number, or `[start, end]` for a range.
+          oneOf:
+            - {type: number}
+            - {type: array, items: {type: number}, minItems: 2, maxItems: 2}
+            - {type: "null"}
+        annual: {type: boolean}
+    SearchResult:
+      allOf:
+        - $ref: "#/components/schemas/FilenameData"
+        - type: object
+          properties:
+            link: {type: string}
+            display_title: {type: string}
+            size: {type: integer, description: Bytes}
+            indexer_id: {type: integer}
+            indexer_title: {type: string}
+            seeders: {type: [integer, "null"]}
+            leechers: {type: [integer, "null"]}
+            match: {type: boolean}
+            match_issue:
+              type: [string, "null"]
+              description: Why the result didn't match.
+
+    DownloadService:
+      type: string
+      enum: [Mega, MediaFire, WeTransfer, Pixeldrain, GetComics, "GetComics (torrent)", Torrent]
+    Download:
+      type: object
+      properties:
+        id: {type: integer}
+        volume_id: {type: integer}
+        issue_id: {type: [integer, "null"]}
+        web_link: {type: [string, "null"]}
+        web_title: {type: [string, "null"]}
+        web_sub_title: {type: [string, "null"]}
+        download_link: {type: string}
+        pure_link: {type: string}
+        download_service: {$ref: "#/components/schemas/DownloadService"}
+        source_name: {type: string}
+        type:
+          type: string
+          enum: [direct, mf, mf_folder, mega, mega_folder, pd, pd_folder, torrent, wt]
+        file: {type: string}
+        title: {type: string}
+        download_folder: {type: string}
+        size: {type: integer, description: Bytes; -1 if unknown}
+        status:
+          type: string
+          enum: [queued, paused, downloading, seeding, importing, failed, canceled, shutting down]
+        progress:
+          type: number
+          description: Percentage, or bytes downloaded when `size` is -1.
+        speed: {type: number, description: Bytes per second}
+        client:
+          type: [integer, "null"]
+          description: Torrents only. The torrent client ID.
+
+    BlocklistEntry:
+      type: object
+      properties:
+        id: {type: integer}
+        volume_id: {type: [integer, "null"]}
+        issue_id: {type: [integer, "null"]}
+        web_link: {type: [string, "null"]}
+        web_title: {type: [string, "null"]}
+        web_sub_title: {type: [string, "null"]}
+        download_link: {type: [string, "null"]}
+        download_service: {type: [string, "null"]}
+        reason: {type: string, enum: [link_broken, no_working_links, added_by_user]}
+        added_at: {type: integer, description: Epoch seconds}
+
+    Credential:
+      type: object
+      properties:
+        id: {type: integer}
+        source: {type: string, enum: [mega, pixeldrain]}
+        username: {type: [string, "null"]}
+        email: {type: [string, "null"]}
+        password: {type: [string, "null"], description: Masked}
+        api_key: {type: [string, "null"]}
+
+    CalendarIssue:
+      type: object
+      properties:
+        comicvine_id: {type: integer, description: ComicVine issue ID}
+        volume_id: {type: integer, description: ComicVine volume ID}
+        volume_name: {type: string}
+        issue_number: {type: string}
+        title: {type: [string, "null"]}
+        store_date: {type: [string, "null"], format: date}
+        cover_date: {type: [string, "null"], format: date}
+        effective_date: {type: string, format: date, description: The date the issue is grouped by}
+        image_url: {type: [string, "null"]}
+        publisher_name: {type: [string, "null"]}
+        publisher_id: {type: [integer, "null"]}
+        parent_publisher_name: {type: [string, "null"]}
+        parent_publisher_id: {type: [integer, "null"]}
+        site_url: {type: [string, "null"]}
+        in_library: {type: boolean, description: The volume is in the library}
+        monitored: {type: boolean, description: The issue is monitored}
+        volume_monitored: {type: boolean}
+        volume_id_local: {type: [integer, "null"], description: Library volume ID}
+        issue_id_local: {type: [integer, "null"], description: Library issue ID}
+        has_files: {type: boolean}
+
+    NotificationProvider:
+      type: string
+      enum: [apprise, custom_script, discord, prowl, webhook]
+    Notification:
+      type: object
+      properties:
+        id: {type: integer}
+        name: {type: string}
+        provider_type: {$ref: "#/components/schemas/NotificationProvider"}
+        settings: {type: object}
+        on_download: {type: boolean}
+        on_health_check: {type: boolean}
+        on_volume_add: {type: boolean}
+        on_application_update: {type: boolean}
+        enabled: {type: boolean}

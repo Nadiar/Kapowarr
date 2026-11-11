@@ -154,3 +154,8 @@ def ui_general():
 @ui.route('/settings/notifications', methods=methods)
 def ui_notifications():
     return render('settings_notifications.html')
+
+
+@ui.route('/api-docs', methods=methods)
+def ui_api_docs():
+    return render('api_docs.html')
