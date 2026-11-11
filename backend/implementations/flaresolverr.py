@@ -199,27 +199,14 @@ class FlareSolverr:
         """
         return self.base_url is not None
 
-    def get_ua_cookies(self, url: str) -> Tuple[str, str]:
-        """Get the user agent and cookies for a certain URL. The UA and cookies
-        can be cleared by CF, so use them to avoid challenges. In case the URL
-        is not CF protected, or hasn't explicitly been cleared yet, then the
-        default UA is returned and no cookie definitions.
+    def get_clearance(self, url: str) -> Tuple[str, str]:
+        """Get the user agent and clearance cookie value to send to the site
+        of a URL. A site that CF cleared earlier gets the UA and cookie that
+        passed the challenge, so it isn't challenged again. Otherwise the
+        default UA and an empty cookie are returned.
 
         Args:
             url (str): The URL to get the UA and cookie for.
-
-        Returns:
-            Tuple[str, str]: First element is the UA, or default UA. Second
-                element is the clearance cookie value.
-        """
-        return FSCache.get_ua_cookies(url)
-
-    def get_clearance(self, url: str) -> Tuple[str, str]:
-        """Get the user agent and clearance cookie value to retry a request
-        with, after `handle_cf_block()` cleared its site.
-
-        Args:
-            url (str): The URL to get the clearance for.
 
         Returns:
             Tuple[str, str]: The UA and the value of the cf_clearance cookie.

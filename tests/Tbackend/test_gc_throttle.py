@@ -54,7 +54,7 @@ class TestAsyncSession429Logic(unittest.TestCase):
         """
         session = AsyncSession.__new__(AsyncSession)
         fs = MagicMock()
-        fs.get_ua_cookies.return_value = ('test-ua', {})
+        fs.get_clearance.return_value = ('test-ua', '')
         fs.handle_cf_block_async = AsyncMock(return_value=None)
         object.__setattr__(session, 'fs', fs)
         # session.headers -> session._default_headers (aiohttp property)

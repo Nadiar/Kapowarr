@@ -115,6 +115,16 @@ class TestClearanceRetry(ClearanceRetryTestCase):
                          (200, b'FILE'))
         self.assertEqual(self.server.solve_requests, [self.base + '/'])
 
+    def test_later_requests_reuse_the_clearance_without_solving_again(self):
+        self.fetch_async()
+        status, body = self.fetch_async()
+        with Session() as session:
+            response = session.get(self.file_url)
+
+        self.assertEqual((status, body), (200, b'FILE'))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.server.solve_requests), 1)
+
     def test_clearance_that_does_not_work_puts_the_site_on_cooldown(self):
         self.server.accept_clearance = False
 
