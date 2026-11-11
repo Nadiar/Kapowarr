@@ -5,6 +5,7 @@ from __future__ import annotations
 from os import listdir
 from os.path import basename, join
 from sqlite3 import OperationalError
+from threading import Lock
 from time import sleep
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Tuple, Union
 
@@ -106,6 +107,7 @@ class DownloadHandler(metaclass=Singleton):
     def __init__(self) -> None:
         """Setup the download handler"""
         self.settings = Settings()
+        self._queue_lock = Lock()
         create_folder(self.settings.sv.download_folder)
         return
 
@@ -656,25 +658,31 @@ class DownloadHandler(metaclass=Singleton):
         This can safely be called at any point in time and with the queue in
         any state.
         """
-        active_downloads = 0
-        max_downloads = self.settings.sv.concurrent_direct_downloads
-        for download in self.queue:
-            if isinstance(download, ExternalDownload):
-                continue
+        # Download threads and tasks call this at the same time. Without the
+        # lock, two calls can start the same thread.
+        with self._queue_lock:
+            active_downloads = 0
+            max_downloads = self.settings.sv.concurrent_direct_downloads
+            for download in self.queue:
+                if isinstance(download, ExternalDownload):
+                    continue
 
-            if download.state == DownloadState.DOWNLOADING_STATE:
-                active_downloads += 1
+                if download.state == DownloadState.DOWNLOADING_STATE:
+                    active_downloads += 1
 
-            elif (
-                download.state == DownloadState.QUEUED_STATE
-                and active_downloads < max_downloads
-            ):
-                if download.download_thread is not None:
-                    download.download_thread.start()
-                active_downloads += 1
+                elif (
+                    download.state == DownloadState.QUEUED_STATE
+                    and active_downloads < max_downloads
+                ):
+                    # A thread that's started is still QUEUED until it
+                    # reaches download.run(). Starting it again would raise.
+                    thread = download.download_thread
+                    if thread is not None and thread.ident is None:
+                        thread.start()
+                    active_downloads += 1
 
-            if active_downloads >= max_downloads:
-                break
+                if active_downloads >= max_downloads:
+                    break
 
         return
 
