@@ -206,7 +206,7 @@ class GetComicsIndexer(BaseIndexerClient):
         )
         self.request_count += 1
         if not page:
-            return QueryResult([], next_page_available=False)
+            return QueryResult([], next_page_available=False, errored=True)
 
         soup = BeautifulSoup(page, "html.parser")
 

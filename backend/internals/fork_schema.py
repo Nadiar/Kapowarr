@@ -41,6 +41,17 @@ CREATE TABLE IF NOT EXISTS volume_search_stats(
     FOREIGN KEY (volume_id) REFERENCES volumes(id)
         ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS issue_search_log(
+    issue_id INTEGER PRIMARY KEY,
+    last_searched INTEGER NOT NULL DEFAULT 0,
+    last_outcome TEXT NOT NULL DEFAULT '',
+    consecutive_misses INTEGER NOT NULL DEFAULT 0,
+    times_searched INTEGER NOT NULL DEFAULT 0,
+    last_queued INTEGER NOT NULL DEFAULT 0,
+
+    FOREIGN KEY (issue_id) REFERENCES issues(id)
+        ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS volume_publisher_cache(
     comicvine_id INTEGER PRIMARY KEY,
     volume_name TEXT NOT NULL DEFAULT '',

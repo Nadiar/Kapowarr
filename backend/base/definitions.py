@@ -985,6 +985,8 @@ class QueryKeys:
 class QueryResult:
     results: List[SearchResultData]
     next_page_available: bool
+    errored: bool = False
+    "The indexer couldn't be searched, so no results doesn't mean none exist"
 
 
 @dataclass

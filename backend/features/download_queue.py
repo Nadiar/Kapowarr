@@ -8,7 +8,6 @@ from time import sleep
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Tuple, Union
 
 from requests.exceptions import RetryError
-
 from typing_extensions import assert_never
 
 from backend.base.custom_exceptions import (ClientNotWorking,
@@ -237,16 +236,35 @@ class DownloadHandler(metaclass=Singleton):
 
     def add_multiple(self, add_args: Iterable[Tuple[
         str, int, FilenameData, int, Union[int, None], bool
-    ]]) -> None:
+    ]]) -> List[Tuple[str, int, FilenameData, int, Union[int, None], bool]]:
+        """Add multiple downloads to the queue. One that fails is skipped, so
+        it can't keep the others from being added.
+
+        Args:
+            add_args (Iterable[Tuple[str, int, FilenameData, int, Union[int, None], bool]]):
+                The arguments for `add()` of each download.
+
+        Returns:
+            List[Tuple[str, int, FilenameData, int, Union[int, None], bool]]:
+                The arguments of the downloads that are now in the queue.
+        """
+        added = []
         for entry in add_args:
             try:
                 self.add(*entry)
+                commit()
+                added.append(entry)
+
             except EnqueuingDownloadFailure:
                 pass
 
-            commit()
+            except Exception:
+                LOGGER.exception(
+                    'Failed to add download %s to the queue: ', entry[0]
+                )
+
             sleep(1.0)
-        return
+        return added
 
     def __load_downloads(self) -> None:
         """

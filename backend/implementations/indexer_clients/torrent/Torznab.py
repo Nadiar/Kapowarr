@@ -127,7 +127,7 @@ class TorznabIndexer(BaseIndexerClient):
             quiet_fail=True
         )
         if not results:
-            return QueryResult([], next_page_available=False)
+            return QueryResult([], next_page_available=False, errored=True)
 
         formatted_results: List[SearchResultData] = []
         for item in ElementTree.XML(results).iter("item"):

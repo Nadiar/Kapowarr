@@ -6,30 +6,34 @@ from abc import abstractmethod
 from asyncio import run
 from datetime import date, timedelta
 from time import sleep, time
-from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Set, Tuple,
-                    Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Dict, Iterable,
+                    List, Set, Tuple, Type, TypeVar, Union)
 
 from backend.base.custom_exceptions import (CredentialInvalid, InvalidKeyValue,
                                             MetadataSourceNotWorking,
                                             TaskNotFound)
 from backend.base.definitions import (BlocklistReasonID, FilenameData,
                                       QueuedTaskData, SearchResultData, Task)
-from backend.base.helpers import Singleton, get_schedules_next_run
+from backend.base.helpers import Singleton, force_range, get_schedules_next_run
 from backend.base.logging import LOGGER
 from backend.features.download_queue import DownloadHandler
 from backend.features.search_discover import discover_downloads
-from backend.features.search_full import auto_search
+from backend.features.search_full import AutoSearchOutcome, auto_search_outcome
 from backend.implementations.comicvine import ComicVine
 from backend.implementations.conversion import mass_convert
 from backend.implementations.file_matching import scan_files
 from backend.implementations.naming import mass_rename
-from backend.implementations.volumes import (Volume,
-                                             determine_special_version,
+from backend.implementations.volumes import (Volume, determine_special_version,
                                              refresh_and_scan,
                                              update_volume_metadata,
                                              upsert_issues)
 from backend.internals.db import commit, get_db
 from backend.internals.db_backup_import import backup_database
+from backend.internals.db_models_search_stats import (IssueSearchOutcome,
+                                                      get_search_all_volumes,
+                                                      record_issue_searches,
+                                                      record_search_hit,
+                                                      record_search_miss)
 from backend.internals.server import (Server, TaskAddedEvent, TaskEndedEvent,
                                       TaskStatusEvent, WebSocket)
 
@@ -630,27 +634,8 @@ class AutoSearchIssue(DownloadTask):
         self.message = f'Searching for {volume_title} #{issue_number}'
         WebSocket().emit(TaskStatusEvent(self.message))
 
-        # Get search results and download them
-        results = auto_search(self._volume_id, self._issue_id)
-        downloads: List[Tuple[
-            str, int, FilenameData, int, Union[int, None]
-        ]] = []
-        for result in results:
-            title_data: FilenameData = {
-                "series": result["series"],
-                "year": result["year"],
-                "volume_number": result["volume_number"],
-                "special_version": result["special_version"],
-                "issue_number": result["issue_number"],
-                "annual": result["annual"]
-            }
-            downloads.append((
-                result['link'], result["indexer_id"],
-                title_data,
-                self._volume_id, self._issue_id
-            ))
-
-        return downloads
+        _search_and_queue(self, self._volume_id, self._issue_id)
+        return []
 
 
 @TaskHandler.register_task('mass_rename_issue')
@@ -794,27 +779,8 @@ class AutoSearchVolume(DownloadTask):
         self.message = f'Searching for {volume_title}'
         WebSocket().emit(TaskStatusEvent(self.message))
 
-        # Get search results and download them
-        results = auto_search(self._volume_id)
-        downloads: List[Tuple[
-            str, int, FilenameData, int, Union[int, None]
-        ]] = []
-        for result in results:
-            title_data: FilenameData = {
-                "series": result["series"],
-                "year": result["year"],
-                "volume_number": result["volume_number"],
-                "special_version": result["special_version"],
-                "issue_number": result["issue_number"],
-                "annual": result["annual"]
-            }
-            downloads.append((
-                result['link'], result["indexer_id"],
-                title_data,
-                self._volume_id, None
-            ))
-
-        return downloads
+        _search_and_queue(self, self._volume_id)
+        return []
 
 
 @TaskHandler.register_task('refresh_and_scan')
@@ -1121,6 +1087,100 @@ def _results_to_downloads(
     return downloads
 
 
+def _search_and_queue(
+    task: Task,
+    volume_id: int,
+    issue_id: Union[int, None] = None
+) -> int:
+    """Search for the open issues of a volume, or for one issue, and queue
+    the chosen downloads right away, so a task that is interrupted later
+    keeps what it found. Logs the outcome per issue and for the volume.
+
+    Args:
+        task (Task): The calling task. Yields to higher-priority tasks
+            between downloads and stops when asked to.
+        volume_id (int): The ID of the volume to search for.
+        issue_id (Union[int, None], optional): The ID of the issue to search
+            for instead of the whole volume.
+            Defaults to None.
+
+    Returns:
+        int: The number of downloads that were queued.
+    """
+    outcome = auto_search_outcome(volume_id, issue_id)
+
+    handler = DownloadHandler()
+    queued: List[
+        Tuple[str, int, FilenameData, int, Union[int, None], bool]
+    ] = []
+    for download in _results_to_downloads(
+        outcome.results, volume_id, issue_id
+    ):
+        task.check_yield()
+        if task.stop:
+            break
+        queued += handler.add_multiple([(*download, False)])
+
+    _record_search_outcome(
+        volume_id, outcome, [download[2] for download in queued]
+    )
+    return len(queued)
+
+
+def _covers_issue(
+    title_datas: Iterable[FilenameData],
+    calculated_issue_number: float
+) -> bool:
+    """Whether any of the releases contains the issue. A special version
+    (e.g. a TPB) or a release without issue number covers every issue.
+    """
+    for title_data in title_datas:
+        if (
+            title_data["special_version"]
+            or title_data["issue_number"] is None
+        ):
+            return True
+
+        start, end = force_range(title_data["issue_number"])
+        if start <= calculated_issue_number <= end:
+            return True
+    return False
+
+
+def _record_search_outcome(
+    volume_id: int,
+    outcome: AutoSearchOutcome,
+    queued: List[FilenameData]
+) -> None:
+    """Log how the search went for each searched issue and for the volume.
+    A search that failed is neither a hit nor a miss.
+
+    Args:
+        volume_id (int): The ID of the searched volume.
+        outcome (AutoSearchOutcome): The outcome of the search.
+        queued (List[FilenameData]): The releases that were queued.
+    """
+    found: List[FilenameData] = list(outcome.results) # type: ignore
+    issue_outcomes: Dict[int, IssueSearchOutcome] = {}
+    for searched_issue_id, number in outcome.searched_issues:
+        if _covers_issue(queued, number):
+            issue_outcomes[searched_issue_id] = IssueSearchOutcome.QUEUED
+        elif _covers_issue(found, number):
+            issue_outcomes[searched_issue_id] = IssueSearchOutcome.FOUND
+        elif outcome.errored:
+            issue_outcomes[searched_issue_id] = IssueSearchOutcome.ERROR
+        else:
+            issue_outcomes[searched_issue_id] = IssueSearchOutcome.NOT_FOUND
+
+    record_issue_searches(issue_outcomes)
+
+    if queued:
+        record_search_hit(volume_id)
+    elif not outcome.errored:
+        record_search_miss(volume_id)
+    return
+
+
 # region Fork library tasks
 @TaskHandler.register_task('sync_issues')
 class SyncIssues(LibraryTask):
@@ -1351,7 +1411,8 @@ class SearchAll(LibraryTask, DownloadTask):
     priority = 5
     description = (
         'Searches for missing issues across every monitored volume in the'
-        ' library. Volumes with recent consecutive misses are deprioritised.'
+        ' library, starting with the volumes whose newest missing issue came'
+        ' out most recently. Downloads are queued as they are found.'
     )
 
     @property
@@ -1366,51 +1427,19 @@ class SearchAll(LibraryTask, DownloadTask):
         return
 
     def run(self) -> List[Tuple[str, int, FilenameData, int, Union[int, None]]]:
-        from backend.internals.db_models_search_stats import (
-            get_total_volume_count, record_search_hit, record_search_miss)
-
-        # Only search volumes that have at least one open issue (monitored
-        # issue with no file). Volumes with fewer consecutive misses are
-        # searched first; within the same miss count, newer volumes (higher
-        # ID) first. vol_count scales the penalty so one miss pushes a volume
-        # behind all untested ones.
-        vol_count = get_total_volume_count()
-        volumes = get_db(force_new=True).execute(
-            """
-            SELECT DISTINCT v.id, v.title,
-                (v.id - COALESCE(vss.consecutive_misses, 0) * :vol_count)
-                    AS priority
-            FROM volumes v
-            INNER JOIN issues i ON i.volume_id = v.id
-            LEFT JOIN issues_files if_ ON if_.issue_id = i.id
-            LEFT JOIN volume_search_stats vss ON vss.volume_id = v.id
-            WHERE v.monitored = 1
-              AND i.monitored = 1
-              AND if_.issue_id IS NULL
-            ORDER BY priority DESC;
-            """,
-            {'vol_count': vol_count}
-        ).fetchall()
-
-        downloads: List[
-            Tuple[str, int, FilenameData, int, Union[int, None]]
-        ] = []
+        # Downloads are queued per volume as the search goes, so they start
+        # right away and survive the task being interrupted.
         ws = WebSocket()
-        for volume_id, volume_title, _priority in volumes:
+        for volume_id, volume_title in get_search_all_volumes():
             self.check_yield()
             if self.stop:
                 break
             self.message = f'Searching for {volume_title}'
             ws.emit(TaskStatusEvent(self.message))
 
-            results = auto_search(volume_id)
-            if results:
-                record_search_hit(volume_id)
-                downloads += _results_to_downloads(results, volume_id, None)
-            else:
-                record_search_miss(volume_id)
+            _search_and_queue(self, volume_id)
 
-        return downloads
+        return []
 
 
 # region Fork calendar tasks
@@ -1738,9 +1767,7 @@ def _run_search_recent(
                 f'#{issue.get("issue_number", "?")}'
             )
             ws.emit(TaskStatusEvent(task.message))
-            downloads += _results_to_downloads(
-                auto_search(vol_id, iss_id), vol_id, iss_id
-            )
+            _search_and_queue(task, vol_id, iss_id)
             continue
 
         # Issue not yet in local DB. Refresh the volume first so the issue
@@ -1777,9 +1804,7 @@ def _run_search_recent(
             f'#{issue.get("issue_number", "?")}'
         )
         ws.emit(TaskStatusEvent(task.message))
-        downloads += _results_to_downloads(
-            auto_search(vol_id, local_iss_id), vol_id, local_iss_id
-        )
+        _search_and_queue(task, vol_id, local_iss_id)
 
     if run_packs and not task.stop:
         try:

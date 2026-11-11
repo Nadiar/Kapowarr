@@ -1,5 +1,5 @@
 """
-Unit tests for volume_search_stats recording and priority scoring.
+Unit tests for volume_search_stats recording.
 
 Uses an in-memory SQLite database with the real schema so we can verify
 SQL upsert, increment, and reset logic without a live Kapowarr instance.
@@ -197,44 +197,6 @@ class TestResetMisses(unittest.TestCase):
 
             # Should not raise
             reset_misses(999)
-
-
-# ---------------------------------------------------------------------------
-# Tests: get_total_volume_count
-# ---------------------------------------------------------------------------
-
-class TestGetTotalVolumeCount(unittest.TestCase):
-
-    def setUp(self) -> None:
-        self.cursor = _make_cursor()
-
-    def test_counts_only_monitored_volumes(self) -> None:
-        """Only monitored volumes should be counted."""
-        _insert_volume(self.cursor, 1, monitored=1)
-        _insert_volume(self.cursor, 2, monitored=1)
-        _insert_volume(self.cursor, 3, monitored=0)  # not monitored
-
-        with patch(
-            'backend.internals.db_models_search_stats.get_db',
-            return_value=self.cursor
-        ):
-            from backend.internals.db_models_search_stats import \
-                get_total_volume_count
-            count = get_total_volume_count()
-
-        self.assertEqual(count, 2)
-
-    def test_zero_when_no_volumes(self) -> None:
-        """Returns 0 when there are no monitored volumes."""
-        with patch(
-            'backend.internals.db_models_search_stats.get_db',
-            return_value=self.cursor
-        ):
-            from backend.internals.db_models_search_stats import \
-                get_total_volume_count
-            count = get_total_volume_count()
-
-        self.assertEqual(count, 0)
 
 
 # ---------------------------------------------------------------------------

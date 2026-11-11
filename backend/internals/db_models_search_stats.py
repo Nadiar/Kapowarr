@@ -1,16 +1,32 @@
 # -*- coding: utf-8 -*-
 
 """
-Database helpers for tracking per-volume search outcomes.
+Database helpers for tracking search outcomes per volume and per issue.
 
 Records hit/miss results per volume so SearchAll can deprioritise volumes
-that consistently yield no results, reducing pointless search traffic.
+that consistently yield no results, and logs when each issue was last
+searched and what came of it.
 """
 
 import time
-from typing import Union
+from enum import Enum
+from typing import List, Mapping, Tuple
 
 from backend.internals.db import get_db
+
+
+class IssueSearchOutcome(Enum):
+    QUEUED = 'queued'
+    "A download for the issue was queued"
+
+    FOUND = 'found'
+    "The issue was found, but no download for it could be queued"
+
+    NOT_FOUND = 'not_found'
+    "The search worked, but found nothing for the issue"
+
+    ERROR = 'error'
+    "An indexer couldn't be searched, so the issue may exist"
 
 
 def record_search_hit(volume_id: int) -> None:
@@ -87,18 +103,80 @@ def reset_misses(volume_id: int) -> None:
         )
 
 
-def get_total_volume_count() -> int:
-    """Return the count of monitored volumes.
+def record_issue_searches(
+    outcomes: Mapping[int, IssueSearchOutcome]
+) -> None:
+    """Log the outcome of searching for each issue.
 
-    Used by SearchAll to compute the priority penalty per consecutive miss:
-        priority = v.id - (consecutive_misses * total_volume_count)
+    Only a search that worked and found nothing counts as a miss. A queued
+    download resets the misses, and a failed search leaves them as they are.
+
+    Args:
+        outcomes (Mapping[int, IssueSearchOutcome]): Issue ID to its outcome.
+    """
+    if not outcomes:
+        return
+
+    ts = int(time.time())
+    cursor = get_db()
+    with cursor:
+        cursor.executemany(
+            """
+            INSERT INTO issue_search_log(
+                issue_id, last_searched, last_outcome,
+                consecutive_misses, times_searched, last_queued
+            ) VALUES (
+                :issue_id, :ts, :outcome,
+                :outcome = 'not_found', 1,
+                CASE WHEN :outcome = 'queued' THEN :ts ELSE 0 END
+            )
+            ON CONFLICT(issue_id) DO UPDATE SET
+                last_searched = :ts,
+                last_outcome = :outcome,
+                consecutive_misses = CASE :outcome
+                    WHEN 'not_found' THEN consecutive_misses + 1
+                    WHEN 'queued' THEN 0
+                    ELSE consecutive_misses
+                END,
+                times_searched = times_searched + 1,
+                last_queued = CASE
+                    WHEN :outcome = 'queued' THEN :ts
+                    ELSE last_queued
+                END;
+            """,
+            (
+                {'issue_id': issue_id, 'ts': ts, 'outcome': outcome.value}
+                for issue_id, outcome in outcomes.items()
+            )
+        )
+    return
+
+
+def get_search_all_volumes() -> List[Tuple[int, str]]:
+    """Get the monitored volumes with missing issues, in the order SearchAll
+    should search them: the newest already released missing issue first.
+    Volumes whose missing issues are all unreleased or undated go last. Ties
+    go to fewer consecutive misses, then the most recently added volume.
 
     Returns:
-        int: Number of monitored volumes (0 if none).
+        List[Tuple[int, str]]: The ID and title of each volume.
     """
-    row = get_db().execute(
-        "SELECT COUNT(*) FROM volumes WHERE monitored = 1;"
-    ).fetchone()
-    if row is None:
-        return 0
-    return int(row[0])
+    rows = get_db().execute(
+        """
+        SELECT v.id, v.title
+        FROM volumes v
+        INNER JOIN issues i ON i.volume_id = v.id
+        LEFT JOIN issues_files if_ ON if_.issue_id = i.id
+        LEFT JOIN volume_search_stats vss ON vss.volume_id = v.id
+        WHERE v.monitored = 1
+            AND i.monitored = 1
+            AND if_.issue_id IS NULL
+        GROUP BY v.id
+        ORDER BY
+            MAX(CASE WHEN i.date <= DATE('now') THEN i.date END) IS NULL,
+            MAX(CASE WHEN i.date <= DATE('now') THEN i.date END) DESC,
+            COALESCE(vss.consecutive_misses, 0),
+            v.id DESC;
+        """
+    ).fetchall()
+    return [(r[0], r[1]) for r in rows]

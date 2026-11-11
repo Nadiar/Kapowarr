@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from asyncio import gather, run
+from dataclasses import dataclass
 from typing import Dict, List, Set, Tuple, TypedDict, TypeVar, Union
 
 from backend.base.definitions import (IndexerClient, IssueData,
@@ -23,6 +24,18 @@ class IndexerTeam(TypedDict):
     indexer: IndexerClient
     query_builder: QueryBuilder
     search_action_planner: SearchActionPlanner
+
+
+@dataclass
+class AutoSearchOutcome:
+    results: List[MatchedSearchResultData]
+    "The chosen search results"
+
+    searched_issues: List[Tuple[int, float]]
+    "The ID and calculated issue number of each issue that was searched for"
+
+    errored: bool
+    "An indexer couldn't be searched, so the results may be incomplete"
 
 
 class SearchCoordinator:
@@ -55,6 +68,7 @@ class SearchCoordinator:
         self.found_results: List[MatchedSearchResultData] = []
         self.found_links: Set[str] = set()
         self.is_issue_search = len(self.wanted_issues) == 1
+        self.errored = False
 
         self.indexers: List[IndexerTeam] = []
         for client in IndexerClients.get_all_clients():
@@ -220,6 +234,8 @@ class SearchCoordinator:
             team["indexer"].search(query)
             for query, team in zip(queries, self.indexers)
         ))
+        if any(r.errored for r in result):
+            self.errored = True
 
         return list(zip(queries, result))
 
@@ -442,6 +458,27 @@ def auto_search(
     Returns:
         List[MatchedSearchResultData]: List with chosen search results.
     """
+    return auto_search_outcome(volume_id, issue_id).results
+
+
+def auto_search_outcome(
+    volume_id: int,
+    issue_id: Union[int, None] = None
+) -> AutoSearchOutcome:
+    """Like `auto_search`, but also report which issues were searched for and
+    whether an indexer failed.
+
+    Args:
+        volume_id (int): The ID of the volume to search for.
+        issue_id (Union[int, None], optional): The ID of the issue to search
+            for, in the case that you want to search for an issue instead of
+            a volume.
+            Defaults to None.
+
+    Returns:
+        AutoSearchOutcome: The chosen results, searched issues and whether
+            the search failed.
+    """
     volume = Volume(volume_id)
     volume_data = volume.get_data()
     volume_issues = volume.get_issues(_skip_files=True)
@@ -473,9 +510,8 @@ def auto_search(
 
     if not searchable_issues:
         # No issues to search for
-        result = []
-        LOGGER.debug(f'Auto search results: {result}')
-        return result
+        LOGGER.debug('Auto search results: []')
+        return AutoSearchOutcome([], [], errored=False)
 
     coordinator = SearchCoordinator(
         volume_id,
@@ -486,6 +522,7 @@ def auto_search(
         for r in run(coordinator.search())
         if r["match"]
     ]
+    searched_issues = [(i[0], i[1]) for i in searchable_issues]
 
     if issue_id is not None or volume_data.special_version not in (
         SpecialVersion.NORMAL,
@@ -494,7 +531,7 @@ def auto_search(
         # We're searching for one "item", so just grab first search result.
         result = search_results[:1] if search_results else []
         LOGGER.debug('Auto search results: %s', result)
-        return result
+        return AutoSearchOutcome(result, searched_issues, coordinator.errored)
 
     # We're searching for a volume, so we might download multiple search results.
     # Find a combination of search results that download the most issues.
@@ -505,4 +542,6 @@ def auto_search(
     )
 
     LOGGER.debug('Auto search results: %s', chosen_downloads)
-    return chosen_downloads
+    return AutoSearchOutcome(
+        chosen_downloads, searched_issues, coordinator.errored
+    )
