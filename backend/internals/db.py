@@ -87,14 +87,23 @@ class KapowarrCursor(Cursor):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Commit the transaction or rollback if an exception occurred"""
-        if self.connection.in_transaction:
-            if exc_type is not None:
-                self.execute("ROLLBACK;")
-            else:
-                self.execute("COMMIT;")
+        """Commit the transaction or rollback if an exception occurred. A
+        failed commit is rolled back too, so the transaction and its write
+        lock never outlive the block."""
+        try:
+            if self.connection.in_transaction:
+                if exc_type is not None:
+                    self.execute("ROLLBACK;")
+                else:
+                    try:
+                        self.execute("COMMIT;")
+                    except Exception:
+                        if self.connection.in_transaction:
+                            self.execute("ROLLBACK;")
+                        raise
 
-        self.connection.isolation_level = "DEFERRED"
+        finally:
+            self.connection.isolation_level = "DEFERRED"
         return
 
 

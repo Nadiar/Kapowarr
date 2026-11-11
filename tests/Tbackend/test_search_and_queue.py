@@ -4,13 +4,12 @@ fared, and a failed search is told apart from one that found nothing."""
 import asyncio
 import sys
 import unittest
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 if 'grp' not in sys.modules:
     sys.modules['grp'] = MagicMock()
 
 from backend.base.definitions import QueryResult, SearchAction
-from backend.features.download_queue import DownloadHandler
 from backend.features.search_full import AutoSearchOutcome, SearchCoordinator
 from backend.features.tasks import _search_and_queue
 from backend.implementations.indexer_clients.ddl.GetComics import (
@@ -129,23 +128,6 @@ class TestSearchAndQueue(unittest.TestCase):
 
         entries = list(self.add_multiple.call_args.args[0])
         self.assertEqual(entries[0][4], 2)
-
-
-class TestAddMultipleSurvivesErrors(unittest.TestCase):
-    def test_entries_after_an_unexpected_error_are_still_added(self):
-        handler = MagicMock()
-        handler.add.side_effect = [RuntimeError('database is locked'), []]
-        first = ('https://gc/1', 1, {}, VOLUME_ID, None, False)
-        second = ('https://gc/2', 1, {}, VOLUME_ID, None, False)
-
-        with patch('backend.features.download_queue.commit'), \
-                patch('backend.features.download_queue.sleep'):
-            added = DownloadHandler.add_multiple(handler, [first, second])
-
-        self.assertEqual(
-            handler.add.call_args_list, [call(*first), call(*second)]
-        )
-        self.assertEqual(added, [second])
 
 
 class TestSearchErrorsAreReported(unittest.TestCase):

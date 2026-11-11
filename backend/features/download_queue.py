@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from os import listdir
 from os.path import basename, join
+from sqlite3 import OperationalError
 from time import sleep
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Tuple, Union
 
@@ -43,6 +44,60 @@ from backend.internals.settings import Settings
 if TYPE_CHECKING:
     from threading import Thread
 
+ADD_ATTEMPTS = 3
+"How often `add_multiple()` tries a download that hits a locked database"
+
+
+def _is_database_locked(error: Exception) -> bool:
+    return isinstance(error, OperationalError) and (
+        'locked' in str(error) or 'busy' in str(error)
+    )
+
+
+def _try_add(
+    handler: DownloadHandler,
+    entry: Tuple[str, int, FilenameData, int, Union[int, None], bool]
+) -> Union[bool, None]:
+    """Add one download to the queue. A failure is rolled back, so it leaves
+    nothing behind that a later commit could save.
+
+    Args:
+        handler (DownloadHandler): The download handler.
+        entry (Tuple[str, int, FilenameData, int, Union[int, None], bool]):
+            The arguments for `add()`.
+
+    Returns:
+        Union[bool, None]: True when added. False when dropped, because of
+            a problem with the download itself. None when only the database
+            was locked, so it's worth trying again.
+    """
+    try:
+        handler.add(*entry)
+        commit()
+        return True
+
+    except EnqueuingDownloadFailure:
+        # The link itself is broken. Keep the blocklist entry add() made.
+        try:
+            commit()
+        except OperationalError:
+            get_db().connection.rollback()
+        return False
+
+    except Exception as error:
+        get_db().connection.rollback()
+        if _is_database_locked(error):
+            LOGGER.warning(
+                'Database locked while adding download %s, will retry',
+                entry[0]
+            )
+            return None
+
+        LOGGER.exception(
+            'Failed to add download %s to the queue: ', entry[0]
+        )
+        return False
+
 
 class DownloadHandler(metaclass=Singleton):
     queue: List[Download] = []
@@ -71,55 +126,68 @@ class DownloadHandler(metaclass=Singleton):
         Returns:
             List[Download]: The downloads, now prepared.
         """
-        cursor = get_db()
+        # Save the rows of all new downloads in one transaction before any
+        # of them goes live, so a failure leaves nothing half-added behind.
+        new_downloads: List[Download] = []
         for download in downloads:
             if download.id is None:
-                if isinstance(download, ExternalDownload):
-                    external_client_id = download.external_client.id
-                else:
-                    external_client_id = None
+                new_downloads.append(download)
+        new_ids: List[int] = []
+        if new_downloads:
+            cursor = get_db()
+            with cursor:
+                for download in new_downloads:
+                    if isinstance(download, ExternalDownload):
+                        external_client_id = download.external_client.id
+                    else:
+                        external_client_id = None
 
-                if isinstance(download.covered_issues, tuple):
-                    covered_issues = str(CommaList(
-                        map(str, download.covered_issues)
-                    ))
+                    if isinstance(download.covered_issues, tuple):
+                        covered_issues = str(CommaList(
+                            map(str, download.covered_issues)
+                        ))
 
-                elif isinstance(download.covered_issues, float):
-                    covered_issues = str(download.covered_issues)
+                    elif isinstance(download.covered_issues, float):
+                        covered_issues = str(download.covered_issues)
 
-                else:
-                    covered_issues = None
+                    else:
+                        covered_issues = None
 
-                download.id = cursor.execute(
-                    """
-                    INSERT INTO download_queue(
-                        volume_id, client_type, external_client_id,
-                        download_link, covered_issues, force_original_name,
-                        source_type, source_name,
-                        web_link, web_title, web_sub_title
-                    )
-                    VALUES (
-                        :volume_id, :client_type, :external_client_id,
-                        :download_link, :covered_issues, :force_original_name,
-                        :source_type, :source_name,
-                        :web_link, :web_title, :web_sub_title
-                    );
-                    """,
-                    {
-                        'volume_id': download.volume_id,
-                        'client_type': download.identifier.value,
-                        'external_client_id': external_client_id,
-                        'download_link': download.download_link,
-                        'covered_issues': covered_issues,
-                        'force_original_name': forced_match,
-                        'source_type': download.download_service.value,
-                        'source_name': download.source_name,
-                        'web_link': download.web_link,
-                        'web_title': download.web_title,
-                        'web_sub_title': download.web_sub_title
-                    }
-                ).lastrowid
+                    download_id = cursor.execute(
+                        """
+                        INSERT INTO download_queue(
+                            volume_id, client_type, external_client_id,
+                            download_link, covered_issues, force_original_name,
+                            source_type, source_name,
+                            web_link, web_title, web_sub_title
+                        )
+                        VALUES (
+                            :volume_id, :client_type, :external_client_id,
+                            :download_link, :covered_issues, :force_original_name,
+                            :source_type, :source_name,
+                            :web_link, :web_title, :web_sub_title
+                        );
+                        """,
+                        {
+                            'volume_id': download.volume_id,
+                            'client_type': download.identifier.value,
+                            'external_client_id': external_client_id,
+                            'download_link': download.download_link,
+                            'covered_issues': covered_issues,
+                            'force_original_name': forced_match,
+                            'source_type': download.download_service.value,
+                            'source_name': download.source_name,
+                            'web_link': download.web_link,
+                            'web_title': download.web_title,
+                            'web_sub_title': download.web_sub_title
+                        }
+                    ).lastrowid
+                    new_ids.append(download_id)
 
+        for download, download_id in zip(new_downloads, new_ids):
+            download.id = download_id
+
+        for download in downloads:
             if not isinstance(download, ExternalDownload):
                 download.download_thread = Server().get_db_thread(
                     target=self.__run_download,
@@ -237,8 +305,10 @@ class DownloadHandler(metaclass=Singleton):
     def add_multiple(self, add_args: Iterable[Tuple[
         str, int, FilenameData, int, Union[int, None], bool
     ]]) -> List[Tuple[str, int, FilenameData, int, Union[int, None], bool]]:
-        """Add multiple downloads to the queue. One that fails is skipped, so
-        it can't keep the others from being added.
+        """Add multiple downloads to the queue. A download with a problem of
+        its own is dropped without affecting the others. One that only hit a
+        locked database is tried again after the rest, up to `ADD_ATTEMPTS`
+        times.
 
         Args:
             add_args (Iterable[Tuple[str, int, FilenameData, int, Union[int, None], bool]]):
@@ -249,21 +319,29 @@ class DownloadHandler(metaclass=Singleton):
                 The arguments of the downloads that are now in the queue.
         """
         added = []
-        for entry in add_args:
-            try:
-                self.add(*entry)
-                commit()
-                added.append(entry)
+        pending = list(add_args)
+        for attempt in range(1, ADD_ATTEMPTS + 1):
+            locked = []
+            for entry in pending:
+                outcome = _try_add(self, entry)
+                if outcome:
+                    added.append(entry)
+                elif outcome is None:
+                    locked.append(entry)
+                sleep(1.0)
 
-            except EnqueuingDownloadFailure:
-                pass
+            pending = locked
+            if not pending:
+                break
+            if attempt < ADD_ATTEMPTS:
+                sleep(5.0 * attempt)
 
-            except Exception:
-                LOGGER.exception(
-                    'Failed to add download %s to the queue: ', entry[0]
-                )
-
-            sleep(1.0)
+        for entry in pending:
+            LOGGER.error(
+                'Gave up adding download %s to the queue, as the database'
+                ' stayed locked',
+                entry[0]
+            )
         return added
 
     def __load_downloads(self) -> None:
