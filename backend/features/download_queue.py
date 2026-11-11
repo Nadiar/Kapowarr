@@ -385,17 +385,19 @@ class DownloadHandler(metaclass=Singleton):
                 DownloadClientIdentifier(download['client_type'])
             )
             kwargs = {}
-            if issubclass(
-                DownloadClient,
-                ExternalDownload
-            ):
-                kwargs = {
-                    'external_client': ExternalClients.get_client(
-                        download['external_client_id']
-                    )
-                }
-
             try:
+                # Connecting to the external client can fail too, and must
+                # not stop the rest of the queue from loading
+                if issubclass(
+                    DownloadClient,
+                    ExternalDownload
+                ):
+                    kwargs = {
+                        'external_client': ExternalClients.get_client(
+                            download['external_client_id']
+                        )
+                    }
+
                 dl_instance = DownloadClient(
                     download_link=download['download_link'],
                     volume_id=download['volume_id'],
