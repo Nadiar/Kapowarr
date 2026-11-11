@@ -5,8 +5,9 @@ The matching of files to issues in a volume
 """
 
 from collections import Counter
+from contextlib import contextmanager
 from os.path import basename, isdir
-from typing import Dict, List, Set, Tuple, Union
+from typing import Dict, Iterator, List, Set, Tuple, Union
 
 from backend.base.comicinfo import read_comicvine_issue_id
 from backend.base.definitions import (FileConstants, FileMatch,
@@ -22,13 +23,30 @@ from backend.base.logging import LOGGER
 from backend.features.external_files import present_external_file_ids
 from backend.implementations.matching import file_importing_filter
 from backend.implementations.root_folders import RootFolders
-from backend.internals.db import commit, get_db
+from backend.internals.db import KapowarrCursor, get_db
 from backend.internals.db_models import FilesDB
 from backend.internals.server import DownloadedStatusEvent, WebSocket
 from backend.internals.settings import Settings
 
 
 # region Automatic Match
+@contextmanager
+def _write_transaction(
+    cursor: KapowarrCursor,
+    commit_joined: bool
+) -> Iterator[None]:
+    """A short transaction of its own, or, if the caller already has one
+    open, that one (committed at the end when `commit_joined`)."""
+    if not cursor.connection.in_transaction:
+        with cursor:
+            yield
+        return
+
+    yield
+    if commit_joined:
+        cursor.connection.commit()
+
+
 def scan_files(
     volume_id: int,
     filepath_filter: List[str] = [],
@@ -83,13 +101,25 @@ def scan_files(
         for i in volume_issues
     }
 
+    def get_file_id(file: str) -> int:
+        """The ID of the file, adding it in a transaction of its own if it's
+        new. The scan reads the library while it runs, so it mustn't hold a
+        write transaction open until the end."""
+        if file not in current_issue_files:
+            known = cursor.execute(
+                "SELECT id FROM files WHERE filepath = ?;", (file,)
+            ).exists()
+            if known is None:
+                with _write_transaction(cursor, commit_joined=False):
+                    known = FilesDB.add_file(file)
+            current_issue_files[file] = known
+        return current_issue_files[file]
+
     def bind_by_comicinfo(file: str) -> None:
         issue_id = comicvine_to_issue.get(read_comicvine_issue_id(file) or 0)
         if issue_id is None:
             return
-        if file not in current_issue_files:
-            current_issue_files[file] = FilesDB.add_file(file)
-        new_issue_bindings.add((current_issue_files[file], issue_id))
+        new_issue_bindings.add((get_file_id(file), issue_id))
 
     # Skip processing manually matched files, but do note that they are found
     manually_matched_files: Dict[str, int] = dict(cursor.execute(
@@ -163,10 +193,7 @@ def scan_files(
             and file_data["issue_number"] is None
         ):
             # Volume cover file
-            if file not in current_issue_files:
-                current_issue_files[file] = FilesDB.add_file(file)
-
-            new_general_bindings[current_issue_files[file]] = (
+            new_general_bindings[get_file_id(file)] = (
                 GeneralFileType.COVER.value
             )
 
@@ -175,10 +202,7 @@ def scan_files(
             and file_data["issue_number"] is None
         ):
             # Volume metadata file
-            if file not in current_issue_files:
-                current_issue_files[file] = FilesDB.add_file(file)
-
-            new_general_bindings[current_issue_files[file]] = (
+            new_general_bindings[get_file_id(file)] = (
                 GeneralFileType.METADATA.value
             )
 
@@ -190,12 +214,7 @@ def scan_files(
             and file_data['special_version']
         ):
             # Special Version
-            if file not in current_issue_files:
-                current_issue_files[file] = FilesDB.add_file(file)
-
-            new_issue_bindings.add(
-                (current_issue_files[file], volume_issues[0].id)
-            )
+            new_issue_bindings.add((get_file_id(file), volume_issues[0].id))
 
         elif file_data["issue_number"] is not None:
             # Normal issue
@@ -211,13 +230,8 @@ def scan_files(
             ]
 
             if matching_issues:
-                if file not in current_issue_files:
-                    current_issue_files[file] = FilesDB.add_file(file)
-
                 for issue in matching_issues:
-                    new_issue_bindings.add(
-                        (current_issue_files[file], issue)
-                    )
+                    new_issue_bindings.add((get_file_id(file), issue))
 
         if bindings_before == (
             len(new_issue_bindings) + len(new_general_bindings)
@@ -233,110 +247,112 @@ def scan_files(
     manually_matched_files_missing = (
         set(manually_matched_files.values()) - external_files_found
     )
-    current_bindings: Set[Tuple[int, int]] = set(map(tuple, cursor.execute("""
-        SELECT if.file_id, if.issue_id
-        FROM issues_files if
-        INNER JOIN issues i
-        ON if.issue_id = i.id
-        WHERE i.volume_id = ?;
-        """,
-        (volume_id,)
-    )))
-    delete_bindings = {
-        (file_id, issue_id)
-        for file_id, issue_id in current_bindings
-        if (
-            (file_id, issue_id) not in new_issue_bindings
-            and file_id not in manually_matched_files_found
 
-            or file_id in manually_matched_files_missing
-        )
-    }
-    add_bindings = {
-        (file_id, issue_id)
-        for file_id, issue_id in new_issue_bindings
-        if (file_id, issue_id) not in current_bindings
-    }
-
-    issue_binding_count = Counter((b[1] for b in current_bindings))
-
-    new_binding_count = Counter((b[1] for b in add_bindings))
-    issue_binding_count.update(new_binding_count)
-    newly_downloaded_issues = list(new_binding_count)
-
-    delete_binding_count = Counter((b[1] for b in delete_bindings))
-    issue_binding_count.subtract(delete_binding_count)
-    deleted_downloaded_issues = [
-        k
-        for k, v in issue_binding_count.items()
-        if not v
-    ]
-
-    # Delete bindings that aren't in new bindings
-    if not filepath_filter:
-        cursor.executemany(
-            "DELETE FROM issues_files WHERE file_id = ? AND issue_id = ?;",
-            delete_bindings
-        )
-
-        if settings.unmonitor_deleted_issues:
-            cursor.executemany(
-                "UPDATE issues SET monitored = 0 WHERE id = ?;",
-                ((issue_id,) for issue_id in deleted_downloaded_issues)
-            )
-
-    # Add bindings that aren't in current bindings
-    cursor.executemany(
-        "INSERT INTO issues_files(file_id, issue_id) VALUES (?, ?);",
-        add_bindings
-    )
-
-    # Delete bindings for general files that aren't in new bindings
-    if not filepath_filter:
-        manually_matched_general_files_missing = set(
-            manually_matched_general_files.values()
-        )
-        current_general_bindings = {
-            gf['id']: gf['file_type']
-            for gf in volume.get_general_files()
-        }
-        delete_general_bindings = (
-            (b,)
-            for b in current_general_bindings
+    # One short write transaction for all binding changes
+    with _write_transaction(cursor, commit_joined=True):
+        current_bindings: Set[Tuple[int, int]] = set(map(
+            tuple, cursor.execute("""
+            SELECT if.file_id, if.issue_id
+            FROM issues_files if
+            INNER JOIN issues i
+            ON if.issue_id = i.id
+            WHERE i.volume_id = ?;
+            """,
+            (volume_id,))
+        ))
+        delete_bindings = {
+            (file_id, issue_id)
+            for file_id, issue_id in current_bindings
             if (
-                b not in new_general_bindings
-                and b not in manually_matched_general_files_found
+                (file_id, issue_id) not in new_issue_bindings
+                and file_id not in manually_matched_files_found
 
-                or b in manually_matched_general_files_missing
+                or file_id in manually_matched_files_missing
+            )
+        }
+        add_bindings = {
+            (file_id, issue_id)
+            for file_id, issue_id in new_issue_bindings
+            if (file_id, issue_id) not in current_bindings
+        }
+
+        issue_binding_count = Counter((b[1] for b in current_bindings))
+
+        new_binding_count = Counter((b[1] for b in add_bindings))
+        issue_binding_count.update(new_binding_count)
+        newly_downloaded_issues = list(new_binding_count)
+
+        delete_binding_count = Counter((b[1] for b in delete_bindings))
+        issue_binding_count.subtract(delete_binding_count)
+        deleted_downloaded_issues = [
+            k
+            for k, v in issue_binding_count.items()
+            if not v
+        ]
+
+        # Delete bindings that aren't in new bindings
+        if not filepath_filter:
+            cursor.executemany(
+                "DELETE FROM issues_files WHERE file_id = ? AND issue_id = ?;",
+                delete_bindings
+            )
+
+            if settings.unmonitor_deleted_issues:
+                cursor.executemany(
+                    "UPDATE issues SET monitored = 0 WHERE id = ?;",
+                    ((issue_id,) for issue_id in deleted_downloaded_issues)
+                )
+
+        # Add bindings that aren't in current bindings
+        cursor.executemany(
+            "INSERT INTO issues_files(file_id, issue_id) VALUES (?, ?);",
+            add_bindings
+        )
+
+        # Delete bindings for general files that aren't in new bindings
+        if not filepath_filter:
+            manually_matched_general_files_missing = set(
+                manually_matched_general_files.values()
+            )
+            current_general_bindings = {
+                gf['id']: gf['file_type']
+                for gf in volume.get_general_files()
+            }
+            delete_general_bindings = (
+                (b,)
+                for b in current_general_bindings
+                if (
+                    b not in new_general_bindings
+                    and b not in manually_matched_general_files_found
+
+                    or b in manually_matched_general_files_missing
+                )
+            )
+            cursor.executemany(
+                "DELETE FROM volume_files WHERE file_id = ?;",
+                delete_general_bindings
+            )
+
+        # Add bindings for general files that aren't in current bindings
+        cursor.executemany("""
+            INSERT INTO volume_files(
+                file_id, volume_id, file_type
+            ) VALUES (
+                ?, ?, ?
+            )
+            ON CONFLICT(file_id) DO
+            UPDATE SET
+                file_type = ?;
+            """,
+            (
+                (file_id, volume_id, file_type, file_type)
+                for file_id, file_type in new_general_bindings.items()
             )
         )
-        cursor.executemany(
-            "DELETE FROM volume_files WHERE file_id = ?;",
-            delete_general_bindings
-        )
 
-    # Add bindings for general files that aren't in current bindings
-    cursor.executemany("""
-        INSERT INTO volume_files(
-            file_id, volume_id, file_type
-        ) VALUES (
-            ?, ?, ?
-        )
-        ON CONFLICT(file_id) DO
-        UPDATE SET
-            file_type = ?;
-        """,
-        (
-            (file_id, volume_id, file_type, file_type)
-            for file_id, file_type in new_general_bindings.items()
-        )
-    )
-
-    # Remove files from the database that aren't matched to anything anymore
-    if del_unmatched_files:
-        FilesDB.delete_unmatched_files()
-
-    commit()
+        # Remove files from the database that aren't matched to anything anymore
+        if del_unmatched_files:
+            FilesDB.delete_unmatched_files()
 
     if update_websocket:
         if not filepath_filter and (
@@ -365,6 +381,16 @@ def scan_files(
                 RootFolders()[volume_data.root_folder]
             )
 
+    return
+
+
+def try_scan_files(volume_id: int, *args, **kwargs) -> None:
+    """Run `scan_files`, logging a failure instead of raising it, so a scan
+    of many volumes carries on past one that fails."""
+    try:
+        scan_files(volume_id, *args, **kwargs)
+    except Exception:
+        LOGGER.exception(f'Failed to scan files of volume {volume_id}')
     return
 
 

@@ -37,7 +37,8 @@ from backend.base.helpers import (PortablePool, extract_year_from_date,
 from backend.base.logging import LOGGER
 from backend.features.external_files import is_external, skip_external
 from backend.implementations.comicvine import ComicVine
-from backend.implementations.file_matching import scan_files
+from backend.implementations.file_matching import (scan_files,
+                                                   try_scan_files)
 from backend.implementations.file_processing import mass_process_files
 from backend.implementations.matching import match_title
 from backend.implementations.root_folders import RootFolders
@@ -1717,14 +1718,14 @@ def refresh_and_scan(
             if update_websocket:
                 ws = WebSocket()
                 for idx, _ in enumerate(
-                    pool.istarmap_unordered(scan_files, v_ids)
+                    pool.istarmap_unordered(try_scan_files, v_ids)
                 ):
                     ws.emit(TaskStatusEvent(
                         f'Scanned files for volume {idx+1}/{total_count}'
                     ))
 
             else:
-                pool.starmap(scan_files, v_ids)
+                pool.starmap(try_scan_files, v_ids)
 
         FilesDB.delete_unmatched_files()
 

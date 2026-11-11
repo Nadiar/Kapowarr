@@ -258,7 +258,7 @@ class TestScanFiles(unittest.TestCase):
         ), patch(
             'backend.features.tasks.WebSocket'
         ), patch(
-            'backend.features.tasks.scan_files',
+            'backend.features.tasks.try_scan_files',
             mock_scan
         ):
             task.run()

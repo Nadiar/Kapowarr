@@ -21,7 +21,7 @@ from backend.features.search_discover import discover_downloads
 from backend.features.search_full import AutoSearchOutcome, auto_search_outcome
 from backend.implementations.comicvine import ComicVine
 from backend.implementations.conversion import mass_convert
-from backend.implementations.file_matching import scan_files
+from backend.implementations.file_matching import try_scan_files
 from backend.implementations.naming import mass_rename
 from backend.implementations.volumes import (Volume,
                                              determine_special_version,
@@ -1360,7 +1360,7 @@ class ScanFiles(LibraryTask):
                 break
             self.message = f'Scanning files {idx}/{total}'
             ws.emit(TaskStatusEvent(self.message))
-            scan_files(vid)
+            try_scan_files(vid)
         return
 
 

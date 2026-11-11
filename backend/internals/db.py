@@ -81,9 +81,11 @@ class KapowarrCursor(Cursor):
         return r[0]
 
     def __enter__(self):
-        """Start a transaction"""
+        """Start a transaction. It takes the write lock straight away, so it
+        waits for another writer instead of failing when it first reads and
+        then writes."""
         self.connection.isolation_level = None
-        self.execute("BEGIN TRANSACTION;")
+        self.execute("BEGIN IMMEDIATE TRANSACTION;")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -168,6 +170,9 @@ class DBConnection(Connection, metaclass=DBConnectionManager):
             detect_types=PARSE_DECLTYPES
         )
         super().cursor().execute("PRAGMA foreign_keys = ON;")
+        # Safe in WAL mode: a crash of Kapowarr loses nothing, and commits
+        # skip a disk flush, so the write lock is released sooner.
+        super().cursor().execute("PRAGMA synchronous = NORMAL;")
         return
 
     def cursor( # type: ignore

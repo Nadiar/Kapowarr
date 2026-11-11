@@ -62,7 +62,7 @@ class Constants:
     before the import is reverted
     """
 
-    DB_MAX_CONCURRENT_CONNECTIONS = 32
+    DB_MAX_CONCURRENT_CONNECTIONS = 4
     "Maximum allowed database connections to be open at the same time"
 
     LOGGER_NAME = "Kapowarr"

@@ -90,7 +90,6 @@ class ScanFilesComicInfoTests(unittest.TestCase):
              MagicMock(return_value=self.cursor)),
             ('backend.implementations.file_matching.Settings',
              MagicMock(return_value=settings)),
-            ('backend.implementations.file_matching.commit', MagicMock()),
             ('backend.implementations.file_matching.present_external_file_ids',
              MagicMock(return_value=set())),
             ('backend.implementations.file_matching.refine_special_version',
