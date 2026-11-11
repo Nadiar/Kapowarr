@@ -6,8 +6,8 @@ from abc import abstractmethod
 from asyncio import run
 from datetime import date, timedelta
 from time import sleep, time
-from typing import (TYPE_CHECKING, Any, Dict, Iterable,
-                    List, Set, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Set, Tuple,
+                    Type, TypeVar, Union)
 
 from backend.base.custom_exceptions import (CredentialInvalid, InvalidKeyValue,
                                             MetadataSourceNotWorking,
@@ -23,7 +23,8 @@ from backend.implementations.comicvine import ComicVine
 from backend.implementations.conversion import mass_convert
 from backend.implementations.file_matching import scan_files
 from backend.implementations.naming import mass_rename
-from backend.implementations.volumes import (Volume, determine_special_version,
+from backend.implementations.volumes import (Volume,
+                                             determine_special_version,
                                              refresh_and_scan,
                                              update_volume_metadata,
                                              upsert_issues)
