@@ -1102,10 +1102,12 @@ class Session(RSession):
         )
 
         # Retry with the clearance of the site: the cached one first, then a
-        # newly solved one if CF rejects the cached one
+        # newly solved one if CF rejects the cached one. Only reads are
+        # retried, and as the final request after any redirects was made.
         for _ in range(2):
             if not (
                 result.status_code == 403
+                and result.request.method in ('GET', 'HEAD')
                 and self.fs.handle_cf_block(result.url, result.headers)
             ):
                 break
@@ -1113,13 +1115,12 @@ class Session(RSession):
             challenged_url = result.url
             ua, clearance = self.fs.get_clearance(challenged_url)
             result = super().request(
-                method, challenged_url, None, data,
-                {**(headers or {}), "User-Agent": ua},
-                {"cf_clearance": clearance}, files, auth,
-                timeout, allow_redirects,
-                proxies, hooks,
-                stream, verify,
-                cert, json
+                result.request.method, challenged_url,
+                headers=_clearance_retry_headers(result.request.headers, ua),
+                cookies={"cf_clearance": clearance},
+                timeout=timeout, allow_redirects=allow_redirects,
+                proxies=proxies, hooks=hooks,
+                stream=stream, verify=verify, cert=cert
             )
             if is_cloudflare_challenge(result.status_code, result.headers):
                 self.fs.forget_clearance(challenged_url)
@@ -1139,6 +1140,25 @@ class Session(RSession):
             )
 
         return result
+
+
+def _clearance_retry_headers(
+    final_headers: Mapping[str, str],
+    user_agent: str
+) -> Dict[str, str]:
+    """Headers to retry a challenged request with, based on the request that
+    got the challenge (after any redirects, so without credentials the HTTP
+    library stripped), with the user agent the clearance belongs to.
+    """
+    skipped = ('cookie', 'host', 'content-length', 'content-type')
+    return {
+        **{
+            name: value
+            for name, value in final_headers.items()
+            if name.lower() not in skipped
+        },
+        "User-Agent": user_agent
+    }
 
 
 class AsyncSession(ClientSession):
@@ -1174,6 +1194,9 @@ class AsyncSession(ClientSession):
         total_rounds = (
             Constants.TOTAL_RETRIES if kwargs.pop('retry', True) else 1
         )
+        # False for the retry of a challenged request, so it isn't retried
+        # again from within itself.
+        handle_challenge = kwargs.pop('handle_challenge', True)
 
         ua, cf_cookie = self.fs.get_clearance(url)
         self.headers.update({"User-Agent": ua})
@@ -1210,10 +1233,14 @@ class AsyncSession(ClientSession):
                 continue
 
             # Retry with the clearance of the site: the cached one first, then
-            # a newly solved one if CF rejects the cached one
-            for _ in range(2):
+            # a newly solved one if CF rejects the cached one. Only reads are
+            # retried, as the final request after any redirects was made, and
+            # through the normal retry handling.
+            for _ in range(2 if handle_challenge else 0):
+                final_request = response.request_info
                 if not (
                     response.status == 403
+                    and final_request.method in ('GET', 'HEAD')
                     and await self.fs.handle_cf_block_async(
                         self, str(response.url), response.headers
                     )
@@ -1223,16 +1250,17 @@ class AsyncSession(ClientSession):
                 challenged_url = str(response.url)
                 ua, clearance = self.fs.get_clearance(challenged_url)
                 response.release()
-                response = await super()._request(
-                    method, challenged_url,
+                response = await self._request(
+                    final_request.method, challenged_url,
+                    headers=_clearance_retry_headers(
+                        final_request.headers, ua
+                    ),
+                    cookies={"cf_clearance": clearance},
+                    handle_challenge=False,
                     **{
-                        **kwargs,
-                        "params": None,
-                        "headers": {
-                            **(kwargs.get("headers") or {}),
-                            "User-Agent": ua
-                        },
-                        "cookies": {"cf_clearance": clearance}
+                        name: value
+                        for name, value in kwargs.items()
+                        if name in ('timeout', 'allow_redirects', 'ssl')
                     }
                 )
                 if is_cloudflare_challenge(response.status, response.headers):

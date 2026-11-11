@@ -711,11 +711,15 @@ class GetComicsPrepper(DownloadPrepper):
         """
         downloads: Tuple[Union[Download, None], ...] = tuple()
         limit_reached: Tuple[bool, ...] = tuple()
+        # Over all paths, so a temporary failure of one isn't forgotten
+        # when a later path is entirely broken
+        any_limit_reached = False
         for path in link_paths:
             downloads, limit_reached = zip(*(await gather(*(
                 self.__purify_download_group(group)
                 for group in path
             ))))
+            any_limit_reached = any_limit_reached or any(limit_reached)
             downloads = tuple(d for d in downloads if d is not None)
 
             if not downloads:
@@ -725,7 +729,7 @@ class GetComicsPrepper(DownloadPrepper):
             return list(downloads)
 
         # Nothing worked
-        if any(limit_reached):
+        if any_limit_reached:
             raise EnqueuingDownloadFailure(
                 EnqueuingDownloadFailureReason.ONLY_RATE_LIMITED_LINKS
             )
