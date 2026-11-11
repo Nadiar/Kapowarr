@@ -46,7 +46,9 @@ if TYPE_CHECKING:
 TASK_INTERVALS = {
     # Note: If there are tasks that should be run at the same time,
     #   but per se after each other, put them in that order in the dict.
-    'update_all': '0 * * * *', # every hour at minute 0
+    # Fork: upstream's hourly 'update_all' isn't scheduled. It repeats what
+    #   sync_issues, refresh_metadata and scan_files do. TODO: decide whether
+    #   to drop it or the split tasks, see .claude/CLAUDE.md.
     'backup_db': '0 0 * * 1', # every Monday at 00:00
     'rss_sync': '0,30 * * * *', # every half hour
 
@@ -63,8 +65,8 @@ TASK_INTERVALS = {
     'health_check': '0 7 * * *' # daily at 07:00
 }
 
-LEGACY_TASK_NAMES = ('search_recent',)
-"Task names that may still be in the database from older versions"
+LEGACY_TASK_NAMES = ('search_recent', 'update_all')
+"Task names whose schedule may still be in the database, to be removed"
 
 
 TaskType = TypeVar(
