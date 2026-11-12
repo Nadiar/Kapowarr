@@ -73,7 +73,7 @@ def list_folders(base_folder: str) -> List[str]:
 
 def list_files(folder: str, ext: Iterable[str] = []) -> List[str]:
     """List all files in a folder recursively with absolute paths. Hidden files
-    (files starting with `.`) are ignored.
+    and folders (starting with `.`) are ignored.
 
     Args:
         folder (str): The base folder to search through.
@@ -93,7 +93,10 @@ def list_files(folder: str, ext: Iterable[str] = []) -> List[str]:
         to_do = to_dos.popleft()
         for f in scandir(to_do):
             if f.is_dir():
-                to_dos.append(f.path)
+                # Hidden folders include a conversion's extraction folder,
+                # which can be removed before it's descended into
+                if not f.name.startswith('.'):
+                    to_dos.append(f.path)
 
             elif (
                 f.is_file()
